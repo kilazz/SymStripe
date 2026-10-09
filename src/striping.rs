@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
+const COMPANION_EXTENSIONS: &[&str] = &["utoc", "pak", "sig"];
+
 /// Checks if a file's extension matches any extension in the provided list.
 pub fn is_ext_match(path: &Path, exts: &[String]) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -28,7 +30,8 @@ pub fn parse_ext_list(ext_str: &str) -> Vec<String> {
 }
 
 /// Detects memory-mapped engine metadata, TOCs, and IoStore header stubs.
-/// These files MUST remain physically on the primary drive to avoid `IoDispatcher` crashes in UE4/5.
+/// These files MUST remain physically on the primary drive in Mode 0, or be handled
+/// as companion bundles in Mode 1, to prevent engine bootstrapping failures.
 pub fn is_iostore_metadata_companion(path: &Path) -> bool {
     // 1. pakchunk0 and global files contain root project descriptors (.uproject) and engine bootstrapping assets
     if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
@@ -41,7 +44,8 @@ pub fn is_iostore_metadata_companion(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let ext_lower = ext.to_lowercase();
 
-        // 2. Never relocate table of contents, signatures, or index files
+        // 2. Never schedule individual standalone relocation for table of contents, signatures, or index files
+        // (In Mode 1, they are automatically bundled alongside their companion .ucas file)
         if matches!(ext_lower.as_str(), "utoc" | "sig" | "toc" | "idx") {
             return true;
         }
@@ -301,7 +305,7 @@ pub fn execute_striping(
             };
             on_progress(current_idx, files_to_move, &filename, pct);
 
-            // Step 1: Copy data to target drive
+            // Step 1: Copy main payload to target drive
             if let Err(e) = fs::copy(&f_path, &target_file) {
                 return Err(format!(
                     "Failed to copy file '{}' to target drive: {e}",
@@ -309,7 +313,28 @@ pub fn execute_striping(
                 ));
             }
 
-            // Step 2: Staged rename of original source file
+            // Step 2: Mode 1 Bundle Optimization — Relocate companion metadata files (.utoc, .pak, .sig) alongside .ucas
+            if mode_idx != 0
+                && f_path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("ucas"))
+            {
+                for ext in COMPANION_EXTENSIONS {
+                    let comp_src = f_path.with_extension(ext);
+                    let comp_dst = target_file.with_extension(ext);
+                    if comp_src.exists() && fs::copy(&comp_src, &comp_dst).is_ok() {
+                        if keep_backup {
+                            let comp_backup =
+                                PathBuf::from(format!("{}.backup", comp_src.to_string_lossy()));
+                            let _ = fs::rename(&comp_src, &comp_backup);
+                        } else {
+                            let _ = fs::remove_file(&comp_src);
+                        }
+                    }
+                }
+            }
+
+            // Step 3: Staged rename of original source file
             let stage_path = PathBuf::from(format!("{}.symstripe_stage", f_path.to_string_lossy()));
             let backup_path = PathBuf::from(format!("{}.backup", f_path.to_string_lossy()));
 
@@ -328,7 +353,7 @@ pub fn execute_striping(
                 ));
             }
 
-            // Step 3: Architecture-Specific Linking Strategy
+            // Step 4: Architecture-Specific Linking Strategy
             if mode_idx == 0
                 && let Err(sym_err) = symlink_file(&target_file, &f_path)
             {
@@ -340,8 +365,7 @@ pub fn execute_striping(
                     f_path.display()
                 ));
             } else if mode_idx != 0 {
-                // Mode 1: UE5 Subfolder Directory Junctions
-                // Instead of linking the file, we link its parent directory into a visible subfolder (Paks_DriveX).
+                // Mode 1: UE5 Subfolder Directory Junctions (Paks_DriveX)
                 let src_parent = f_path.parent().unwrap();
                 let junction_name = format!("Paks_Drive{}", target_idx + 1);
                 let junction_path = src_parent.join(&junction_name);
@@ -353,12 +377,12 @@ pub fn execute_striping(
                 }
             }
 
-            // Step 4: Clean stage file
+            // Step 5: Clean temporary stage file if backup was not requested
             if !keep_backup {
                 let _ = fs::remove_file(&stage_path);
             }
 
-            // Step 5: Save manifest incrementally
+            // Step 6: Save manifest incrementally
             manifest.files.push(ManifestFileEntry {
                 rel_path: rel.to_string_lossy().to_string(),
                 target_drive_idx: target_idx,
@@ -391,18 +415,43 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
             let mut restored = false;
 
             if entry.has_local_backup && backup_path.exists() {
-                let _ = fs::remove_file(&link_path);
+                let _ = fs::remove_file(&link_path); // Remove symlink if it exists
                 if fs::rename(&backup_path, &link_path).is_ok() {
                     let _ = fs::remove_file(&target_path);
                     clean_empty_parents(&target_path);
                     restored = true;
                 }
             } else if target_path.exists() {
-                let _ = fs::remove_file(&link_path);
+                let _ = fs::remove_file(&link_path); // Remove symlink if it exists
                 if fs::copy(&target_path, &link_path).is_ok() {
                     let _ = fs::remove_file(&target_path);
                     clean_empty_parents(&target_path);
                     restored = true;
+                }
+            }
+
+            // Restore companion files (.utoc, .pak, .sig) if this was a .ucas archive
+            if link_path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("ucas"))
+            {
+                for ext in COMPANION_EXTENSIONS {
+                    let comp_primary = link_path.with_extension(ext);
+                    let comp_target = target_path.with_extension(ext);
+                    let comp_backup =
+                        PathBuf::from(format!("{}.backup", comp_primary.to_string_lossy()));
+
+                    if comp_backup.exists() {
+                        let _ = fs::remove_file(&comp_primary);
+                        if fs::rename(&comp_backup, &comp_primary).is_ok() {
+                            let _ = fs::remove_file(&comp_target);
+                        }
+                    } else if comp_target.exists() {
+                        let _ = fs::remove_file(&comp_primary);
+                        if fs::copy(&comp_target, &comp_primary).is_ok() {
+                            let _ = fs::remove_file(&comp_target);
+                        }
+                    }
                 }
             }
 
@@ -433,7 +482,7 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
             .to_string_lossy()
             .starts_with("Paks_Drive")
         {
-            let _ = fs::remove_dir(entry.path());
+            let _ = fs::remove_dir(entry.path()); // Removes junction point without deleting target contents
         }
     }
 
@@ -468,6 +517,31 @@ pub fn execute_consolidate(src_path: &Path, chosen_target_dir: &Path) -> Result<
                     let _ = fs::remove_file(&target_path);
                     clean_empty_parents(&target_path);
                     consolidated_count += 1;
+                }
+            }
+
+            // Consolidate companions (.utoc, .pak, .sig)
+            if link_path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("ucas"))
+            {
+                for ext in COMPANION_EXTENSIONS {
+                    let comp_primary = link_path.with_extension(ext);
+                    let comp_target = target_path.with_extension(ext);
+                    let comp_backup =
+                        PathBuf::from(format!("{}.backup", comp_primary.to_string_lossy()));
+
+                    if comp_backup.exists() {
+                        let _ = fs::remove_file(&comp_primary);
+                        if fs::rename(&comp_backup, &comp_primary).is_ok() {
+                            let _ = fs::remove_file(&comp_target);
+                        }
+                    } else if comp_target.exists() {
+                        let _ = fs::remove_file(&comp_primary);
+                        if fs::copy(&comp_target, &comp_primary).is_ok() {
+                            let _ = fs::remove_file(&comp_target);
+                        }
+                    }
                 }
             }
         } else {
