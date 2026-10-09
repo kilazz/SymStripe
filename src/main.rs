@@ -106,13 +106,6 @@ fn inspect_game_folder(src_path: &Path, ui: &slint::Weak<AppWindow>) {
             app_ui.set_file_list(ModelRc::new(VecModel::from(items)));
             app_ui.set_status_msg("Manifest detected: Directory is currently STRIPED.".into());
         });
-        append_log(
-            ui,
-            &format!(
-                "Active manifest found: {} files on secondary storage.",
-                total_moved
-            ),
-        );
     } else {
         let _ = ui.upgrade_in_event_loop(|app_ui| {
             app_ui.set_is_already_striped(false);
@@ -129,6 +122,7 @@ fn apply_profile_to_ui(profile: &Profile, app: &AppWindow, ui_weak: &slint::Weak
     app.set_media_extensions_text(profile.media_extensions.clone().into());
     app.set_keep_backup(profile.keep_backup);
     app.set_aggressive_media(profile.aggressive_media);
+    app.set_active_mode_idx(profile.mode_idx);
 
     let target_rows: Vec<String> = profile
         .secondary_targets
@@ -174,7 +168,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: initial_config,
     }));
 
-    // Auto-Detect Threshold
+    // Mode Switcher Callback
+    let weak = ui_weak.clone();
+    let state_arc = state.clone();
+    app.on_mode_switched(move |mode_idx| {
+        let mut st = state_arc.lock().unwrap();
+        let idx = st.config.active_profile_index;
+        if let Some(prof) = st.config.profiles.get_mut(idx) {
+            prof.mode_idx = mode_idx;
+            save_config(&st.config);
+        }
+        let mode_name = if mode_idx == 0 {
+            "NTFS File Symlinks (Universal)"
+        } else {
+            "UE5 Subfolder Junctions (DirectStorage Safe)"
+        };
+        append_log(
+            &weak,
+            &format!("Engine architecture switched to: {}", mode_name),
+        );
+    });
+
+    // Auto-Detect Optimal Threshold
     let weak = ui_weak.clone();
     app.on_auto_detect_threshold(move |src_dir, exclusions_str| {
         let src = src_dir.to_string();
@@ -209,7 +224,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // Verify Integrity
+    // Verify Storage Integrity
     let weak = ui_weak.clone();
     app.on_verify_integrity(move |src_dir| {
         let src = src_dir.to_string();
@@ -222,7 +237,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match verify_and_repair_integrity(&src_path) {
                 Ok((intact, repaired)) => {
-                    append_log(&w, &format!("Integrity check complete: {} file(s) intact.", intact));
+                    append_log(
+                        &w,
+                        &format!("Integrity check complete: {} file(s) intact.", intact),
+                    );
                     if repaired > 0 {
                         append_log(&w, &format!("⚠️ [ALERT] {} missing file(s) detected! Auto-restored from .backup.", repaired));
                     }
@@ -255,6 +273,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui.set_media_extensions_text(prof.media_extensions.clone().into());
                 ui.set_keep_backup(prof.keep_backup);
                 ui.set_aggressive_media(prof.aggressive_media);
+                ui.set_active_mode_idx(prof.mode_idx);
 
                 let target_rows: Vec<String> = prof
                     .secondary_targets
@@ -307,6 +326,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_target_drives_list(ModelRc::new(VecModel::from(Vec::new())));
             ui.set_file_list(ModelRc::new(VecModel::from(Vec::new())));
             ui.set_is_already_striped(false);
+            ui.set_active_mode_idx(0);
         });
         append_log(&weak, &format!("Created new profile: {}", prof.name));
     });
@@ -348,6 +368,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_media_extensions_text(prof.media_extensions.clone().into());
             ui.set_keep_backup(prof.keep_backup);
             ui.set_aggressive_media(prof.aggressive_media);
+            ui.set_active_mode_idx(prof.mode_idx);
 
             let target_rows: Vec<String> = prof
                 .secondary_targets
@@ -396,7 +417,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Add Target Drive
+    // Add Secondary Target Drive
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_add_target_drive(move || {
@@ -415,7 +436,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|(i, p)| format!("[Drive {}] {}", i + 2, p))
                     .collect();
 
-                let _ = prof.secondary_targets.len();
                 save_config(&st.config);
 
                 let _ = weak.upgrade_in_event_loop(move |ui| {
@@ -538,7 +558,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_preview_striping(
-        move |src_dir, min_mb, exclusions_str, media_exts_str, keep_backup, aggressive_media| {
+        move |src_dir,
+              min_mb,
+              exclusions_str,
+              media_exts_str,
+              keep_backup,
+              aggressive_media,
+              mode_idx| {
             let src = src_dir.to_string();
             let excl = exclusions_str.to_string();
             let media = media_exts_str.to_string();
@@ -572,12 +598,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let excl_list = parse_ext_list(&excl);
                 let media_list = parse_ext_list(&media);
+                let mode_str = if mode_idx == 0 {
+                    "File Symlinks"
+                } else {
+                    "Subfolder Junctions"
+                };
                 append_log(
                     &w,
-                    &format!(
-                        "--- PREVIEW ANALYSIS (Media Offload: {}) ---",
-                        aggressive_media
-                    ),
+                    &format!("--- PREVIEW ANALYSIS (Engine: {}) ---", mode_str),
                 );
 
                 let Some(plan) = calculate_allocation_plan(
@@ -594,11 +622,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let mut list_rows = Vec::new();
-
-                // Drive 1: Primary
                 let d1_gb = plan.drive_bytes[0] as f64 / 1e9;
                 list_rows.push(format!(
-                    "▼ 📁 [DRIVE 1: PRIMARY (SOURCE)] — {} archives ({:.2} GB retained)",
+                    "▼ 📁 [DRIVE 1: PRIMARY] — {} archives ({:.2} GB retained)",
                     plan.drive_buckets[0].len(),
                     d1_gb
                 ));
@@ -606,42 +632,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(rel) = f_path.strip_prefix(&src_path) {
                         let name = rel.file_name().unwrap_or_default().to_string_lossy();
                         let mb = *size as f64 / (1024.0 * 1024.0);
-                        list_rows.push(format!("   ├─ [PHYSICAL] {} ({:.1} MB)", name, mb));
+                        list_rows.push(format!("   ├─ [LOCAL] {} ({:.1} MB)", name, mb));
                     }
                 }
 
-                // Secondary Target Drives
                 for (t_idx, target_files) in plan.drive_buckets.iter().enumerate().skip(1) {
                     let target_dir = &targets[t_idx - 1];
                     let dt_gb = plan.drive_bytes[t_idx] as f64 / 1e9;
-                    let mode_str = if keep_backup {
-                        " [.backup protected]"
-                    } else {
-                        ""
-                    };
                     list_rows.push(format!(
-                        "▼ 📁 [DRIVE {}: TARGET ({})] — {} archives ({:.2} GB relocated){}",
+                        "▼ 📁 [DRIVE {}: TARGET ({})] — {} archives ({:.2} GB relocated)",
                         t_idx + 1,
                         target_dir.display(),
                         target_files.len(),
-                        dt_gb,
-                        mode_str
+                        dt_gb
                     ));
 
-                    for (f_path, size, is_media) in target_files {
+                    for (f_path, size, _) in target_files {
                         if let Ok(rel) = f_path.strip_prefix(&src_path) {
                             let name = rel.file_name().unwrap_or_default().to_string_lossy();
                             let mb = *size as f64 / (1024.0 * 1024.0);
-                            let mut tags = String::new();
-                            if keep_backup {
-                                tags.push_str(" [.backup]");
-                            }
-                            if *is_media && aggressive_media {
-                                tags.push_str(" [media forced]");
-                            }
-
+                            let tag = if mode_idx == 0 {
+                                "[to Symlink]"
+                            } else {
+                                "[to UE5 Junction]"
+                            };
+                            let b_tag = if keep_backup { " [.backup]" } else { "" };
                             list_rows
-                                .push(format!("   ├─ [RELOCATE] {} ({:.1} MB){}", name, mb, tags));
+                                .push(format!("   ├─ {} {} ({:.1} MB){}", tag, name, mb, b_tag));
                         }
                     }
                 }
@@ -664,17 +681,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.set_file_list(ModelRc::new(VecModel::from(items)));
                 });
 
-                append_log(&w, "Preview analysis complete. Ready to distribute.");
-                update_status(&w, "Preview complete. Ready to distribute.");
+                append_log(&w, "Preview complete. Ready to distribute.");
+                update_status(&w, "Preview complete.");
             });
         },
     );
 
-    // Apply Striping
+    // Apply Striping Relocation
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_apply_striping(
-        move |src_dir, min_mb, exclusions_str, media_exts_str, keep_backup, aggressive_media| {
+        move |src_dir,
+              min_mb,
+              exclusions_str,
+              media_exts_str,
+              keep_backup,
+              aggressive_media,
+              mode_idx| {
             let src = src_dir.to_string();
             let excl = exclusions_str.to_string();
             let media = media_exts_str.to_string();
@@ -741,6 +764,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &targets,
                     plan,
                     keep_backup,
+                    mode_idx,
                     move |curr, total, name, pct| {
                         let status_text = format!(
                             "[{}/{}] Transferring {} ({:.0}%)...",
@@ -782,7 +806,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    // Revert Striping
+    // Revert Striping Back to Primary
     let weak = ui_weak.clone();
     app.on_revert_striping(move |src_dir| {
         let src = src_dir.to_string();
@@ -823,7 +847,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // Speed Benchmark across ALL configured drives
+    // Speed Benchmark Test
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_run_benchmark(move || {
@@ -917,7 +941,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // Scan S.M.A.R.T. & Disks
+    // Scan S.M.A.R.T. Disks
     let weak = ui_weak.clone();
     app.on_scan_drives(move || {
         let w = weak.clone();

@@ -61,33 +61,34 @@ component SectionHeader {
 
 export component AppWindow inherits Window {
     title: "SymStripe - Multi-Drive Storage Accelerator";
-    min-width: 1000px;
-    min-height: 740px;
-    preferred-width: 1080px;
-    preferred-height: 800px;
+    min-width: 1040px;
+    min-height: 820px;
+    preferred-width: 1120px;
+    preferred-height: 860px;
     background: #141414;
 
     // Profile state
     in-out property <[string]> profile_names: ["Default Profile"];
     in-out property <int> active_profile_idx: 0;
 
-    // Config & path properties
+    // Config properties
     in-out property <string> primary_path: "";
     in-out property <[StandardListViewItem]> target_drives_list: [];
     in-out property <string> min_size_mb_text: "50";
-    in-out property <string> exclusions_text: "exe, dll, pdb";
+    in-out property <string> exclusions_text: "exe, dll, pdb, utoc, sig";
     in-out property <string> media_extensions_text: "bik, bk2, mp4, fsb, pck, wem";
     in-out property <bool> keep_backup: true;
     in-out property <bool> aggressive_media: false;
     in-out property <bool> is_already_striped: false;
 
-    // Diagnostics & SMART
-    in-out property <string> smart_alert_text: "";
+    // Engine Mode: 0 = NTFS Symlinks, 1 = UE5 Subfolder Junctions
+    in-out property <int> active_mode_idx: 0;
 
-    // Progress bar & status state
+    // Diagnostics
+    in-out property <string> smart_alert_text: "";
     in-out property <float> progress: 0.0;
     in-out property <bool> is_processing: false;
-    in-out property <string> log_text: "System ready. Select or create a profile to begin.\n";
+    in-out property <string> log_text: "System ready. Configure targets, select engine mode and distribute.\n";
     in-out property <string> status_msg: "Ready";
     in-out property <string> summary_text: "No files analyzed yet.";
     in-out property <[StandardListViewItem]> file_list: [];
@@ -96,18 +97,16 @@ export component AppWindow inherits Window {
     callback profile_selected(int);
     callback create_profile();
     callback delete_profile();
-
+    callback mode_switched(int);
     callback browse_primary_folder() -> string;
     callback primary_folder_changed(string);
     callback add_target_drive();
     callback clear_target_drives();
     callback consolidate_target_drive();
-
     callback auto_detect_threshold(string, string);
     callback verify_integrity(string);
-
-    callback preview_striping(string, int, string, string, bool, bool);
-    callback apply_striping(string, int, string, string, bool, bool);
+    callback preview_striping(string, int, string, string, bool, bool, int);
+    callback apply_striping(string, int, string, string, bool, bool, int);
     callback revert_striping(string);
     callback scan_drives();
     callback run_benchmark();
@@ -116,9 +115,9 @@ export component AppWindow inherits Window {
         padding: 10px;
         spacing: 8px;
 
-        // TOP HEADER BAR
+        // HEADER
         Rectangle {
-            height: 42px;
+            height: 44px;
             background: #1e1f22;
             border-radius: 4px;
             border-width: 1px;
@@ -139,7 +138,7 @@ export component AppWindow inherits Window {
                     }
 
                     Text {
-                        text: "Smart Thresholds, Media Offload & Multi-Spindle I/O";
+                        text: "Multi-Spindle I/O, NTFS Striping & Engine Junction Architecture";
                         font-size: 10px;
                         color: #808080;
                     }
@@ -148,7 +147,6 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     alignment: center;
                     spacing: 8px;
-
                     CustomButton {
                         text: "Run Speed Benchmark";
                         width: 150px;
@@ -173,7 +171,6 @@ export component AppWindow inherits Window {
             border-radius: 4px;
             border-width: 1px;
             border-color: #e53935;
-
             HorizontalLayout {
                 padding-left: 10px;
                 padding-right: 10px;
@@ -193,9 +190,9 @@ export component AppWindow inherits Window {
             spacing: 8px;
             vertical-stretch: 1;
 
-            // LEFT PANEL
+            // LEFT CONTROL PANEL
             Rectangle {
-                width: 470px;
+                width: 500px;
                 background: #1e1f22;
                 border-radius: 4px;
                 border-width: 1px;
@@ -207,7 +204,7 @@ export component AppWindow inherits Window {
                         spacing: 12px;
                         alignment: start;
 
-                        // Section 0
+                        // Section: Profile
                         SectionHeader {
                             title: "ACTIVE STORAGE PROFILE";
                             title-color: #3e6a90;
@@ -236,56 +233,51 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // Section 1
+                        // Section: Primary Drive
                         SectionHeader {
                             title: "PRIMARY DRIVE (SOURCE / DATA DIRECTORY)";
                             title-color: #3e6a90;
                         }
 
-                        VerticalLayout {
+                        HorizontalLayout {
                             spacing: 5px;
-                            HorizontalLayout {
-                                spacing: 5px;
-                                height: 30px;
-                                LineEdit {
-                                    text <=> root.primary_path;
-                                    placeholder-text: "D:\\Games\\Title or D:\\Datasets...";
-                                    edited(val) => { root.primary_folder_changed(val); }
-                                }
+                            height: 30px;
+                            LineEdit {
+                                text <=> root.primary_path;
+                                placeholder-text: "E:\\Games\\Gears of War E-Day\\GoWEDay";
+                                edited(val) => { root.primary_folder_changed(val); }
+                            }
 
-                                CustomButton {
-                                    text: "...";
-                                    width: 32px;
-                                    clicked => { root.primary_path = root.browse_primary_folder(); }
-                                }
+                            CustomButton {
+                                text: "...";
+                                width: 32px;
+                                clicked => { root.primary_path = root.browse_primary_folder(); }
                             }
                         }
 
-                        // Section 2
+                        // Section: Secondary Targets
                         SectionHeader {
-                            title: "SECONDARY TARGET DRIVES (PARALLEL SPINDLES)";
+                            title: "SECONDARY TARGET DRIVES (PHYSICAL DESTINATIONS)";
                             title-color: #f0b132;
                         }
 
                         VerticalLayout {
                             spacing: 6px;
                             Rectangle {
-                                height: 70px;
+                                height: 60px;
                                 background: #141414;
                                 border-radius: 4px;
                                 border-width: 1px;
                                 border-color: #2b2d31;
-
                                 ListView {
                                     for item in root.target_drives_list: Rectangle {
-                                        height: 22px;
+                                        height: 20px;
                                         background: ta_td.has-hover ? #202226 : transparent;
                                         border-radius: 2px;
                                         ta_td := TouchArea { }
 
                                         HorizontalLayout {
                                             padding-left: 6px;
-                                            padding-right: 6px;
                                             alignment: start;
                                             Text {
                                                 text: item.text;
@@ -302,30 +294,80 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 spacing: 6px;
                                 CustomButton {
-                                    text: "+ Add Target";
+                                    text: "+ Add Physical Target (e.g. F:\\zzz)";
                                     primary-color: #f0b132;
                                     clicked => { root.add_target_drive(); }
                                 }
 
                                 CustomButton {
-                                    text: "Consolidate & Free Drive";
+                                    text: "Consolidate";
                                     primary-color: #d97706;
                                     enabled: root.is_already_striped && !root.is_processing;
                                     clicked => { root.consolidate_target_drive(); }
                                 }
 
                                 CustomButton {
-                                    text: "Clear List";
+                                    text: "Clear";
                                     primary-color: #2b2d31;
-                                    width: 75px;
+                                    width: 60px;
                                     clicked => { root.clear_target_drives(); }
                                 }
                             }
                         }
 
-                        // Section 3
+                        // Section: Architecture
                         SectionHeader {
-                            title: "MULTI-DRIVE ASSET STRIPING & SAFETY MODES";
+                            title: "STORAGE ENGINE ARCHITECTURE";
+                            title-color: #a855f7;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            height: 32px;
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                background: root.active_mode_idx == 0 ? #3e6a90 : #141414;
+                                border-radius: 4px;
+                                border-width: 1px;
+                                border-color: root.active_mode_idx == 0 ? #60a5fa : #2b2d31;
+                                Text {
+                                    text: "🔗 NTFS File Symlinks (Universal)";
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    color: root.active_mode_idx == 0 ? #ffffff : #949ba4;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+
+                                TouchArea {
+                                    clicked => { root.active_mode_idx = 0; root.mode_switched(0); }
+                                }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                background: root.active_mode_idx == 1 ? #23a55a : #141414;
+                                border-radius: 4px;
+                                border-width: 1px;
+                                border-color: root.active_mode_idx == 1 ? #4ade80 : #2b2d31;
+                                Text {
+                                    text: "📁 UE5 Subfolder Junctions (DirectStorage Safe)";
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    color: root.active_mode_idx == 1 ? #ffffff : #949ba4;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+
+                                TouchArea {
+                                    clicked => { root.active_mode_idx = 1; root.mode_switched(1); }
+                                }
+                            }
+                        }
+
+                        // Section: Rules
+                        SectionHeader {
+                            title: "STRIPING RULES & DISTRIBUTION";
                             title-color: #23a55a;
                         }
 
@@ -333,7 +375,6 @@ export component AppWindow inherits Window {
                             height: 30px;
                             spacing: 8px;
                             alignment: start;
-
                             Text {
                                 text: "Min Archive Size (MB):";
                                 vertical-alignment: center;
@@ -342,7 +383,7 @@ export component AppWindow inherits Window {
                             }
 
                             LineEdit {
-                                width: 60px;
+                                width: 65px;
                                 text <=> root.min_size_mb_text;
                             }
 
@@ -359,7 +400,6 @@ export component AppWindow inherits Window {
                             height: 30px;
                             spacing: 8px;
                             alignment: start;
-
                             Text {
                                 text: "Exclude Extensions:";
                                 vertical-alignment: center;
@@ -369,25 +409,7 @@ export component AppWindow inherits Window {
 
                             LineEdit {
                                 text <=> root.exclusions_text;
-                                placeholder-text: "exe, dll, pdb...";
-                            }
-                        }
-
-                        HorizontalLayout {
-                            height: 30px;
-                            spacing: 8px;
-                            alignment: start;
-
-                            Text {
-                                text: "Media Extensions:";
-                                vertical-alignment: center;
-                                font-size: 11px;
-                                color: #dcddde;
-                            }
-
-                            LineEdit {
-                                text <=> root.media_extensions_text;
-                                placeholder-text: "bik, bk2, mp4, fsb...";
+                                placeholder-text: "exe, dll, pdb, utoc, sig...";
                             }
                         }
 
@@ -404,82 +426,37 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // Warning & Integrity Banner
-                        if root.is_already_striped: Rectangle {
-                            background: #2a1c0d;
-                            border-radius: 4px;
-                            border-width: 1px;
-                            border-color: #f0b132;
-
-                            HorizontalLayout {
-                                padding: 8px;
-                                spacing: 8px;
-                                VerticalLayout {
-                                    spacing: 3px;
-                                    Text {
-                                        text: "⚠️ CAUTION: Files are physically split!";
-                                        font-size: 11px;
-                                        font-weight: 800;
-                                        color: #f0b132;
-                                    }
-
-                                    Text {
-                                        text: "Use Revert or Consolidate to manage folders safely.";
-                                        font-size: 10px;
-                                        color: #dcddde;
-                                        wrap: word-wrap;
-                                    }
-                                }
-
-                                VerticalLayout {
-                                    alignment: center;
-                                    CustomButton {
-                                        text: "Verify Integrity";
-                                        width: 110px;
-                                        primary-color: #d97706;
-                                        enabled: !root.is_processing;
-                                        clicked => { root.verify_integrity(root.primary_path); }
-                                    }
-                                }
-                            }
-                        }
-
+                        // Actions
                         HorizontalLayout {
                             CustomButton {
                                 text: "Analyze & Preview Split (Dry Run)";
                                 primary-color: #4a5d6e;
                                 enabled: !root.is_processing && !root.is_already_striped;
-                                clicked => {
-                                    root.preview_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.media_extensions_text, root.keep_backup, root.aggressive_media);
-                                }
+                                clicked => { root.preview_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.media_extensions_text, root.keep_backup, root.aggressive_media, root.active_mode_idx); }
                             }
                         }
 
                         HorizontalLayout {
                             spacing: 6px;
                             CustomButton {
-                                text: "Distribute Across All Drives";
+                                text: "Distribute Across Drives";
                                 primary-color: #23a55a;
                                 enabled: !root.is_processing && !root.is_already_striped;
-                                clicked => {
-                                    root.apply_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.media_extensions_text, root.keep_backup, root.aggressive_media);
-                                }
+                                clicked => { root.apply_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.media_extensions_text, root.keep_backup, root.aggressive_media, root.active_mode_idx); }
                             }
 
                             CustomButton {
                                 text: "Revert All to Primary";
                                 primary-color: root.is_already_striped ? #f0b132 : #3e6a90;
                                 enabled: !root.is_processing;
-                                clicked => {
-                                    root.revert_striping(root.primary_path);
-                                }
+                                clicked => { root.revert_striping(root.primary_path); }
                             }
                         }
                     }
                 }
             }
 
-            // RIGHT PANEL
+            // RIGHT DISPLAY PANEL (Tree View & Logs)
             VerticalLayout {
                 spacing: 8px;
                 horizontal-stretch: 1;
@@ -490,11 +467,9 @@ export component AppWindow inherits Window {
                     border-radius: 4px;
                     border-width: 1px;
                     border-color: #2b2d31;
-
                     VerticalLayout {
                         padding: 8px;
                         spacing: 6px;
-
                         HorizontalLayout {
                             alignment: space-between;
                             Text {
@@ -545,11 +520,9 @@ export component AppWindow inherits Window {
                     border-radius: 4px;
                     border-width: 1px;
                     border-color: #2b2d31;
-
                     VerticalLayout {
                         padding: 8px;
                         spacing: 4px;
-
                         Text {
                             text: "TERMINAL EXECUTION LOG";
                             font-size: 10px;
@@ -568,21 +541,19 @@ export component AppWindow inherits Window {
             }
         }
 
-        // BOTTOM BAR
+        // BOTTOM STATUS BAR
         Rectangle {
             height: 34px;
             background: #1e1f22;
             border-radius: 4px;
             border-width: 1px;
             border-color: #2b2d31;
-
             VerticalLayout {
                 padding-left: 10px;
                 padding-right: 10px;
                 padding-top: 4px;
                 padding-bottom: 4px;
                 spacing: 3px;
-
                 HorizontalLayout {
                     alignment: space-between;
                     Text {

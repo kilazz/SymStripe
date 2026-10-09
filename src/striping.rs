@@ -2,9 +2,11 @@ use crate::manifest::{
     ManifestFileEntry, StripingManifest, delete_manifest, load_manifest, save_manifest,
 };
 use crate::win32::get_free_disk_space_bytes;
+use std::collections::HashSet;
 use std::fs;
 use std::os::windows::fs::symlink_file;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use walkdir::WalkDir;
 
 /// Checks if a file's extension matches any extension in the provided list.
@@ -28,15 +30,23 @@ pub fn parse_ext_list(ext_str: &str) -> Vec<String> {
 /// Detects memory-mapped engine metadata, TOCs, and IoStore header stubs.
 /// These files MUST remain physically on the primary drive to avoid `IoDispatcher` crashes in UE4/5.
 pub fn is_iostore_metadata_companion(path: &Path) -> bool {
+    // 1. pakchunk0 and global files contain root project descriptors (.uproject) and engine bootstrapping assets
+    if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
+        let name_lower = file_name.to_lowercase();
+        if name_lower.starts_with("pakchunk0-") || name_lower.starts_with("global.") {
+            return true;
+        }
+    }
+
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let ext_lower = ext.to_lowercase();
 
-        // 1. Never relocate table of contents, signatures, or index files
+        // 2. Never relocate table of contents, signatures, or index files
         if matches!(ext_lower.as_str(), "utoc" | "sig" | "toc" | "idx") {
             return true;
         }
 
-        // 2. If it is a .pak file, check if it is a companion stub to an IoStore container (.ucas/.utoc)
+        // 3. Companion header .pak files
         if ext_lower == "pak" {
             let ucas_companion = path.with_extension("ucas");
             let utoc_companion = path.with_extension("utoc");
@@ -57,37 +67,6 @@ fn clean_empty_parents(file_path: &Path) {
         } else {
             break;
         }
-    }
-}
-
-/// Pre-flight capability probe: verifies that the process can create NTFS symbolic links in the source directory.
-pub fn verify_symlink_privilege(test_dir: &Path) -> Result<(), String> {
-    let test_src = test_dir.join(".symstripe_perm_test.tmp");
-    let test_link = test_dir.join(".symstripe_perm_link.tmp");
-
-    let _ = fs::remove_file(&test_src);
-    let _ = fs::remove_file(&test_link);
-
-    if let Err(e) = fs::write(&test_src, b"permission_probe") {
-        return Err(format!(
-            "Access denied writing to directory '{}': {}",
-            test_dir.display(),
-            e
-        ));
-    }
-
-    let link_result = symlink_file(&test_src, &test_link);
-
-    let _ = fs::remove_file(&test_src);
-    let _ = fs::remove_file(&test_link);
-
-    match link_result {
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!(
-            "Missing privilege to create symbolic links ({e}).\n\
-            Windows requires Administrator privileges OR Developer Mode enabled.\n\
-            Enable Developer Mode in Windows Settings (System -> For developers) or run SymStripe as Administrator."
-        )),
     }
 }
 
@@ -126,8 +105,7 @@ pub fn auto_detect_threshold(src_path: &Path, exclusions: &[String]) -> Option<u
         }
     }
 
-    let mb = (threshold / 1_048_576).max(1);
-    Some(mb)
+    Some((threshold / 1_048_576).max(1))
 }
 
 /// Verifies all manifest symlinks against physical secondary targets, auto-restoring missing links from .backup.
@@ -176,7 +154,7 @@ pub struct SimulationPlan {
 }
 
 /// Calculates an optimal multi-drive distribution plan using LPT bin-packing.
-/// Automatically retains memory-mapped metadata (.utoc/.pak stubs) on the primary drive.
+/// Automatically retains memory-mapped metadata (.utoc/.pak stubs) and boot chunks on the primary drive.
 pub fn calculate_allocation_plan(
     src_path: &Path,
     targets: &[PathBuf],
@@ -236,16 +214,35 @@ pub fn calculate_allocation_plan(
     })
 }
 
-/// Executes striping relocation with pre-flight permission checks, staged rollback, and incremental manifest saves.
+/// Creates an NTFS Directory Junction via the system `mklink` command.
+fn create_directory_junction(target_dir: &Path, junction_path: &Path) -> Result<(), String> {
+    let output = Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            junction_path.to_str().unwrap_or_default(),
+            target_dir.to_str().unwrap_or_default(),
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok(())
+}
+
+/// Executes striping relocation using either File Symlinks (Mode 0) or UE5 Subfolder Junctions (Mode 1).
 pub fn execute_striping(
     src_path: &Path,
     targets: &[PathBuf],
     plan: SimulationPlan,
     keep_backup: bool,
+    mode_idx: i32,
     mut on_progress: impl FnMut(usize, usize, &str, f32),
 ) -> Result<usize, String> {
-    verify_symlink_privilege(src_path)?;
-
+    // Validate free capacity on all target storage drives
     for (idx, target) in targets.iter().enumerate() {
         let required = plan.drive_bytes[idx + 1];
         if let Some(free) = get_free_disk_space_bytes(target).filter(|&free| free < required) {
@@ -268,6 +265,7 @@ pub fn execute_striping(
     });
 
     let mut moved_count = 0;
+    let mut created_junctions = HashSet::new();
 
     for (target_idx, bucket) in plan.drive_buckets.into_iter().enumerate().skip(1) {
         let target_root = &targets[target_idx - 1];
@@ -278,16 +276,22 @@ pub fn execute_striping(
                 Err(_) => continue,
             };
 
-            let target_file = target_root.join(rel);
-            if let Some(parent) = target_file.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-
             let filename = rel
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
+
+            // Safety guard: never relocate boot chunks or engine globals
+            if filename.to_lowercase().starts_with("pakchunk0-")
+                || filename.to_lowercase().starts_with("global.")
+            {
+                continue;
+            }
+
+            let target_file = target_root.join(rel);
+            let target_parent = target_file.parent().unwrap();
+            let _ = fs::create_dir_all(target_parent);
 
             let current_idx = moved_count + 1;
             let pct = if files_to_move > 0 {
@@ -324,16 +328,29 @@ pub fn execute_striping(
                 ));
             }
 
-            // Step 3: Create NTFS symlink
-            if let Err(sym_err) = symlink_file(&target_file, &f_path) {
+            // Step 3: Architecture-Specific Linking Strategy
+            if mode_idx == 0
+                && let Err(sym_err) = symlink_file(&target_file, &f_path)
+            {
                 let _ = fs::rename(stage_destination, &f_path);
                 let _ = fs::remove_file(&target_file);
                 clean_empty_parents(&target_file);
-
                 return Err(format!(
                     "Symlink creation failed for '{}': {sym_err}. Source file was safely restored.",
                     f_path.display()
                 ));
+            } else if mode_idx != 0 {
+                // Mode 1: UE5 Subfolder Directory Junctions
+                // Instead of linking the file, we link its parent directory into a visible subfolder (Paks_DriveX).
+                let src_parent = f_path.parent().unwrap();
+                let junction_name = format!("Paks_Drive{}", target_idx + 1);
+                let junction_path = src_parent.join(&junction_name);
+
+                if created_junctions.insert(junction_path.clone())
+                    && let Err(err) = create_directory_junction(target_parent, &junction_path)
+                {
+                    return Err(format!("Directory Junction creation failed: {}", err));
+                }
             }
 
             // Step 4: Clean stage file
@@ -407,41 +424,16 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
             };
             on_progress(current_idx, total, pct);
         }
-    } else {
-        let mut all_files = Vec::new();
-        for entry in WalkDir::new(src_path).into_iter().filter_map(|e| e.ok()) {
-            all_files.push(entry.path().to_path_buf());
-        }
+    }
 
-        let total = all_files.len();
-        for (idx, p) in all_files.into_iter().enumerate() {
-            let backup_p = PathBuf::from(format!("{}.backup", p.to_string_lossy()));
-
-            if backup_p.exists() {
-                let _ = fs::remove_file(&p);
-                if fs::rename(&backup_p, &p).is_ok() {
-                    reverted += 1;
-                }
-            } else if let Some(target) = fs::symlink_metadata(&p)
-                .ok()
-                .filter(|m| m.file_type().is_symlink())
-                .and_then(|_| fs::read_link(&p).ok())
-                .filter(|t| t.exists())
-            {
-                let _ = fs::remove_file(&p);
-                if fs::copy(&target, &p).is_ok() {
-                    let _ = fs::remove_file(&target);
-                    clean_empty_parents(&target);
-                    reverted += 1;
-                }
-            }
-
-            let pct = if total > 0 {
-                (idx + 1) as f32 / total as f32
-            } else {
-                1.0
-            };
-            on_progress(idx + 1, total, pct);
+    // Clean up Subfolder Junctions (Mode 1 cleanup)
+    for entry in WalkDir::new(src_path).into_iter().filter_map(|e| e.ok()) {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("Paks_Drive")
+        {
+            let _ = fs::remove_dir(entry.path());
         }
     }
 

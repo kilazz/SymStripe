@@ -11,6 +11,14 @@ fn default_false() -> bool {
     false
 }
 
+fn default_mode() -> i32 {
+    0 // 0 = NTFS Symlinks, 1 = WinFsp VFS
+}
+
+fn default_mount_point() -> String {
+    "Z:".to_string()
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Profile {
     pub name: String,
@@ -23,6 +31,10 @@ pub struct Profile {
     pub keep_backup: bool,
     #[serde(default = "default_false")]
     pub aggressive_media: bool,
+    #[serde(default = "default_mode")]
+    pub mode_idx: i32,
+    #[serde(default = "default_mount_point")]
+    pub vfs_mount_point: String,
 }
 
 impl Default for Profile {
@@ -36,6 +48,8 @@ impl Default for Profile {
             media_extensions: "bik, bk2, mp4, fsb, pck, wem".to_string(),
             keep_backup: true,
             aggressive_media: false,
+            mode_idx: 0,
+            vfs_mount_point: "Z:".to_string(),
         }
     }
 }
@@ -74,6 +88,7 @@ pub fn get_config_file_path() -> PathBuf {
 pub fn load_config() -> AppConfig {
     let main_path = get_config_file_path();
 
+    // 1. Try reading from %APPDATA%\SymStripe\config.json
     if let Ok(content) = fs::read_to_string(&main_path)
         && let Ok(cfg) = serde_json::from_str::<AppConfig>(&content)
         && !cfg.profiles.is_empty()
@@ -81,6 +96,7 @@ pub fn load_config() -> AppConfig {
         return cfg;
     }
 
+    // 2. Migration fallback: check legacy path next to executable if AppData doesn't exist yet
     if let Ok(exe_path) = env::current_exe()
         && let Some(parent) = exe_path.parent()
     {
@@ -90,7 +106,7 @@ pub fn load_config() -> AppConfig {
             && let Ok(cfg) = serde_json::from_str::<AppConfig>(&content)
             && !cfg.profiles.is_empty()
         {
-            save_config(&cfg);
+            save_config(&cfg); // Migrate immediately to AppData
             return cfg;
         }
     }
