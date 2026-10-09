@@ -9,7 +9,7 @@ use config::{AppConfig, Profile, load_config, save_config};
 use manifest::load_manifest;
 use striping::{
     auto_detect_threshold, calculate_allocation_plan, execute_consolidate, execute_revert,
-    execute_striping, parse_exclusions, verify_and_repair_integrity,
+    execute_striping, parse_ext_list, verify_and_repair_integrity,
 };
 use win32::{get_logical_volumes, query_smart_disks};
 
@@ -126,6 +126,7 @@ fn apply_profile_to_ui(profile: &Profile, app: &AppWindow, ui_weak: &slint::Weak
     app.set_primary_path(profile.primary_path.clone().into());
     app.set_min_size_mb_text(profile.min_size_mb.clone().into());
     app.set_exclusions_text(profile.exclusions.clone().into());
+    app.set_media_extensions_text(profile.media_extensions.clone().into());
     app.set_keep_backup(profile.keep_backup);
     app.set_aggressive_media(profile.aggressive_media);
 
@@ -187,7 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
 
-            let excl_list = parse_exclusions(&excl);
+            let excl_list = parse_ext_list(&excl);
             update_status(&w, "Auto-detecting optimal threshold...");
 
             if let Some(optimal_mb) = auto_detect_threshold(&src_path, &excl_list) {
@@ -208,7 +209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // Verify Integrity & Auto-Repair
+    // Verify Integrity
     let weak = ui_weak.clone();
     app.on_verify_integrity(move |src_dir| {
         let src = src_dir.to_string();
@@ -251,6 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui.set_primary_path(prof.primary_path.clone().into());
                 ui.set_min_size_mb_text(prof.min_size_mb.clone().into());
                 ui.set_exclusions_text(prof.exclusions.clone().into());
+                ui.set_media_extensions_text(prof.media_extensions.clone().into());
                 ui.set_keep_backup(prof.keep_backup);
                 ui.set_aggressive_media(prof.aggressive_media);
 
@@ -343,6 +345,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_primary_path(prof.primary_path.clone().into());
             ui.set_min_size_mb_text(prof.min_size_mb.clone().into());
             ui.set_exclusions_text(prof.exclusions.clone().into());
+            ui.set_media_extensions_text(prof.media_extensions.clone().into());
             ui.set_keep_backup(prof.keep_backup);
             ui.set_aggressive_media(prof.aggressive_media);
 
@@ -412,7 +415,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|(i, p)| format!("[Drive {}] {}", i + 2, p))
                     .collect();
 
-                let count = prof.secondary_targets.len();
+                let _ = prof.secondary_targets.len();
                 save_config(&st.config);
 
                 let _ = weak.upgrade_in_event_loop(move |ui| {
@@ -422,10 +425,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect();
                     ui.set_target_drives_list(ModelRc::new(VecModel::from(items)));
                 });
-                append_log(
-                    &weak,
-                    &format!("Target drive added. Total active drives: {}", count + 1),
-                );
+                append_log(&weak, "Target drive added to profile.");
             }
         }
     });
@@ -447,7 +447,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         append_log(&weak, "All secondary target drives cleared.");
     });
 
-    // Consolidate & Free Single Target Drive
+    // Consolidate Target Drive
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_consolidate_target_drive(move || {
@@ -538,9 +538,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_preview_striping(
-        move |src_dir, min_mb, exclusions_str, keep_backup, aggressive_media| {
+        move |src_dir, min_mb, exclusions_str, media_exts_str, keep_backup, aggressive_media| {
             let src = src_dir.to_string();
             let excl = exclusions_str.to_string();
+            let media = media_exts_str.to_string();
             let threshold = (min_mb as u64) * 1024 * 1024;
             let w = weak.clone();
             let st_lock = state_arc.clone();
@@ -569,10 +570,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
 
-                let excl_list = parse_exclusions(&excl);
+                let excl_list = parse_ext_list(&excl);
+                let media_list = parse_ext_list(&media);
                 append_log(
                     &w,
-                    &format!("--- PREVIEW ANALYSIS (Safe Mode: {}) ---", keep_backup),
+                    &format!(
+                        "--- PREVIEW ANALYSIS (Media Offload: {}) ---",
+                        aggressive_media
+                    ),
                 );
 
                 let Some(plan) = calculate_allocation_plan(
@@ -580,6 +585,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &targets,
                     threshold,
                     &excl_list,
+                    &media_list,
                     aggressive_media,
                 ) else {
                     append_log(&w, "No files matching criteria found for striping.");
@@ -668,9 +674,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_apply_striping(
-        move |src_dir, min_mb, exclusions_str, keep_backup, aggressive_media| {
+        move |src_dir, min_mb, exclusions_str, media_exts_str, keep_backup, aggressive_media| {
             let src = src_dir.to_string();
             let excl = exclusions_str.to_string();
+            let media = media_exts_str.to_string();
             let threshold = (min_mb as u64) * 1024 * 1024;
             let w = weak.clone();
             let st_lock = state_arc.clone();
@@ -683,6 +690,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         prof.primary_path = src.clone();
                         prof.min_size_mb = min_mb.to_string();
                         prof.exclusions = excl.clone();
+                        prof.media_extensions = media.clone();
                         prof.keep_backup = keep_backup;
                         prof.aggressive_media = aggressive_media;
                         save_config(&st.config);
@@ -706,13 +714,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let src_path = PathBuf::from(&src);
-                let excl_list = parse_exclusions(&excl);
+                let excl_list = parse_ext_list(&excl);
+                let media_list = parse_ext_list(&media);
 
                 let Some(plan) = calculate_allocation_plan(
                     &src_path,
                     &targets,
                     threshold,
                     &excl_list,
+                    &media_list,
                     aggressive_media,
                 ) else {
                     append_log(&w, "No files matching criteria found.");
@@ -813,7 +823,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // Speed Benchmark
+    // Speed Benchmark across ALL configured drives
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_run_benchmark(move || {
@@ -825,7 +835,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let st = st_lock.lock().unwrap();
                 let idx = st.config.active_profile_index;
                 let prof = &st.config.profiles[idx];
-                (prof.primary_path.clone(), prof.secondary_targets.clone())
+                (
+                    prof.primary_path.clone(),
+                    prof.secondary_targets
+                        .iter()
+                        .map(PathBuf::from)
+                        .collect::<Vec<_>>(),
+                )
             };
 
             if src_dir.is_empty() || targets.is_empty() {
@@ -836,7 +852,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
 
-            append_log(&w, "=== STARTING HARDWARE BENCHMARK ===");
+            let total_drives = 1 + targets.len();
+            append_log(
+                &w,
+                &format!(
+                    "=== STARTING HARDWARE BENCHMARK ({} DRIVES) ===",
+                    total_drives
+                ),
+            );
             update_status(&w, "Running benchmark (128 MB blocks)...");
 
             let _ = w.upgrade_in_event_loop(|ui| {
@@ -844,27 +867,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui.set_progress(0.2);
             });
 
-            match run_benchmark_test(Path::new(&src_dir), Path::new(&targets[0])) {
+            match run_benchmark_test(Path::new(&src_dir), &targets) {
                 Ok(res) => {
                     append_log(&w, "--- BENCHMARK RESULTS ---");
                     append_log(
                         &w,
                         &format!(
-                            "• Single-Drive Read (Drive 1):  {:.1} MB/s",
+                            "• Single-Drive Read (Drive 1):               {:.1} MB/s",
                             res.single_speed_mbs
                         ),
                     );
                     append_log(
                         &w,
                         &format!(
-                            "• Multi-Drive Parallel Read:    {:.1} MB/s",
-                            res.parallel_speed_mbs
+                            "• Multi-Drive Concurrent Read ({} Drives):   {:.1} MB/s",
+                            res.drives_tested, res.parallel_speed_mbs
                         ),
                     );
                     append_log(
                         &w,
                         &format!(
-                            "• Measured Hardware Boost:      {:+.1}% 🚀",
+                            "• Measured Hardware Boost:                   {:+.1}% 🚀",
                             res.boost_percentage
                         ),
                     );
@@ -874,8 +897,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ui.set_is_processing(false);
                         ui.set_status_msg(
                             format!(
-                                "Single: {:.0} MB/s | Parallel: {:.0} MB/s ({:+.0}%)",
-                                res.single_speed_mbs, res.parallel_speed_mbs, res.boost_percentage
+                                "Single: {:.0} MB/s | {} Drives: {:.0} MB/s ({:+.0}%)",
+                                res.single_speed_mbs,
+                                res.drives_tested,
+                                res.parallel_speed_mbs,
+                                res.boost_percentage
                             )
                             .into(),
                         );

@@ -18,6 +18,7 @@ pub struct Profile {
     pub secondary_targets: Vec<String>,
     pub min_size_mb: String,
     pub exclusions: String,
+    pub media_extensions: String,
     #[serde(default = "default_true")]
     pub keep_backup: bool,
     #[serde(default = "default_false")]
@@ -32,6 +33,7 @@ impl Default for Profile {
             secondary_targets: Vec::new(),
             min_size_mb: "50".to_string(),
             exclusions: "exe, dll, pdb".to_string(),
+            media_extensions: "bik, bk2, mp4, fsb, pck, wem".to_string(),
             keep_backup: true,
             aggressive_media: false,
         }
@@ -42,7 +44,6 @@ impl Default for Profile {
 pub struct AppConfig {
     pub active_profile_index: usize,
     pub profiles: Vec<Profile>,
-    pub drive_letter: String,
 }
 
 impl Default for AppConfig {
@@ -50,7 +51,6 @@ impl Default for AppConfig {
         Self {
             active_profile_index: 0,
             profiles: vec![Profile::default()],
-            drive_letter: "Z:".to_string(),
         }
     }
 }

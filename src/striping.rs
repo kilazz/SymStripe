@@ -7,38 +7,25 @@ use std::os::windows::fs::symlink_file;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-pub fn is_excluded(path: &Path, exclusions: &[String]) -> bool {
+pub fn is_ext_match(path: &Path, exts: &[String]) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let ext_lower = ext.to_lowercase();
-        return exclusions.iter().any(|ex| ex == &ext_lower);
+        return exts.iter().any(|e| e == &ext_lower);
     }
     false
 }
 
-pub fn is_media_file(path: &Path) -> bool {
-    const MEDIA_EXTS: &[&str] = &[
-        "bik", "bk2", "mp4", "avi", "mkv", "wmv", "fsb", "pck", "bnk", "wav", "ogg", "wem",
-    ];
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext_lower = ext.to_lowercase();
-        return MEDIA_EXTS.contains(&ext_lower.as_str());
-    }
-    false
-}
-
-pub fn parse_exclusions(exclusions_str: &str) -> Vec<String> {
-    exclusions_str
+pub fn parse_ext_list(ext_str: &str) -> Vec<String> {
+    ext_str
         .split(',')
         .map(|s| s.trim().trim_start_matches('.').to_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
 }
 
-/// Recursively removes empty parent directories up the tree
 fn clean_empty_parents(file_path: &Path) {
     let mut current = file_path.to_path_buf();
     while let Some(parent) = current.parent() {
-        // fs::remove_dir only succeeds if the directory is completely empty
         if fs::remove_dir(parent).is_ok() {
             current = parent.to_path_buf();
         } else {
@@ -53,7 +40,7 @@ pub fn auto_detect_threshold(src_path: &Path, exclusions: &[String]) -> Option<u
 
     for entry in WalkDir::new(src_path).into_iter().filter_map(|e| e.ok()) {
         let p = entry.path();
-        if is_excluded(p, exclusions) {
+        if is_ext_match(p, exclusions) {
             continue;
         }
         if let Some(meta) = fs::symlink_metadata(p).ok().filter(|m| m.is_file()) {
@@ -134,17 +121,18 @@ pub fn calculate_allocation_plan(
     targets: &[PathBuf],
     min_size_bytes: u64,
     exclusions: &[String],
+    media_exts: &[String],
     aggressive_media: bool,
 ) -> Option<SimulationPlan> {
     let mut files = Vec::new();
 
     for entry in WalkDir::new(src_path).into_iter().filter_map(|e| e.ok()) {
         let p = entry.path();
-        if is_excluded(p, exclusions) {
+        if is_ext_match(p, exclusions) {
             continue;
         }
         if let Some(meta) = fs::symlink_metadata(p).ok().filter(|m| m.is_file()) {
-            let is_media = aggressive_media && is_media_file(p);
+            let is_media = aggressive_media && is_ext_match(p, media_exts);
             if is_media || meta.len() >= min_size_bytes {
                 files.push((p.to_path_buf(), meta.len(), is_media));
             }
@@ -384,7 +372,6 @@ pub fn execute_consolidate(src_path: &Path, chosen_target_dir: &Path) -> Result<
         save_manifest(src_path, &manifest);
     }
 
-    // Safety: we use remove_dir instead of remove_dir_all to ensure we don't wipe custom user files
     let _ = fs::remove_dir(chosen_target_dir);
     Ok(consolidated_count)
 }

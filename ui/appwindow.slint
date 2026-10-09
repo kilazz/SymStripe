@@ -60,11 +60,11 @@ component SectionHeader {
 }
 
 export component AppWindow inherits Window {
-    title: "SymStripe - Multi-Drive Parallel Storage Accelerator";
+    title: "SymStripe - Multi-Drive Storage Accelerator";
     min-width: 1000px;
-    min-height: 720px;
+    min-height: 740px;
     preferred-width: 1080px;
-    preferred-height: 760px;
+    preferred-height: 800px;
     background: #141414;
 
     // Profile state
@@ -76,6 +76,7 @@ export component AppWindow inherits Window {
     in-out property <[StandardListViewItem]> target_drives_list: [];
     in-out property <string> min_size_mb_text: "50";
     in-out property <string> exclusions_text: "exe, dll, pdb";
+    in-out property <string> media_extensions_text: "bik, bk2, mp4, fsb, pck, wem";
     in-out property <bool> keep_backup: true;
     in-out property <bool> aggressive_media: false;
     in-out property <bool> is_already_striped: false;
@@ -105,10 +106,9 @@ export component AppWindow inherits Window {
     callback auto_detect_threshold(string, string);
     callback verify_integrity(string);
 
-    callback preview_striping(string, int, string, bool, bool);
-    callback apply_striping(string, int, string, bool, bool);
+    callback preview_striping(string, int, string, string, bool, bool);
+    callback apply_striping(string, int, string, string, bool, bool);
     callback revert_striping(string);
-
     callback scan_drives();
     callback run_benchmark();
 
@@ -139,7 +139,7 @@ export component AppWindow inherits Window {
                     }
 
                     Text {
-                        text: "Smart Thresholds, Media Offload & Auto-Repair";
+                        text: "Smart Thresholds, Media Offload & Multi-Spindle I/O";
                         font-size: 10px;
                         color: #808080;
                     }
@@ -204,7 +204,7 @@ export component AppWindow inherits Window {
                 ScrollView {
                     VerticalLayout {
                         padding: 12px;
-                        spacing: 16px;
+                        spacing: 12px;
                         alignment: start;
 
                         // Section 0
@@ -270,7 +270,7 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             spacing: 6px;
                             Rectangle {
-                                height: 85px;
+                                height: 70px;
                                 background: #141414;
                                 border-radius: 4px;
                                 border-width: 1px;
@@ -308,7 +308,7 @@ export component AppWindow inherits Window {
                                 }
 
                                 CustomButton {
-                                    text: "Consolidate & Free";
+                                    text: "Consolidate & Free Drive";
                                     primary-color: #d97706;
                                     enabled: root.is_already_striped && !root.is_processing;
                                     clicked => { root.consolidate_target_drive(); }
@@ -373,7 +373,24 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // Backup Mode Toggle
+                        HorizontalLayout {
+                            height: 30px;
+                            spacing: 8px;
+                            alignment: start;
+
+                            Text {
+                                text: "Media Extensions:";
+                                vertical-alignment: center;
+                                font-size: 11px;
+                                color: #dcddde;
+                            }
+
+                            LineEdit {
+                                text <=> root.media_extensions_text;
+                                placeholder-text: "bik, bk2, mp4, fsb...";
+                            }
+                        }
+
                         VerticalLayout {
                             spacing: 5px;
                             CheckBox {
@@ -382,7 +399,7 @@ export component AppWindow inherits Window {
                             }
 
                             CheckBox {
-                                text: "Aggressive Media Offload (.bik, .mp4, .fsb to Target)";
+                                text: "Aggressive Media Offload (Force media to targets)";
                                 checked <=> root.aggressive_media;
                             }
                         }
@@ -427,13 +444,14 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // Actions
                         HorizontalLayout {
                             CustomButton {
                                 text: "Analyze & Preview Split (Dry Run)";
                                 primary-color: #4a5d6e;
                                 enabled: !root.is_processing && !root.is_already_striped;
-                                clicked => { root.preview_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.keep_backup, root.aggressive_media); }
+                                clicked => {
+                                    root.preview_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.media_extensions_text, root.keep_backup, root.aggressive_media);
+                                }
                             }
                         }
 
@@ -443,14 +461,18 @@ export component AppWindow inherits Window {
                                 text: "Distribute Across All Drives";
                                 primary-color: #23a55a;
                                 enabled: !root.is_processing && !root.is_already_striped;
-                                clicked => { root.apply_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.keep_backup, root.aggressive_media); }
+                                clicked => {
+                                    root.apply_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.media_extensions_text, root.keep_backup, root.aggressive_media);
+                                }
                             }
 
                             CustomButton {
                                 text: "Revert All to Primary";
                                 primary-color: root.is_already_striped ? #f0b132 : #3e6a90;
                                 enabled: !root.is_processing;
-                                clicked => { root.revert_striping(root.primary_path); }
+                                clicked => {
+                                    root.revert_striping(root.primary_path);
+                                }
                             }
                         }
                     }
