@@ -54,12 +54,18 @@ fn open_unbuffered_file(path: &Path) -> std::io::Result<File> {
         .or_else(|_| File::open(path))
 }
 
+fn cleanup_bench_files(paths: &[PathBuf]) {
+    for p in paths {
+        let _ = fs::remove_file(p);
+    }
+}
+
 pub fn run_benchmark_test(src_dir: &Path, targets: &[PathBuf]) -> Result<BenchmarkResult, String> {
     if targets.is_empty() {
         return Err("No target drives configured for benchmark.".into());
     }
 
-    let mut all_paths = vec![PathBuf::from(src_dir).join(".bench_test_0.tmp")];
+    let mut all_paths = vec![src_dir.join(".bench_test_0.tmp")];
     for (idx, target) in targets.iter().enumerate() {
         all_paths.push(target.join(format!(".bench_test_{}.tmp", idx + 1)));
     }
@@ -69,7 +75,7 @@ pub fn run_benchmark_test(src_dir: &Path, targets: &[PathBuf]) -> Result<Benchma
     let mut write_buffer = AlignedBuffer::new(payload_bytes, 4096);
     write_buffer.as_slice_mut().fill(0xAA);
 
-    // Create unbuffered test files on ALL drives in the array
+    // Create unbuffered test files on all drives in the array
     for (i, path) in all_paths.iter().enumerate() {
         let write_opt = OpenOptions::new()
             .write(true)
@@ -79,61 +85,87 @@ pub fn run_benchmark_test(src_dir: &Path, targets: &[PathBuf]) -> Result<Benchma
             .open(path);
 
         if let Ok(mut f) = write_opt {
-            let _ = f.write_all(write_buffer.as_slice_mut());
-            let _ = f.sync_all();
-        } else {
-            for p in &all_paths[..i] {
-                let _ = fs::remove_file(p);
+            if f.write_all(write_buffer.as_slice_mut()).is_err() || f.sync_all().is_err() {
+                cleanup_bench_files(&all_paths[..=i]);
+                return Err(format!("Failed to write test block to Drive {}.", i + 1));
             }
-            return Err(format!("Failed to write test block to Drive {}.", i + 1));
+        } else {
+            cleanup_bench_files(&all_paths[..i]);
+            return Err(format!(
+                "Failed to create benchmark test file on Drive {}.",
+                i + 1
+            ));
         }
     }
 
     drop(write_buffer);
 
-    // 1. Single-Drive Read (Drive 1 only)
+    // 1. Single-Drive Read Test (Drive 1 only)
     let start_single = Instant::now();
     let mut single_buf = AlignedBuffer::new(payload_bytes, 4096);
 
-    if let Ok(mut fa) = open_unbuffered_file(&all_paths[0]) {
-        let _ = fa.read_exact(single_buf.as_slice_mut());
-    } else {
-        for p in &all_paths {
-            let _ = fs::remove_file(p);
+    let single_read_bytes = match open_unbuffered_file(&all_paths[0]) {
+        Ok(mut fa) => match fa.read_exact(single_buf.as_slice_mut()) {
+            Ok(_) => payload_bytes,
+            Err(e) => {
+                cleanup_bench_files(&all_paths);
+                return Err(format!("Failed reading from Primary Drive: {e}"));
+            }
+        },
+        Err(e) => {
+            cleanup_bench_files(&all_paths);
+            return Err(format!("Failed to open Primary Drive test file: {e}"));
         }
-        return Err("Failed to read from Primary Drive.".into());
-    }
+    };
 
     let single_duration = start_single.elapsed().as_secs_f64();
-    let single_speed_mbs = 128.0 / single_duration.max(0.001);
+    let single_speed_mbs =
+        (single_read_bytes as f64 / (1024.0 * 1024.0)) / single_duration.max(0.001);
     drop(single_buf);
 
-    // 2. Parallel Multi-Drive Concurrent Read across ALL drives!
+    // 2. Parallel Multi-Drive Concurrent Read across all drives
     let start_parallel = Instant::now();
     let mut handles = Vec::new();
 
-    for path in &all_paths {
+    for (idx, path) in all_paths.iter().enumerate() {
         let p = path.clone();
-        let handle = thread::spawn(move || {
+        let handle = thread::spawn(move || -> Result<usize, String> {
             let mut buf = AlignedBuffer::new(payload_bytes, 4096);
-            if let Ok(mut f) = open_unbuffered_file(&p) {
-                let _ = f.read_exact(buf.as_slice_mut());
-            }
+            let mut f = open_unbuffered_file(&p)
+                .map_err(|e| format!("Drive {} open error: {e}", idx + 1))?;
+            f.read_exact(buf.as_slice_mut())
+                .map_err(|e| format!("Drive {} read error: {e}", idx + 1))?;
+            Ok(payload_bytes)
         });
         handles.push(handle);
     }
 
+    let mut total_bytes_read: usize = 0;
+    let mut errors: Vec<String> = Vec::new();
+
     for h in handles {
-        let _ = h.join();
+        match h.join() {
+            Ok(Ok(bytes)) => total_bytes_read += bytes,
+            Ok(Err(err_msg)) => errors.push(err_msg),
+            Err(_) => errors.push("Thread panicked during disk read".into()),
+        }
+    }
+
+    // Always clean up test files
+    cleanup_bench_files(&all_paths);
+
+    // If any thread failed, abort with exact details instead of returning distorted metrics
+    if !errors.is_empty() {
+        return Err(format!(
+            "Parallel benchmark failed on {} drive(s): {}",
+            errors.len(),
+            errors.join("; ")
+        ));
     }
 
     let parallel_duration = start_parallel.elapsed().as_secs_f64();
-    let total_mb_read = 128.0 * (all_paths.len() as f64);
+    let total_mb_read = total_bytes_read as f64 / (1024.0 * 1024.0);
     let parallel_speed_mbs = total_mb_read / parallel_duration.max(0.001);
-
-    for p in &all_paths {
-        let _ = fs::remove_file(p);
-    }
 
     let boost_percentage =
         ((parallel_speed_mbs - single_speed_mbs) / single_speed_mbs.max(1.0)) * 100.0;
