@@ -1,0 +1,590 @@
+import {
+    CheckBox,
+    ComboBox,
+    LineEdit,
+    ScrollView,
+    TextEdit,
+    ListView,
+} from "std-widgets.slint";
+
+component CustomButton {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <color> primary-color: #3e6a90;
+    callback clicked;
+
+    height: 30px;
+
+    Rectangle {
+        background: !root.enabled ? #202124 : (ta.has-hover ? root.primary-color.brighter(12%) : root.primary-color);
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: !root.enabled ? #2b2d31 : root.primary-color.darker(10%);
+
+        Text {
+            text: root.text;
+            color: !root.enabled ? #808080 : #ffffff;
+            font-size: 11px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+component SectionHeader {
+    in property <string> title;
+    in property <color> title-color: #949ba4;
+
+    height: 22px;
+    VerticalLayout {
+        spacing: 3px;
+        Text {
+            text: root.title;
+            font-size: 11px;
+            font-weight: 700;
+            color: root.title-color;
+        }
+
+        Rectangle {
+            height: 1px;
+            background: #353535;
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "SymStripe - Multi-Drive Parallel Storage Accelerator";
+    min-width: 1000px;
+    min-height: 720px;
+    preferred-width: 1080px;
+    preferred-height: 760px;
+    background: #141414;
+
+    // Profile state
+    in-out property <[string]> profile_names: ["Default Profile"];
+    in-out property <int> active_profile_idx: 0;
+
+    // Config & path properties
+    in-out property <string> primary_path: "";
+    in-out property <[StandardListViewItem]> target_drives_list: [];
+    in-out property <string> min_size_mb_text: "50";
+    in-out property <string> exclusions_text: "exe, dll, pdb";
+    in-out property <bool> keep_backup: true;
+    in-out property <bool> aggressive_media: false;
+    in-out property <bool> is_already_striped: false;
+
+    // Diagnostics & SMART
+    in-out property <string> smart_alert_text: "";
+
+    // Progress bar & status state
+    in-out property <float> progress: 0.0;
+    in-out property <bool> is_processing: false;
+    in-out property <string> log_text: "System ready. Select or create a profile to begin.\n";
+    in-out property <string> status_msg: "Ready";
+    in-out property <string> summary_text: "No files analyzed yet.";
+    in-out property <[StandardListViewItem]> file_list: [];
+
+    // Callbacks
+    callback profile_selected(int);
+    callback create_profile();
+    callback delete_profile();
+
+    callback browse_primary_folder() -> string;
+    callback primary_folder_changed(string);
+    callback add_target_drive();
+    callback clear_target_drives();
+    callback consolidate_target_drive();
+
+    callback auto_detect_threshold(string, string);
+    callback verify_integrity(string);
+
+    callback preview_striping(string, int, string, bool, bool);
+    callback apply_striping(string, int, string, bool, bool);
+    callback revert_striping(string);
+
+    callback scan_drives();
+    callback run_benchmark();
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        // TOP HEADER BAR
+        Rectangle {
+            height: 42px;
+            background: #1e1f22;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: #2b2d31;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                alignment: space-between;
+
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "SYMSTRIPE PARALLEL ACCELERATOR";
+                        font-size: 12px;
+                        font-weight: 800;
+                        color: #ffffff;
+                    }
+
+                    Text {
+                        text: "Smart Thresholds, Media Offload & Auto-Repair";
+                        font-size: 10px;
+                        color: #808080;
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 8px;
+
+                    CustomButton {
+                        text: "Run Speed Benchmark";
+                        width: 150px;
+                        primary-color: #d97706;
+                        enabled: !root.is_processing;
+                        clicked => { root.run_benchmark(); }
+                    }
+
+                    CustomButton {
+                        text: "Scan S.M.A.R.T. & Disks";
+                        width: 150px;
+                        primary-color: #2b2d31;
+                        clicked => { root.scan_drives(); }
+                    }
+                }
+            }
+        }
+
+        if root.smart_alert_text != "": Rectangle {
+            height: 30px;
+            background: #3d1414;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: #e53935;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                alignment: center;
+                Text {
+                    text: root.smart_alert_text;
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: #ff8a80;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // MAIN WORKSPACE
+        HorizontalLayout {
+            spacing: 8px;
+            vertical-stretch: 1;
+
+            // LEFT PANEL
+            Rectangle {
+                width: 470px;
+                background: #1e1f22;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: #2b2d31;
+
+                ScrollView {
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 16px;
+                        alignment: start;
+
+                        // Section 0
+                        SectionHeader {
+                            title: "ACTIVE STORAGE PROFILE";
+                            title-color: #3e6a90;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 6px;
+                            height: 30px;
+                            ComboBox {
+                                model: root.profile_names;
+                                current-index <=> root.active_profile_idx;
+                                selected(val) => { root.profile_selected(root.active_profile_idx); }
+                            }
+
+                            CustomButton {
+                                text: "+ New";
+                                width: 50px;
+                                clicked => { root.create_profile(); }
+                            }
+
+                            CustomButton {
+                                text: "Del";
+                                width: 40px;
+                                primary-color: #c94040;
+                                clicked => { root.delete_profile(); }
+                            }
+                        }
+
+                        // Section 1
+                        SectionHeader {
+                            title: "PRIMARY DRIVE (SOURCE / DATA DIRECTORY)";
+                            title-color: #3e6a90;
+                        }
+
+                        VerticalLayout {
+                            spacing: 5px;
+                            HorizontalLayout {
+                                spacing: 5px;
+                                height: 30px;
+                                LineEdit {
+                                    text <=> root.primary_path;
+                                    placeholder-text: "D:\\Games\\Title or D:\\Datasets...";
+                                    edited(val) => { root.primary_folder_changed(val); }
+                                }
+
+                                CustomButton {
+                                    text: "...";
+                                    width: 32px;
+                                    clicked => { root.primary_path = root.browse_primary_folder(); }
+                                }
+                            }
+                        }
+
+                        // Section 2
+                        SectionHeader {
+                            title: "SECONDARY TARGET DRIVES (PARALLEL SPINDLES)";
+                            title-color: #f0b132;
+                        }
+
+                        VerticalLayout {
+                            spacing: 6px;
+                            Rectangle {
+                                height: 85px;
+                                background: #141414;
+                                border-radius: 4px;
+                                border-width: 1px;
+                                border-color: #2b2d31;
+
+                                ListView {
+                                    for item in root.target_drives_list: Rectangle {
+                                        height: 22px;
+                                        background: ta_td.has-hover ? #202226 : transparent;
+                                        border-radius: 2px;
+                                        ta_td := TouchArea { }
+
+                                        HorizontalLayout {
+                                            padding-left: 6px;
+                                            padding-right: 6px;
+                                            alignment: start;
+                                            Text {
+                                                text: item.text;
+                                                font-family: "Consolas";
+                                                font-size: 11px;
+                                                color: #f0b132;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 6px;
+                                CustomButton {
+                                    text: "+ Add Target";
+                                    primary-color: #f0b132;
+                                    clicked => { root.add_target_drive(); }
+                                }
+
+                                CustomButton {
+                                    text: "Consolidate & Free";
+                                    primary-color: #d97706;
+                                    enabled: root.is_already_striped && !root.is_processing;
+                                    clicked => { root.consolidate_target_drive(); }
+                                }
+
+                                CustomButton {
+                                    text: "Clear List";
+                                    primary-color: #2b2d31;
+                                    width: 75px;
+                                    clicked => { root.clear_target_drives(); }
+                                }
+                            }
+                        }
+
+                        // Section 3
+                        SectionHeader {
+                            title: "MULTI-DRIVE ASSET STRIPING & SAFETY MODES";
+                            title-color: #23a55a;
+                        }
+
+                        HorizontalLayout {
+                            height: 30px;
+                            spacing: 8px;
+                            alignment: start;
+
+                            Text {
+                                text: "Min Archive Size (MB):";
+                                vertical-alignment: center;
+                                font-size: 11px;
+                                color: #dcddde;
+                            }
+
+                            LineEdit {
+                                width: 60px;
+                                text <=> root.min_size_mb_text;
+                            }
+
+                            CustomButton {
+                                text: "Auto";
+                                width: 50px;
+                                primary-color: #3e6a90;
+                                enabled: !root.is_processing;
+                                clicked => { root.auto_detect_threshold(root.primary_path, root.exclusions_text); }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            height: 30px;
+                            spacing: 8px;
+                            alignment: start;
+
+                            Text {
+                                text: "Exclude Extensions:";
+                                vertical-alignment: center;
+                                font-size: 11px;
+                                color: #dcddde;
+                            }
+
+                            LineEdit {
+                                text <=> root.exclusions_text;
+                                placeholder-text: "exe, dll, pdb...";
+                            }
+                        }
+
+                        // Backup Mode Toggle
+                        VerticalLayout {
+                            spacing: 5px;
+                            CheckBox {
+                                text: "Keep local .backup on Drive 1 (Safe Mode)";
+                                checked <=> root.keep_backup;
+                            }
+
+                            CheckBox {
+                                text: "Aggressive Media Offload (.bik, .mp4, .fsb to Target)";
+                                checked <=> root.aggressive_media;
+                            }
+                        }
+
+                        // Warning & Integrity Banner
+                        if root.is_already_striped: Rectangle {
+                            background: #2a1c0d;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: #f0b132;
+
+                            HorizontalLayout {
+                                padding: 8px;
+                                spacing: 8px;
+                                VerticalLayout {
+                                    spacing: 3px;
+                                    Text {
+                                        text: "⚠️ CAUTION: Files are physically split!";
+                                        font-size: 11px;
+                                        font-weight: 800;
+                                        color: #f0b132;
+                                    }
+
+                                    Text {
+                                        text: "Use Revert or Consolidate to manage folders safely.";
+                                        font-size: 10px;
+                                        color: #dcddde;
+                                        wrap: word-wrap;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    CustomButton {
+                                        text: "Verify Integrity";
+                                        width: 110px;
+                                        primary-color: #d97706;
+                                        enabled: !root.is_processing;
+                                        clicked => { root.verify_integrity(root.primary_path); }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Actions
+                        HorizontalLayout {
+                            CustomButton {
+                                text: "Analyze & Preview Split (Dry Run)";
+                                primary-color: #4a5d6e;
+                                enabled: !root.is_processing && !root.is_already_striped;
+                                clicked => { root.preview_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.keep_backup, root.aggressive_media); }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 6px;
+                            CustomButton {
+                                text: "Distribute Across All Drives";
+                                primary-color: #23a55a;
+                                enabled: !root.is_processing && !root.is_already_striped;
+                                clicked => { root.apply_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.keep_backup, root.aggressive_media); }
+                            }
+
+                            CustomButton {
+                                text: "Revert All to Primary";
+                                primary-color: root.is_already_striped ? #f0b132 : #3e6a90;
+                                enabled: !root.is_processing;
+                                clicked => { root.revert_striping(root.primary_path); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // RIGHT PANEL
+            VerticalLayout {
+                spacing: 8px;
+                horizontal-stretch: 1;
+
+                Rectangle {
+                    vertical-stretch: 6;
+                    background: #1e1f22;
+                    border-radius: 4px;
+                    border-width: 1px;
+                    border-color: #2b2d31;
+
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 6px;
+
+                        HorizontalLayout {
+                            alignment: space-between;
+                            Text {
+                                text: "STORAGE TREE VIEW (PHYSICAL ALLOCATION)";
+                                font-size: 11px;
+                                font-weight: 700;
+                                color: #949ba4;
+                                vertical-alignment: center;
+                            }
+
+                            Text {
+                                text: root.summary_text;
+                                font-size: 10px;
+                                font-weight: 700;
+                                color: #23a55a;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        ListView {
+                            for item in root.file_list: Rectangle {
+                                height: 22px;
+                                background: ta_row.has-hover ? #26282d : transparent;
+                                border-radius: 2px;
+                                ta_row := TouchArea { }
+
+                                HorizontalLayout {
+                                    padding-left: 6px;
+                                    padding-right: 6px;
+                                    alignment: start;
+                                    Text {
+                                        text: item.text;
+                                        font-family: "Consolas";
+                                        font-size: 11px;
+                                        color: #dcddde;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 4;
+                    background: #18191b;
+                    border-radius: 4px;
+                    border-width: 1px;
+                    border-color: #2b2d31;
+
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 4px;
+
+                        Text {
+                            text: "TERMINAL EXECUTION LOG";
+                            font-size: 10px;
+                            font-weight: 700;
+                            color: #e59535;
+                        }
+
+                        TextEdit {
+                            text <=> root.log_text;
+                            read-only: true;
+                            font-family: "Consolas";
+                            font-size: 11px;
+                        }
+                    }
+                }
+            }
+        }
+
+        // BOTTOM BAR
+        Rectangle {
+            height: 34px;
+            background: #1e1f22;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: #2b2d31;
+
+            VerticalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                padding-top: 4px;
+                padding-bottom: 4px;
+                spacing: 3px;
+
+                HorizontalLayout {
+                    alignment: space-between;
+                    Text {
+                        text: root.status_msg;
+                        color: root.is_processing ? #f0b132 : #4CAF50;
+                        font-size: 11px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Rectangle {
+                    height: 3px;
+                    background: #141414;
+                    border-radius: 1px;
+                    Rectangle {
+                        x: 0px;
+                        width: parent.width * root.progress;
+                        height: parent.height;
+                        background: root.is_processing ? #f0b132 : #23a55a;
+                        border-radius: 1px;
+                    }
+                }
+            }
+        }
+    }
+}
