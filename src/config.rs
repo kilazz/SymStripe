@@ -32,7 +32,7 @@ impl Default for Profile {
             primary_path: String::new(),
             secondary_targets: Vec::new(),
             min_size_mb: "50".to_string(),
-            exclusions: "exe, dll, pdb".to_string(),
+            exclusions: "exe, dll, pdb, utoc, sig".to_string(),
             media_extensions: "bik, bk2, mp4, fsb, pck, wem".to_string(),
             keep_backup: true,
             aggressive_media: false,
@@ -74,7 +74,6 @@ pub fn get_config_file_path() -> PathBuf {
 pub fn load_config() -> AppConfig {
     let main_path = get_config_file_path();
 
-    // 1. Try reading from %APPDATA%\SymStripe\config.json
     if let Ok(content) = fs::read_to_string(&main_path)
         && let Ok(cfg) = serde_json::from_str::<AppConfig>(&content)
         && !cfg.profiles.is_empty()
@@ -82,7 +81,6 @@ pub fn load_config() -> AppConfig {
         return cfg;
     }
 
-    // 2. Migration fallback: check legacy path next to executable if AppData doesn't exist yet
     if let Ok(exe_path) = env::current_exe()
         && let Some(parent) = exe_path.parent()
     {
@@ -92,7 +90,7 @@ pub fn load_config() -> AppConfig {
             && let Ok(cfg) = serde_json::from_str::<AppConfig>(&content)
             && !cfg.profiles.is_empty()
         {
-            save_config(&cfg); // Migrate immediately to AppData
+            save_config(&cfg);
             return cfg;
         }
     }

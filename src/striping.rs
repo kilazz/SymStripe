@@ -2,7 +2,6 @@ use crate::manifest::{
     ManifestFileEntry, StripingManifest, delete_manifest, load_manifest, save_manifest,
 };
 use crate::win32::get_free_disk_space_bytes;
-use std::collections::HashMap;
 use std::fs;
 use std::os::windows::fs::symlink_file;
 use std::path::{Path, PathBuf};
@@ -26,6 +25,29 @@ pub fn parse_ext_list(ext_str: &str) -> Vec<String> {
         .collect()
 }
 
+/// Detects memory-mapped engine metadata, TOCs, and IoStore header stubs.
+/// These files MUST remain physically on the primary drive to avoid `IoDispatcher` crashes in UE4/5.
+pub fn is_iostore_metadata_companion(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_lowercase();
+
+        // 1. Never relocate table of contents, signatures, or index files
+        if matches!(ext_lower.as_str(), "utoc" | "sig" | "toc" | "idx") {
+            return true;
+        }
+
+        // 2. If it is a .pak file, check if it is a companion stub to an IoStore container (.ucas/.utoc)
+        if ext_lower == "pak" {
+            let ucas_companion = path.with_extension("ucas");
+            let utoc_companion = path.with_extension("utoc");
+            if ucas_companion.exists() || utoc_companion.exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Traverses up the directory hierarchy and deletes empty parent directories.
 fn clean_empty_parents(file_path: &Path) {
     let mut current = file_path.to_path_buf();
@@ -39,7 +61,6 @@ fn clean_empty_parents(file_path: &Path) {
 }
 
 /// Pre-flight capability probe: verifies that the process can create NTFS symbolic links in the source directory.
-/// Aborts early before copying any files if Administrator privileges or Developer Mode are absent.
 pub fn verify_symlink_privilege(test_dir: &Path) -> Result<(), String> {
     let test_src = test_dir.join(".symstripe_perm_test.tmp");
     let test_link = test_dir.join(".symstripe_perm_link.tmp");
@@ -70,25 +91,6 @@ pub fn verify_symlink_privilege(test_dir: &Path) -> Result<(), String> {
     }
 }
 
-/// Resolves a grouping key for coupled game engine asset containers.
-/// For Unreal Engine 4.25+ / 5 IoStore (.ucas + .utoc + .pak + .sig), Unity, or Blizzard CASC,
-/// companion files sharing the same directory and stem are grouped as an atomic bundle.
-fn get_bundle_key(path: &Path) -> PathBuf {
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext_lower = ext.to_lowercase();
-        if matches!(
-            ext_lower.as_str(),
-            "ucas" | "utoc" | "pak" | "sig" | "assets" | "resource" | "ress" | "idx"
-        ) && let Some(stem) = path.file_stem()
-            && let Some(parent) = path.parent()
-        {
-            return parent.join(stem);
-        }
-    }
-    // Independent files use their full path as unique key
-    path.to_path_buf()
-}
-
 /// Automatically computes an optimal threshold size (in MB) covering ~80% of eligible data.
 pub fn auto_detect_threshold(src_path: &Path, exclusions: &[String]) -> Option<u64> {
     let mut files = Vec::new();
@@ -96,7 +98,7 @@ pub fn auto_detect_threshold(src_path: &Path, exclusions: &[String]) -> Option<u
 
     for entry in WalkDir::new(src_path).into_iter().filter_map(|e| e.ok()) {
         let p = entry.path();
-        if is_ext_match(p, exclusions) {
+        if is_ext_match(p, exclusions) || is_iostore_metadata_companion(p) {
             continue;
         }
         if let Some(meta) = fs::symlink_metadata(p).ok().filter(|m| m.is_file()) {
@@ -173,14 +175,8 @@ pub struct SimulationPlan {
     pub total_drives: usize,
 }
 
-struct FileBundle {
-    files: Vec<(PathBuf, u64, bool)>,
-    total_size: u64,
-    has_media: bool,
-}
-
-/// Calculates an optimal multi-drive distribution plan using LPT bin-packing,
-/// keeping coupled engine containers (e.g. UE4/5 .ucas + .utoc + .pak) co-located on the same drive.
+/// Calculates an optimal multi-drive distribution plan using LPT bin-packing.
+/// Automatically retains memory-mapped metadata (.utoc/.pak stubs) on the primary drive.
 pub fn calculate_allocation_plan(
     src_path: &Path,
     targets: &[PathBuf],
@@ -189,64 +185,36 @@ pub fn calculate_allocation_plan(
     media_exts: &[String],
     aggressive_media: bool,
 ) -> Option<SimulationPlan> {
-    // 1. Scan filesystem and group files by bundle key
-    let mut bundle_map: HashMap<PathBuf, Vec<(PathBuf, u64, bool)>> = HashMap::new();
+    let mut files = Vec::new();
 
     for entry in WalkDir::new(src_path).into_iter().filter_map(|e| e.ok()) {
         let p = entry.path();
-        if is_ext_match(p, exclusions) {
+        if is_ext_match(p, exclusions) || is_iostore_metadata_companion(p) {
             continue;
         }
+
         if let Some(meta) = fs::symlink_metadata(p).ok().filter(|m| m.is_file()) {
             let size = meta.len();
             let is_media = aggressive_media && is_ext_match(p, media_exts);
-            let key = get_bundle_key(p);
 
-            bundle_map
-                .entry(key)
-                .or_default()
-                .push((p.to_path_buf(), size, is_media));
+            if is_media || size >= min_size_bytes {
+                files.push((p.to_path_buf(), size, is_media));
+            }
         }
     }
 
-    // 2. Filter eligible bundles based on size threshold and media settings
-    let mut eligible_bundles: Vec<FileBundle> = Vec::new();
-
-    for (_key, items) in bundle_map {
-        let bundle_total_size: u64 = items.iter().map(|(_, sz, _)| *sz).sum();
-        let max_item_size = items.iter().map(|(_, sz, _)| *sz).max().unwrap_or(0);
-        let has_media = items.iter().any(|(_, _, is_m)| *is_m);
-
-        // A bundle qualifies if:
-        // - At least one item exceeds min_size_bytes (e.g., .ucas is 8.8 GB), pulling its .utoc and .pak along, OR
-        // - Aggregate bundle size exceeds min_size_bytes, OR
-        // - It contains forced media under aggressive media offload.
-        if (has_media && aggressive_media)
-            || max_item_size >= min_size_bytes
-            || bundle_total_size >= min_size_bytes
-        {
-            eligible_bundles.push(FileBundle {
-                files: items,
-                total_size: bundle_total_size,
-                has_media,
-            });
-        }
-    }
-
-    if eligible_bundles.is_empty() {
+    if files.is_empty() {
         return None;
     }
 
-    // 3. Sort bundles in descending order by total size (LPT bin-packing)
-    eligible_bundles.sort_by_key(|b| std::cmp::Reverse(b.total_size));
+    files.sort_by_key(|item| std::cmp::Reverse(item.1));
 
     let total_drives = 1 + targets.len();
     let mut drive_bytes: Vec<u64> = vec![0; total_drives];
     let mut drive_buckets: Vec<Vec<(PathBuf, u64, bool)>> = vec![Vec::new(); total_drives];
 
-    // 4. Assign each complete atomic bundle to the least loaded drive bucket
-    for bundle in eligible_bundles {
-        let best_drive = if bundle.has_media && aggressive_media && total_drives > 1 {
+    for (f_path, size, is_media) in files.clone() {
+        let best_drive = if is_media && total_drives > 1 {
             (1..total_drives)
                 .min_by_key(|&idx| drive_bytes[idx])
                 .unwrap_or(1)
@@ -256,16 +224,12 @@ pub fn calculate_allocation_plan(
                 .unwrap_or(0)
         };
 
-        drive_bytes[best_drive] += bundle.total_size;
-        for file_entry in bundle.files {
-            drive_buckets[best_drive].push(file_entry);
-        }
+        drive_bytes[best_drive] += size;
+        drive_buckets[best_drive].push((f_path, size, is_media));
     }
 
-    let all_files = drive_buckets.iter().flatten().cloned().collect();
-
     Some(SimulationPlan {
-        files: all_files,
+        files,
         drive_bytes,
         drive_buckets,
         total_drives,
@@ -280,10 +244,8 @@ pub fn execute_striping(
     keep_backup: bool,
     mut on_progress: impl FnMut(usize, usize, &str, f32),
 ) -> Result<usize, String> {
-    // 1. Verify symlink capabilities before touching any real data
     verify_symlink_privilege(src_path)?;
 
-    // 2. Validate free capacity on all target storage drives
     for (idx, target) in targets.iter().enumerate() {
         let required = plan.drive_bytes[idx + 1];
         if let Some(free) = get_free_disk_space_bytes(target).filter(|&free| free < required) {
@@ -299,7 +261,6 @@ pub fn execute_striping(
 
     let files_to_move: usize = plan.drive_buckets.iter().skip(1).map(|b| b.len()).sum();
 
-    // Load active manifest or initialize a new record
     let mut manifest = load_manifest(src_path).unwrap_or_else(|| StripingManifest {
         game_path: src_path.to_string_lossy().to_string(),
         total_drives: plan.total_drives,
@@ -365,7 +326,6 @@ pub fn execute_striping(
 
             // Step 3: Create NTFS symlink
             if let Err(sym_err) = symlink_file(&target_file, &f_path) {
-                // AUTOMATIC ROLLBACK: restore original file immediately
                 let _ = fs::rename(stage_destination, &f_path);
                 let _ = fs::remove_file(&target_file);
                 clean_empty_parents(&target_file);
@@ -376,12 +336,12 @@ pub fn execute_striping(
                 ));
             }
 
-            // Step 4: Discard temporary stage file if backups are disabled
+            // Step 4: Clean stage file
             if !keep_backup {
                 let _ = fs::remove_file(&stage_path);
             }
 
-            // Step 5: Incrementally record and flush manifest update
+            // Step 5: Save manifest incrementally
             manifest.files.push(ManifestFileEntry {
                 rel_path: rel.to_string_lossy().to_string(),
                 target_drive_idx: target_idx,
@@ -433,7 +393,6 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
                 reverted += 1;
             }
 
-            // Incrementally persist manifest state after every restored file
             if manifest.files.is_empty() {
                 delete_manifest(src_path);
             } else {
@@ -449,7 +408,6 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
             on_progress(current_idx, total, pct);
         }
     } else {
-        // Fallback: directory crawl for orphaned backups/broken symlinks
         let mut all_files = Vec::new();
         for entry in WalkDir::new(src_path).into_iter().filter_map(|e| e.ok()) {
             all_files.push(entry.path().to_path_buf());
