@@ -191,6 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool_session: None,
     }));
 
+    // Top Paradigm Switcher
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_mode_switched(move |mode_idx| {
@@ -207,6 +208,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         append_log(&weak, &format!("Paradigm switched to: {}", mode_name));
     });
+
+    // ==========================================
+    // PARADIGM 1: IN-PLACE GAME OPTIMIZER LOGIC
+    // ==========================================
 
     let state_arc = state.clone();
     let weak = ui_weak.clone();
@@ -394,6 +399,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 append_log(&w, "Auto-Detect failed: No suitable files found.");
             }
         });
+    });
+
+    let weak = ui_weak.clone();
+    let state_arc = state.clone();
+    app.on_auto_detect_pool_size(move || {
+        let (members, policy) = {
+            let st = state_arc.lock().unwrap();
+            let idx = st.config.active_profile_index;
+            let prof = &st.config.profiles[idx];
+            (
+                prof.pool_members.iter().map(PathBuf::from).collect::<Vec<_>>(),
+                prof.pool_policy,
+            )
+        };
+
+        if members.is_empty() {
+            append_log(&weak, "Auto-Detect Pool: No member folders added yet.");
+            return;
+        }
+
+        let mut total_free_bytes: u64 = 0;
+        let mut min_free_bytes = u64::MAX;
+        let mut valid_drives = 0;
+
+        for member in &members {
+            if let Some(free) = win32::get_free_disk_space_bytes(member) {
+                total_free_bytes += free;
+                if free < min_free_bytes {
+                    min_free_bytes = free;
+                }
+                valid_drives += 1;
+            }
+        }
+
+        let calculated_gb = if valid_drives == 0 {
+            0
+        } else if policy == 1 {
+            (min_free_bytes * (valid_drives as u64)) / (1024 * 1024 * 1024)
+        } else {
+            total_free_bytes / (1024 * 1024 * 1024)
+        };
+
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.set_pool_custom_size_gb_text("0".into());
+        });
+
+        let policy_str = if policy == 1 {
+            "Speed (RAID-0)"
+        } else {
+            "Capacity (JBOD)"
+        };
+        append_log(
+            &weak,
+            &format!(
+                "💽 Pool Auto-Detect ({}): Found ~{} GB total available space across {} active member(s). Mode set to Dynamic Auto (0).",
+                policy_str, calculated_gb, valid_drives
+            ),
+        );
     });
 
     let weak = ui_weak.clone();

@@ -115,6 +115,7 @@ export component AppWindow inherits Window {
     callback clear_target_drives();
     callback consolidate_target_drive();
     callback auto_detect_threshold(string, string);
+    callback auto_detect_pool_size();
     callback verify_integrity(string);
     callback preview_striping(string, int, string, string, bool, bool, bool);
     callback apply_striping(string, int, string, string, bool, bool, bool);
@@ -707,7 +708,7 @@ export component AppWindow inherits Window {
                                     width: 40px;
                                     primary-color: #3e6a90;
                                     enabled: !root.is_pool_mounted;
-                                    clicked => { root.pool_custom_size_gb_text = "0"; }
+                                    clicked => { root.auto_detect_pool_size(); }
                                 }
                             }
 
