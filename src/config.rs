@@ -12,16 +12,30 @@ fn default_false() -> bool {
 }
 
 fn default_mode() -> i32 {
-    0 // 0 = NTFS Symlinks, 1 = WinFsp VFS
+    0 // 0 = In-Place Optimizer, 1 = Virtual Storage Pool
+}
+
+fn default_pool_policy() -> i32 {
+    1 // 0 = Capacity (JBOD), 1 = Speed (RAID-0)
+}
+
+fn default_stripe_mb() -> u32 {
+    16
 }
 
 fn default_mount_point() -> String {
     "Z:".to_string()
 }
 
+fn default_custom_size_gb() -> String {
+    "0".to_string() // 0 = Auto detect from physical drives
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Profile {
     pub name: String,
+
+    // Paradigm 1: In-Place Game Optimizer
     pub primary_path: String,
     pub secondary_targets: Vec<String>,
     pub min_size_mb: String,
@@ -31,10 +45,23 @@ pub struct Profile {
     pub keep_backup: bool,
     #[serde(default = "default_false")]
     pub aggressive_media: bool,
+    #[serde(default = "default_true")]
+    pub ue5_safe_mode: bool,
+
     #[serde(default = "default_mode")]
     pub mode_idx: i32,
+
+    // Paradigm 2: Virtual Storage Pool
+    #[serde(default = "Vec::new")]
+    pub pool_members: Vec<String>,
+    #[serde(default = "default_pool_policy")]
+    pub pool_policy: i32,
+    #[serde(default = "default_stripe_mb")]
+    pub pool_stripe_mb: u32,
     #[serde(default = "default_mount_point")]
-    pub vfs_mount_point: String,
+    pub pool_mount_point: String,
+    #[serde(default = "default_custom_size_gb")]
+    pub pool_custom_size_gb: String, // Added customizable size quota in GB
 }
 
 impl Default for Profile {
@@ -48,8 +75,13 @@ impl Default for Profile {
             media_extensions: "bik, bk2, mp4, fsb, pck, wem".to_string(),
             keep_backup: true,
             aggressive_media: false,
+            ue5_safe_mode: true,
             mode_idx: 0,
-            vfs_mount_point: "Z:".to_string(),
+            pool_members: Vec::new(),
+            pool_policy: 1,
+            pool_stripe_mb: 16,
+            pool_mount_point: "Z:".to_string(),
+            pool_custom_size_gb: "0".to_string(),
         }
     }
 }
@@ -69,7 +101,6 @@ impl Default for AppConfig {
     }
 }
 
-/// Standard configuration directory: %APPDATA%\SymStripe
 pub fn get_config_dir() -> PathBuf {
     if let Some(appdata) = env::var_os("APPDATA") {
         PathBuf::from(appdata).join("SymStripe")
@@ -84,11 +115,9 @@ pub fn get_config_file_path() -> PathBuf {
     get_config_dir().join("config.json")
 }
 
-/// Loads application configuration with legacy migration from executable folder.
 pub fn load_config() -> AppConfig {
     let main_path = get_config_file_path();
 
-    // 1. Try reading from %APPDATA%\SymStripe\config.json
     if let Ok(content) = fs::read_to_string(&main_path)
         && let Ok(cfg) = serde_json::from_str::<AppConfig>(&content)
         && !cfg.profiles.is_empty()
@@ -96,7 +125,6 @@ pub fn load_config() -> AppConfig {
         return cfg;
     }
 
-    // 2. Migration fallback: check legacy path next to executable if AppData doesn't exist yet
     if let Ok(exe_path) = env::current_exe()
         && let Some(parent) = exe_path.parent()
     {
@@ -106,7 +134,7 @@ pub fn load_config() -> AppConfig {
             && let Ok(cfg) = serde_json::from_str::<AppConfig>(&content)
             && !cfg.profiles.is_empty()
         {
-            save_config(&cfg); // Migrate immediately to AppData
+            save_config(&cfg);
             return cfg;
         }
     }
@@ -114,7 +142,6 @@ pub fn load_config() -> AppConfig {
     AppConfig::default()
 }
 
-/// Atomically saves configuration via a temporary file.
 pub fn save_config(cfg: &AppConfig) {
     let dir = get_config_dir();
     let _ = fs::create_dir_all(&dir);

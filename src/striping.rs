@@ -30,8 +30,8 @@ pub fn parse_ext_list(ext_str: &str) -> Vec<String> {
 }
 
 /// Detects memory-mapped engine metadata, TOCs, and IoStore header stubs.
-/// These files MUST remain physically on the primary drive in Mode 0, or be handled
-/// as companion bundles in Mode 1, to prevent engine bootstrapping failures.
+/// These files MUST remain on the primary drive (or be co-located inside a junction)
+/// to prevent engine bootstrapping failures.
 pub fn is_iostore_metadata_companion(path: &Path) -> bool {
     // 1. pakchunk0 and global files contain root project descriptors (.uproject) and engine bootstrapping assets
     if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
@@ -44,8 +44,7 @@ pub fn is_iostore_metadata_companion(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let ext_lower = ext.to_lowercase();
 
-        // 2. Never schedule individual standalone relocation for table of contents, signatures, or index files
-        // (In Mode 1, they are automatically bundled alongside their companion .ucas file)
+        // 2. Never schedule individual standalone relocation for TOC, signatures, or index files
         if matches!(ext_lower.as_str(), "utoc" | "sig" | "toc" | "idx") {
             return true;
         }
@@ -158,7 +157,6 @@ pub struct SimulationPlan {
 }
 
 /// Calculates an optimal multi-drive distribution plan using LPT bin-packing.
-/// Automatically retains memory-mapped metadata (.utoc/.pak stubs) and boot chunks on the primary drive.
 pub fn calculate_allocation_plan(
     src_path: &Path,
     targets: &[PathBuf],
@@ -218,7 +216,7 @@ pub fn calculate_allocation_plan(
     })
 }
 
-/// Creates an NTFS Directory Junction via the system `mklink` command.
+/// Creates an NTFS Directory Junction via system `mklink /J`.
 fn create_directory_junction(target_dir: &Path, junction_path: &Path) -> Result<(), String> {
     let output = Command::new("cmd")
         .args([
@@ -237,16 +235,15 @@ fn create_directory_junction(target_dir: &Path, junction_path: &Path) -> Result<
     Ok(())
 }
 
-/// Executes striping relocation using either File Symlinks (Mode 0) or UE5 Subfolder Junctions (Mode 1).
+/// Executes striping relocation using either File Symlinks or UE5 Subfolder Directory Junctions.
 pub fn execute_striping(
     src_path: &Path,
     targets: &[PathBuf],
     plan: SimulationPlan,
     keep_backup: bool,
-    mode_idx: i32,
+    ue5_safe_mode: bool,
     mut on_progress: impl FnMut(usize, usize, &str, f32),
 ) -> Result<usize, String> {
-    // Validate free capacity on all target storage drives
     for (idx, target) in targets.iter().enumerate() {
         let required = plan.drive_bytes[idx + 1];
         if let Some(free) = get_free_disk_space_bytes(target).filter(|&free| free < required) {
@@ -313,8 +310,8 @@ pub fn execute_striping(
                 ));
             }
 
-            // Step 2: Mode 1 Bundle Optimization — Relocate companion metadata files (.utoc, .pak, .sig) alongside .ucas
-            if mode_idx != 0
+            // Step 2: In UE5 Safe Mode, co-locate companion files (.utoc, .pak, .sig) alongside .ucas
+            if ue5_safe_mode
                 && f_path
                     .extension()
                     .is_some_and(|e| e.eq_ignore_ascii_case("ucas"))
@@ -353,10 +350,8 @@ pub fn execute_striping(
                 ));
             }
 
-            // Step 4: Architecture-Specific Linking Strategy
-            if mode_idx == 0
-                && let Err(sym_err) = symlink_file(&target_file, &f_path)
-            {
+            // Step 4: Linking strategy
+            if !ue5_safe_mode && let Err(sym_err) = symlink_file(&target_file, &f_path) {
                 let _ = fs::rename(stage_destination, &f_path);
                 let _ = fs::remove_file(&target_file);
                 clean_empty_parents(&target_file);
@@ -364,8 +359,8 @@ pub fn execute_striping(
                     "Symlink creation failed for '{}': {sym_err}. Source file was safely restored.",
                     f_path.display()
                 ));
-            } else if mode_idx != 0 {
-                // Mode 1: UE5 Subfolder Directory Junctions (Paks_DriveX)
+            } else if ue5_safe_mode {
+                // Subfolder Directory Junction (Paks_DriveX)
                 let src_parent = f_path.parent().unwrap();
                 let junction_name = format!("Paks_Drive{}", target_idx + 1);
                 let junction_path = src_parent.join(&junction_name);
@@ -415,14 +410,14 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
             let mut restored = false;
 
             if entry.has_local_backup && backup_path.exists() {
-                let _ = fs::remove_file(&link_path); // Remove symlink if it exists
+                let _ = fs::remove_file(&link_path);
                 if fs::rename(&backup_path, &link_path).is_ok() {
                     let _ = fs::remove_file(&target_path);
                     clean_empty_parents(&target_path);
                     restored = true;
                 }
             } else if target_path.exists() {
-                let _ = fs::remove_file(&link_path); // Remove symlink if it exists
+                let _ = fs::remove_file(&link_path);
                 if fs::copy(&target_path, &link_path).is_ok() {
                     let _ = fs::remove_file(&target_path);
                     clean_empty_parents(&target_path);
@@ -482,7 +477,7 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
             .to_string_lossy()
             .starts_with("Paks_Drive")
         {
-            let _ = fs::remove_dir(entry.path()); // Removes junction point without deleting target contents
+            let _ = fs::remove_dir(entry.path());
         }
     }
 
@@ -520,7 +515,6 @@ pub fn execute_consolidate(src_path: &Path, chosen_target_dir: &Path) -> Result<
                 }
             }
 
-            // Consolidate companions (.utoc, .pak, .sig)
             if link_path
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("ucas"))

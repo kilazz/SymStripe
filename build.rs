@@ -1,3 +1,4 @@
 fn main() {
     slint_build::compile("ui/appwindow.slint").expect("Failed to compile Slint UI definitions");
+    winfsp::build::winfsp_link_delayload();
 }

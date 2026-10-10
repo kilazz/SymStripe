@@ -71,7 +71,10 @@ export component AppWindow inherits Window {
     in-out property <[string]> profile_names: ["Default Profile"];
     in-out property <int> active_profile_idx: 0;
 
-    // Config properties
+    // Top Paradigm Architecture: 0 = In-Place Optimizer, 1 = Virtual Storage Pool
+    in-out property <int> active_mode_idx: 0;
+
+    // Paradigm 1: In-Place Game Optimizer Properties
     in-out property <string> primary_path: "";
     in-out property <[StandardListViewItem]> target_drives_list: [];
     in-out property <string> min_size_mb_text: "50";
@@ -79,16 +82,22 @@ export component AppWindow inherits Window {
     in-out property <string> media_extensions_text: "bik, bk2, mp4, fsb, pck, wem";
     in-out property <bool> keep_backup: true;
     in-out property <bool> aggressive_media: false;
+    in-out property <bool> ue5_safe_mode: true;
     in-out property <bool> is_already_striped: false;
 
-    // Engine Mode: 0 = NTFS Symlinks, 1 = UE5 Subfolder Junctions
-    in-out property <int> active_mode_idx: 0;
+    // Paradigm 2: Virtual Storage Pool Properties
+    in-out property <[StandardListViewItem]> pool_members_list: [];
+    in-out property <int> pool_policy_idx: 1; // 0 = Capacity (JBOD), 1 = Speed (RAID-0)
+    in-out property <int> pool_stripe_mb: 16;
+    in-out property <string> pool_mount_point: "Z:";
+    in-out property <string> pool_custom_size_gb_text: "0";
+    in-out property <bool> is_pool_mounted: false;
 
-    // Diagnostics
+    // Diagnostics & Status
     in-out property <string> smart_alert_text: "";
     in-out property <float> progress: 0.0;
     in-out property <bool> is_processing: false;
-    in-out property <string> log_text: "System ready. Configure targets, select engine mode and distribute.\n";
+    in-out property <string> log_text: "System ready. Select paradigm to begin.\n";
     in-out property <string> status_msg: "Ready";
     in-out property <string> summary_text: "No files analyzed yet.";
     in-out property <[StandardListViewItem]> file_list: [];
@@ -98,6 +107,8 @@ export component AppWindow inherits Window {
     callback create_profile();
     callback delete_profile();
     callback mode_switched(int);
+
+    // Paradigm 1 Callbacks
     callback browse_primary_folder() -> string;
     callback primary_folder_changed(string);
     callback add_target_drive();
@@ -105,9 +116,18 @@ export component AppWindow inherits Window {
     callback consolidate_target_drive();
     callback auto_detect_threshold(string, string);
     callback verify_integrity(string);
-    callback preview_striping(string, int, string, string, bool, bool, int);
-    callback apply_striping(string, int, string, string, bool, bool, int);
+    callback preview_striping(string, int, string, string, bool, bool, bool);
+    callback apply_striping(string, int, string, string, bool, bool, bool);
     callback revert_striping(string);
+
+    // Paradigm 2 Callbacks
+    callback add_pool_member();
+    callback clear_pool_members();
+    callback pool_policy_switched(int);
+    callback pool_stripe_changed(int);
+    callback mount_pool(string, string);
+    callback unmount_pool();
+
     callback scan_drives();
     callback run_benchmark();
 
@@ -115,7 +135,7 @@ export component AppWindow inherits Window {
         padding: 10px;
         spacing: 8px;
 
-        // HEADER
+        // TOP HEADER
         Rectangle {
             height: 44px;
             background: #1e1f22;
@@ -138,7 +158,7 @@ export component AppWindow inherits Window {
                     }
 
                     Text {
-                        text: "Multi-Spindle I/O, NTFS Striping & Engine Junction Architecture";
+                        text: "Multi-Spindle I/O, Engine Junctions & Extent-Striped Virtual Pools";
                         font-size: 10px;
                         color: #808080;
                     }
@@ -204,7 +224,7 @@ export component AppWindow inherits Window {
                         spacing: 12px;
                         alignment: start;
 
-                        // Section: Profile
+                        // Section 0: Active Storage Profile
                         SectionHeader {
                             title: "ACTIVE STORAGE PROFILE";
                             title-color: #3e6a90;
@@ -233,91 +253,9 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // Section: Primary Drive
+                        // Section 1: PARADIGM ARCHITECTURE SELECTOR
                         SectionHeader {
-                            title: "PRIMARY DRIVE (SOURCE / DATA DIRECTORY)";
-                            title-color: #3e6a90;
-                        }
-
-                        HorizontalLayout {
-                            spacing: 5px;
-                            height: 30px;
-                            LineEdit {
-                                text <=> root.primary_path;
-                                placeholder-text: "E:\\Games\\Gears of War E-Day\\GoWEDay";
-                                edited(val) => { root.primary_folder_changed(val); }
-                            }
-
-                            CustomButton {
-                                text: "...";
-                                width: 32px;
-                                clicked => { root.primary_path = root.browse_primary_folder(); }
-                            }
-                        }
-
-                        // Section: Secondary Targets
-                        SectionHeader {
-                            title: "SECONDARY TARGET DRIVES (PHYSICAL DESTINATIONS)";
-                            title-color: #f0b132;
-                        }
-
-                        VerticalLayout {
-                            spacing: 6px;
-                            Rectangle {
-                                height: 60px;
-                                background: #141414;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: #2b2d31;
-                                ListView {
-                                    for item in root.target_drives_list: Rectangle {
-                                        height: 20px;
-                                        background: ta_td.has-hover ? #202226 : transparent;
-                                        border-radius: 2px;
-                                        ta_td := TouchArea { }
-
-                                        HorizontalLayout {
-                                            padding-left: 6px;
-                                            alignment: start;
-                                            Text {
-                                                text: item.text;
-                                                font-family: "Consolas";
-                                                font-size: 11px;
-                                                color: #f0b132;
-                                                vertical-alignment: center;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            HorizontalLayout {
-                                spacing: 6px;
-                                CustomButton {
-                                    text: "+ Add Physical Target (e.g. F:\\zzz)";
-                                    primary-color: #f0b132;
-                                    clicked => { root.add_target_drive(); }
-                                }
-
-                                CustomButton {
-                                    text: "Consolidate";
-                                    primary-color: #d97706;
-                                    enabled: root.is_already_striped && !root.is_processing;
-                                    clicked => { root.consolidate_target_drive(); }
-                                }
-
-                                CustomButton {
-                                    text: "Clear";
-                                    primary-color: #2b2d31;
-                                    width: 60px;
-                                    clicked => { root.clear_target_drives(); }
-                                }
-                            }
-                        }
-
-                        // Section: Architecture
-                        SectionHeader {
-                            title: "STORAGE ENGINE ARCHITECTURE";
+                            title: "STORAGE ACCELERATION PARADIGM";
                             title-color: #a855f7;
                         }
 
@@ -326,12 +264,12 @@ export component AppWindow inherits Window {
                             height: 32px;
                             Rectangle {
                                 horizontal-stretch: 1;
-                                background: root.active_mode_idx == 0 ? #3e6a90 : #141414;
+                                background: root.active_mode_idx == 0 ? #23a55a : #141414;
                                 border-radius: 4px;
                                 border-width: 1px;
-                                border-color: root.active_mode_idx == 0 ? #60a5fa : #2b2d31;
+                                border-color: root.active_mode_idx == 0 ? #4ade80 : #2b2d31;
                                 Text {
-                                    text: "🔗 NTFS File Symlinks (Universal)";
+                                    text: "🎮 In-Place Game Optimizer";
                                     font-size: 11px;
                                     font-weight: 700;
                                     color: root.active_mode_idx == 0 ? #ffffff : #949ba4;
@@ -346,12 +284,12 @@ export component AppWindow inherits Window {
 
                             Rectangle {
                                 horizontal-stretch: 1;
-                                background: root.active_mode_idx == 1 ? #23a55a : #141414;
+                                background: root.active_mode_idx == 1 ? #7e22ce : #141414;
                                 border-radius: 4px;
                                 border-width: 1px;
-                                border-color: root.active_mode_idx == 1 ? #4ade80 : #2b2d31;
+                                border-color: root.active_mode_idx == 1 ? #c084fc : #2b2d31;
                                 Text {
-                                    text: "📁 UE5 Subfolder Junctions (DirectStorage Safe)";
+                                    text: "💽 Virtual Storage Pool (Z:)";
                                     font-size: 11px;
                                     font-weight: 700;
                                     color: root.active_mode_idx == 1 ? #ffffff : #949ba4;
@@ -365,98 +303,434 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // Section: Rules
-                        SectionHeader {
-                            title: "STRIPING RULES & DISTRIBUTION";
-                            title-color: #23a55a;
+                        // ==========================================
+                        // PARADIGM 1: IN-PLACE GAME OPTIMIZER
+                        // ==========================================
+                        if root.active_mode_idx == 0: VerticalLayout {
+                            spacing: 12px;
+
+                            SectionHeader {
+                                title: "PRIMARY DRIVE (GAME SOURCE DIRECTORY)";
+                                title-color: #3e6a90;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 5px;
+                                height: 30px;
+                                LineEdit {
+                                    text <=> root.primary_path;
+                                    placeholder-text: "E:\\Games\\Gears of War E-Day\\GoWEDay";
+                                    edited(val) => { root.primary_folder_changed(val); }
+                                }
+
+                                CustomButton {
+                                    text: "...";
+                                    width: 32px;
+                                    clicked => { root.primary_path = root.browse_primary_folder(); }
+                                }
+                            }
+
+                            SectionHeader {
+                                title: "SECONDARY TARGET DRIVES (DESTINATIONS)";
+                                title-color: #f0b132;
+                            }
+
+                            VerticalLayout {
+                                spacing: 6px;
+                                Rectangle {
+                                    height: 60px;
+                                    background: #141414;
+                                    border-radius: 4px;
+                                    border-width: 1px;
+                                    border-color: #2b2d31;
+                                    ListView {
+                                        for item in root.target_drives_list: Rectangle {
+                                            height: 20px;
+                                            background: ta_td.has-hover ? #202226 : transparent;
+                                            border-radius: 2px;
+                                            ta_td := TouchArea { }
+
+                                            HorizontalLayout {
+                                                padding-left: 6px;
+                                                alignment: start;
+                                                Text {
+                                                    text: item.text;
+                                                    font-family: "Consolas";
+                                                    font-size: 11px;
+                                                    color: #f0b132;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    CustomButton {
+                                        text: "+ Add Target (e.g. F:\\zzz)";
+                                        primary-color: #f0b132;
+                                        clicked => { root.add_target_drive(); }
+                                    }
+
+                                    CustomButton {
+                                        text: "Consolidate";
+                                        primary-color: #d97706;
+                                        enabled: root.is_already_striped && !root.is_processing;
+                                        clicked => { root.consolidate_target_drive(); }
+                                    }
+
+                                    CustomButton {
+                                        text: "Clear";
+                                        primary-color: #2b2d31;
+                                        width: 60px;
+                                        clicked => { root.clear_target_drives(); }
+                                    }
+                                }
+                            }
+
+                            SectionHeader {
+                                title: "STRIPING RULES & COMPATIBILITY";
+                                title-color: #23a55a;
+                            }
+
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                alignment: start;
+                                Text {
+                                    text: "Min Archive Size (MB):";
+                                    vertical-alignment: center;
+                                    font-size: 11px;
+                                    color: #dcddde;
+                                }
+
+                                LineEdit {
+                                    width: 65px;
+                                    text <=> root.min_size_mb_text;
+                                }
+
+                                CustomButton {
+                                    text: "Auto";
+                                    width: 50px;
+                                    primary-color: #3e6a90;
+                                    enabled: !root.is_processing;
+                                    clicked => { root.auto_detect_threshold(root.primary_path, root.exclusions_text); }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                alignment: start;
+                                Text {
+                                    text: "Exclude Extensions:";
+                                    vertical-alignment: center;
+                                    font-size: 11px;
+                                    color: #dcddde;
+                                }
+
+                                LineEdit {
+                                    text <=> root.exclusions_text;
+                                    placeholder-text: "exe, dll, pdb, utoc, sig...";
+                                }
+                            }
+
+                            VerticalLayout {
+                                spacing: 5px;
+                                CheckBox {
+                                    text: "Unreal Engine / DirectStorage Safe Mode (Subfolder Junctions)";
+                                    checked <=> root.ue5_safe_mode;
+                                }
+
+                                CheckBox {
+                                    text: "Keep local .backup on Drive 1 (Safe Mode)";
+                                    checked <=> root.keep_backup;
+                                }
+
+                                CheckBox {
+                                    text: "Aggressive Media Offload (Force media to targets)";
+                                    checked <=> root.aggressive_media;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                CustomButton {
+                                    text: "Analyze & Preview Split (Dry Run)";
+                                    primary-color: #4a5d6e;
+                                    enabled: !root.is_processing && !root.is_already_striped;
+                                    clicked => {
+                                        root.preview_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.media_extensions_text, root.keep_backup, root.aggressive_media, root.ue5_safe_mode);
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 6px;
+                                CustomButton {
+                                    text: "Distribute Across Drives";
+                                    primary-color: #23a55a;
+                                    enabled: !root.is_processing && !root.is_already_striped;
+                                    clicked => {
+                                        root.apply_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.media_extensions_text, root.keep_backup, root.aggressive_media, root.ue5_safe_mode);
+                                    }
+                                }
+
+                                CustomButton {
+                                    text: "Revert All to Primary";
+                                    primary-color: root.is_already_striped ? #f0b132 : #3e6a90;
+                                    enabled: !root.is_processing;
+                                    clicked => {
+                                        root.revert_striping(root.primary_path);
+                                    }
+                                }
+                            }
                         }
 
-                        HorizontalLayout {
-                            height: 30px;
-                            spacing: 8px;
-                            alignment: start;
-                            Text {
-                                text: "Min Archive Size (MB):";
-                                vertical-alignment: center;
-                                font-size: 11px;
-                                color: #dcddde;
+                        // ==========================================
+                        // PARADIGM 2: VIRTUAL STORAGE POOL (VFS)
+                        // ==========================================
+                        if root.active_mode_idx == 1: VerticalLayout {
+                            spacing: 12px;
+
+                            SectionHeader {
+                                title: "STORAGE POOL MEMBERS (FOLDERS ACROSS DISKS)";
+                                title-color: #a855f7;
                             }
 
-                            LineEdit {
-                                width: 65px;
-                                text <=> root.min_size_mb_text;
+                            VerticalLayout {
+                                spacing: 6px;
+                                Rectangle {
+                                    height: 80px;
+                                    background: #141414;
+                                    border-radius: 4px;
+                                    border-width: 1px;
+                                    border-color: #2b2d31;
+                                    ListView {
+                                        for item in root.pool_members_list: Rectangle {
+                                            height: 20px;
+                                            background: ta_pm.has-hover ? #202226 : transparent;
+                                            border-radius: 2px;
+                                            ta_pm := TouchArea { }
+
+                                            HorizontalLayout {
+                                                padding-left: 6px;
+                                                alignment: start;
+                                                Text {
+                                                    text: item.text;
+                                                    font-family: "Consolas";
+                                                    font-size: 11px;
+                                                    color: #c084fc;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    CustomButton {
+                                        text: "+ Add Pool Folder (e.g. E:\\Pool, F:\\Pool)";
+                                        primary-color: #7e22ce;
+                                        clicked => { root.add_pool_member(); }
+                                    }
+
+                                    CustomButton {
+                                        text: "Clear";
+                                        primary-color: #2b2d31;
+                                        width: 60px;
+                                        clicked => { root.clear_pool_members(); }
+                                    }
+                                }
                             }
 
-                            CustomButton {
-                                text: "Auto";
-                                width: 50px;
-                                primary-color: #3e6a90;
-                                enabled: !root.is_processing;
-                                clicked => { root.auto_detect_threshold(root.primary_path, root.exclusions_text); }
-                            }
-                        }
-
-                        HorizontalLayout {
-                            height: 30px;
-                            spacing: 8px;
-                            alignment: start;
-                            Text {
-                                text: "Exclude Extensions:";
-                                vertical-alignment: center;
-                                font-size: 11px;
-                                color: #dcddde;
+                            SectionHeader {
+                                title: "POOL ALLOCATION STRATEGY";
+                                title-color: #a855f7;
                             }
 
-                            LineEdit {
-                                text <=> root.exclusions_text;
-                                placeholder-text: "exe, dll, pdb, utoc, sig...";
-                            }
-                        }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                height: 30px;
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    background: root.pool_policy_idx == 0 ? #3e6a90 : #141414;
+                                    border-radius: 4px;
+                                    border-width: 1px;
+                                    border-color: root.pool_policy_idx == 0 ? #60a5fa : #2b2d31;
+                                    Text {
+                                        text: "📦 Capacity (JBOD Merge)";
+                                        font-size: 11px;
+                                        font-weight: 700;
+                                        color: root.pool_policy_idx == 0 ? #ffffff : #949ba4;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
 
-                        VerticalLayout {
-                            spacing: 5px;
-                            CheckBox {
-                                text: "Keep local .backup on Drive 1 (Safe Mode)";
-                                checked <=> root.keep_backup;
+                                    TouchArea {
+                                        clicked => { root.pool_policy_idx = 0; root.pool_policy_switched(0); }
+                                    }
+                                }
+
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    background: root.pool_policy_idx == 1 ? #7e22ce : #141414;
+                                    border-radius: 4px;
+                                    border-width: 1px;
+                                    border-color: root.pool_policy_idx == 1 ? #c084fc : #2b2d31;
+                                    Text {
+                                        text: "⚡ Speed (RAID-0 Striping)";
+                                        font-size: 11px;
+                                        font-weight: 700;
+                                        color: root.pool_policy_idx == 1 ? #ffffff : #949ba4;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+
+                                    TouchArea {
+                                        clicked => { root.pool_policy_idx = 1; root.pool_policy_switched(1); }
+                                    }
+                                }
                             }
 
-                            CheckBox {
-                                text: "Aggressive Media Offload (Force media to targets)";
-                                checked <=> root.aggressive_media;
-                            }
-                        }
+                            if root.pool_policy_idx == 1: HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                alignment: start;
+                                Text {
+                                    text: "Stripe Extent Block Size:";
+                                    vertical-alignment: center;
+                                    font-size: 11px;
+                                    color: #dcddde;
+                                }
 
-                        // Actions
-                        HorizontalLayout {
-                            CustomButton {
-                                text: "Analyze & Preview Split (Dry Run)";
-                                primary-color: #4a5d6e;
-                                enabled: !root.is_processing && !root.is_already_striped;
-                                clicked => { root.preview_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.media_extensions_text, root.keep_backup, root.aggressive_media, root.active_mode_idx); }
-                            }
-                        }
+                                Rectangle {
+                                    width: 55px;
+                                    height: 26px;
+                                    background: root.pool_stripe_mb == 4 ? #7e22ce : #141414;
+                                    border-radius: 3px;
+                                    border-width: 1px;
+                                    border-color: root.pool_stripe_mb == 4 ? #c084fc : #2b2d31;
+                                    Text {
+                                        text: "4 MB";
+                                        font-size: 10px;
+                                        font-weight: 700;
+                                        color: #ffffff;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
 
-                        HorizontalLayout {
-                            spacing: 6px;
-                            CustomButton {
-                                text: "Distribute Across Drives";
-                                primary-color: #23a55a;
-                                enabled: !root.is_processing && !root.is_already_striped;
-                                clicked => { root.apply_striping(root.primary_path, root.min_size_mb_text.to-float(), root.exclusions_text, root.media_extensions_text, root.keep_backup, root.aggressive_media, root.active_mode_idx); }
+                                    TouchArea {
+                                        clicked => { root.pool_stripe_mb = 4; root.pool_stripe_changed(4); }
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 55px;
+                                    height: 26px;
+                                    background: root.pool_stripe_mb == 16 ? #7e22ce : #141414;
+                                    border-radius: 3px;
+                                    border-width: 1px;
+                                    border-color: root.pool_stripe_mb == 16 ? #c084fc : #2b2d31;
+                                    Text {
+                                        text: "16 MB";
+                                        font-size: 10px;
+                                        font-weight: 700;
+                                        color: #ffffff;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+
+                                    TouchArea {
+                                        clicked => { root.pool_stripe_mb = 16; root.pool_stripe_changed(16); }
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 55px;
+                                    height: 26px;
+                                    background: root.pool_stripe_mb == 64 ? #7e22ce : #141414;
+                                    border-radius: 3px;
+                                    border-width: 1px;
+                                    border-color: root.pool_stripe_mb == 64 ? #c084fc : #2b2d31;
+                                    Text {
+                                        text: "64 MB";
+                                        font-size: 10px;
+                                        font-weight: 700;
+                                        color: #ffffff;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+
+                                    TouchArea {
+                                        clicked => { root.pool_stripe_mb = 64; root.pool_stripe_changed(64); }
+                                    }
+                                }
                             }
 
-                            CustomButton {
-                                text: "Revert All to Primary";
-                                primary-color: root.is_already_striped ? #f0b132 : #3e6a90;
-                                enabled: !root.is_processing;
-                                clicked => { root.revert_striping(root.primary_path); }
+                            // Quota and Drive Letter Section
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                alignment: start;
+                                Text {
+                                    text: "Virtual Mount Drive:";
+                                    vertical-alignment: center;
+                                    font-size: 11px;
+                                    color: #dcddde;
+                                }
+
+                                LineEdit {
+                                    width: 45px;
+                                    text <=> root.pool_mount_point;
+                                    placeholder-text: "Z:";
+                                    enabled: !root.is_pool_mounted;
+                                }
+
+                                Text {
+                                    text: "Size (GB):";
+                                    vertical-alignment: center;
+                                    font-size: 11px;
+                                    color: #dcddde;
+                                }
+
+                                LineEdit {
+                                    width: 65px;
+                                    text <=> root.pool_custom_size_gb_text;
+                                    placeholder-text: "0 (Auto)";
+                                    enabled: !root.is_pool_mounted;
+                                }
+
+                                CustomButton {
+                                    text: "Auto";
+                                    width: 40px;
+                                    primary-color: #3e6a90;
+                                    enabled: !root.is_pool_mounted;
+                                    clicked => { root.pool_custom_size_gb_text = "0"; }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                CustomButton {
+                                    text: root.is_pool_mounted ? "🛑 Stop & Unmount Virtual Pool" : "🚀 Mount Virtual Storage Pool (" + root.pool_mount_point + ")";
+                                    primary-color: root.is_pool_mounted ? #c94040 : #7e22ce;
+                                    enabled: !root.is_processing;
+                                    clicked => {
+                                        if root.is_pool_mounted {
+                                            root.unmount_pool();
+                                        } else {
+                                            root.mount_pool(root.pool_mount_point, root.pool_custom_size_gb_text);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // RIGHT DISPLAY PANEL (Tree View & Logs)
+            // RIGHT DISPLAY PANEL
             VerticalLayout {
                 spacing: 8px;
                 horizontal-stretch: 1;
