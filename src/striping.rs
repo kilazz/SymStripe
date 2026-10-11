@@ -351,14 +351,34 @@ pub fn execute_striping(
             }
 
             // Step 4: Linking strategy
-            if !ue5_safe_mode && let Err(sym_err) = symlink_file(&target_file, &f_path) {
-                let _ = fs::rename(stage_destination, &f_path);
-                let _ = fs::remove_file(&target_file);
-                clean_empty_parents(&target_file);
-                return Err(format!(
-                    "Symlink creation failed for '{}': {sym_err}. Source file was safely restored.",
-                    f_path.display()
-                ));
+            if !ue5_safe_mode {
+                if let Err(sym_err) = symlink_file(&target_file, &f_path) {
+                    // Rollback on failure
+                    let _ = fs::rename(stage_destination, &f_path);
+                    let _ = fs::remove_file(&target_file);
+                    clean_empty_parents(&target_file);
+
+                    let mut err_msg = format!(
+                        "Symlink creation failed for '{}': {}",
+                        f_path.display(),
+                        sym_err
+                    );
+
+                    // Check for OS Error 1314 (ERROR_PRIVILEGE_NOT_HELD) or 5 (Access Denied)
+                    if let Some(os_err) = sym_err.raw_os_error()
+                        && (os_err == 1314 || os_err == 5)
+                    {
+                        err_msg = format!(
+                            "⚠️ ACCESS DENIED (OS Error {}).\n\
+                            Creating standard file symlinks requires Administrator privileges OR Windows Developer Mode to be enabled.\n\n\
+                            SOLUTION:\n\
+                            1. Restart SymStripe as Administrator.\n\
+                            2. OR Enable 'Unreal Engine / Safe Mode' checkbox (uses Directory Junctions, which do NOT require admin rights).",
+                            os_err
+                        );
+                    }
+                    return Err(err_msg);
+                }
             } else if ue5_safe_mode {
                 // Subfolder Directory Junction (Paks_DriveX)
                 let src_parent = f_path.parent().unwrap();
