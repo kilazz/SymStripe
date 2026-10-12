@@ -13,7 +13,7 @@ use striping::{
     auto_detect_threshold, calculate_allocation_plan, execute_consolidate, execute_revert,
     execute_striping, parse_ext_list, verify_and_repair_integrity,
 };
-use vfs_pool::{VfsPoolSession, mount_storage_pool};
+use vfs_pool::{VfsLogCallback, VfsPoolSession, mount_storage_pool};
 use win32::{get_logical_volumes, query_smart_disks};
 
 use rfd::FileDialog;
@@ -867,7 +867,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     });
 
-    // Mount Virtual Storage Pool (Z:) with Custom or Auto Quota
+    // Mount Virtual Storage Pool (Z:) with Real-Time Tracing
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_mount_pool(move |drive_letter, custom_size_str| {
@@ -919,7 +919,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             update_status(&w, "Mounting Virtual Storage Pool...");
 
             let stripe_bytes = (stripe_mb as u64) * 1024 * 1024;
-            match mount_storage_pool(&drive, &members, policy, stripe_bytes, custom_gb) {
+            let w_log = w.clone();
+            let logger: Option<VfsLogCallback> = Some(Arc::new(move |msg: String| {
+                append_log(&w_log, &msg);
+            }));
+
+            match mount_storage_pool(&drive, &members, policy, stripe_bytes, custom_gb, logger) {
                 Ok(session) => {
                     let mut st = st_lock.lock().unwrap();
                     st.pool_session = Some(session);
@@ -934,7 +939,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     append_log(
                         &w,
                         &format!(
-                            "🚀 SUCCESS: Virtual Storage Pool mounted at '{}' ({})!",
+                            "🚀 SUCCESS: Virtual Storage Pool mounted at '{}' ({})! Transparent on-the-fly striping is active.",
                             drive, quota_msg
                         ),
                     );
@@ -959,6 +964,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_status_msg("Virtual Storage Pool unmounted.".into());
         });
         append_log(&weak, "Virtual Storage Pool unmounted successfully.");
+    });
+
+    // Live Rescan Virtual Pool Index Without Unmounting
+    let weak = ui_weak.clone();
+    let state_arc = state.clone();
+    app.on_refresh_pool_index(move || {
+        let st = state_arc.lock().unwrap();
+        if let Some(session) = &st.pool_session {
+            session.rescan();
+            append_log(&weak, "✅ Virtual Storage Pool catalog refreshed live.");
+            update_status(&weak, "Pool index refreshed.");
+        } else {
+            append_log(&weak, "Pool is not mounted.");
+        }
     });
 
     // Profile Management Callbacks

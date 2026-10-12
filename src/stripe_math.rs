@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 /// Describes an I/O slice mapped to a specific physical drive in the storage array.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeSlice {
