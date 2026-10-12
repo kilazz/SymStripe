@@ -166,6 +166,7 @@ export component AppWindow inherits Window {
     in-out property <int> pool_stripe_mb: 16;
     in-out property <string> pool_mount_point: "Z:";
     in-out property <string> pool_custom_size_gb_text: "0";
+    in-out property <string> pool_ram_cache_mb_text: "1024";
     in-out property <bool> is_pool_mounted: false;
 
     // Enterprise VFS Features
@@ -224,7 +225,8 @@ export component AppWindow inherits Window {
     callback clear_pool_members();
     callback pool_policy_switched(int);
     callback pool_stripe_changed(int);
-    callback mount_pool(string, string, int, bool);
+    callback auto_detect_ram_cache();
+    callback mount_pool(string, string, int, bool, float);
     callback unmount_pool();
     callback refresh_pool_index();
 
@@ -848,6 +850,39 @@ export component AppWindow inherits Window {
                                 }
 
                                 HorizontalLayout {
+                                    height: 30px;
+                                    spacing: 8px;
+                                    alignment: start;
+                                    Text {
+                                        text: "RAM Cache Budget (MB):";
+                                        vertical-alignment: center;
+                                        font-size: 11px;
+                                        color: Theme.text-main;
+                                    }
+
+                                    LineEdit {
+                                        width: 75px;
+                                        text <=> root.pool_ram_cache_mb_text;
+                                        placeholder-text: "0 (Auto)";
+                                        enabled: !root.is_pool_mounted && !root.is_processing;
+                                    }
+
+                                    CustomButton {
+                                        text: "Auto";
+                                        primary-color: Theme.accent-emerald;
+                                        enabled: !root.is_pool_mounted && !root.is_processing;
+                                        clicked => { root.auto_detect_ram_cache(); }
+                                    }
+
+                                    Text {
+                                        text: "Raw uncompressed RAM buffer";
+                                        vertical-alignment: center;
+                                        font-size: 10px;
+                                        color: Theme.text-muted;
+                                    }
+                                }
+
+                                HorizontalLayout {
                                     spacing: 6px;
                                     CustomButton {
                                         text: root.is_pool_mounted ? "🛑 Stop & Unmount Virtual Pool" : "🚀 Mount Virtual Storage Pool (" + root.pool_mount_point + ")";
@@ -857,7 +892,7 @@ export component AppWindow inherits Window {
                                             if root.is_pool_mounted {
                                                 root.unmount_pool();
                                             } else {
-                                                root.mount_pool(root.pool_mount_point, root.pool_custom_size_gb_text, root.vfs_codec_index, root.tiered_storage_enabled);
+                                                root.mount_pool(root.pool_mount_point, root.pool_custom_size_gb_text, root.vfs_codec_index, root.tiered_storage_enabled, root.pool_ram_cache_mb_text.to-float());
                                             }
                                         }
                                     }

@@ -125,7 +125,6 @@ pub struct CachedPart {
     pub data: Vec<u8>,
     pub dirty: bool,
     pub last_access: std::time::Instant,
-    pub last_modified: std::time::Instant,
     pub codec: VfsCodec,
 }
 
@@ -169,11 +168,14 @@ impl FileNode {
         let mut opts = OpenOptions::new();
         opts.read(true);
         if for_write {
-            opts.write(true).create(true).truncate(false);
+            opts.write(true).create(true);
+        } else {
+            opts.write(true);
         }
 
         let file = opts
             .open(&p)
+            .or_else(|_| OpenOptions::new().read(true).open(&p))
             .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
         let arc_file = Arc::new(file);
         *guard = Some(arc_file.clone());
@@ -229,6 +231,7 @@ impl SymStripePoolFs {
         custom_size_gb: u64,
         codec_idx: i32,
         tiered_storage: bool,
+        ram_cache_mb: u32,
         logger: Option<VfsLogCallback>,
     ) -> Self {
         let num_drives = members.len().max(1);
@@ -239,16 +242,18 @@ impl SymStripePoolFs {
         );
 
         let ram_mb = get_system_ram_mb();
-        let cache_budget_bytes = if ram_mb >= 32768 {
-            1024 * 1024 * 1024
+        let cache_budget_bytes = if ram_cache_mb > 0 {
+            (ram_cache_mb as u64) * 1024 * 1024
+        } else if ram_mb >= 32768 {
+            2048 * 1024 * 1024
         } else if ram_mb >= 16384 {
-            512 * 1024 * 1024
+            1024 * 1024 * 1024
         } else {
-            256 * 1024 * 1024
+            512 * 1024 * 1024
         };
 
         let max_cache_parts =
-            ((cache_budget_bytes / stripe_size_bytes.max(1)).clamp(16, 512)) as usize;
+            ((cache_budget_bytes / stripe_size_bytes.max(1)).clamp(8, 4096)) as usize;
 
         let fs = Self {
             members: Arc::new(members),
@@ -552,7 +557,6 @@ impl SymStripePoolFs {
             data,
             dirty: false,
             last_access: now,
-            last_modified: now,
             codec: loaded_codec,
         }));
         cache.insert(part_index, part.clone());
@@ -931,7 +935,6 @@ impl FileSystemContext for SymStripePoolFs {
 
                 part.data[start_idx..end_pos].copy_from_slice(src_slice);
                 part.dirty = true;
-                part.last_modified = std::time::Instant::now();
                 part.codec = codec;
 
                 if let Some(counter) = io_bytes.get(slice.target_drive_idx) {
@@ -1611,9 +1614,6 @@ pub struct VfsPoolSession {
 }
 
 impl VfsPoolSession {
-    #[allow(dead_code)]
-    pub fn rescan(&self) {}
-
     pub fn sample_and_reset_io(&self) -> Vec<u64> {
         self.io_bytes
             .iter()
@@ -1641,6 +1641,7 @@ pub fn mount_storage_pool(
     custom_size_gb: u64,
     codec_idx: i32,
     tiered_storage: bool,
+    ram_cache_mb: u32,
     logger: Option<VfsLogCallback>,
 ) -> Result<VfsPoolSession, String> {
     if members.is_empty() {
@@ -1659,6 +1660,7 @@ pub fn mount_storage_pool(
         custom_size_gb,
         codec_idx,
         tiered_storage,
+        ram_cache_mb,
         logger,
     );
     let io_bytes = pool_fs.io_bytes.clone();

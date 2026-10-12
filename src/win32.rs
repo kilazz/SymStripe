@@ -8,26 +8,13 @@ use winreg::enums::*;
 type Handle = *mut c_void;
 const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 
-#[allow(dead_code)]
-const GENERIC_WRITE: u32 = 0x40000000;
 const FILE_SHARE_READ: u32 = 0x00000001;
 const FILE_SHARE_WRITE: u32 = 0x00000002;
-#[allow(dead_code)]
-const FILE_SHARE_DELETE: u32 = 0x00000004;
 const OPEN_EXISTING: u32 = 3;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
-#[allow(dead_code)]
-const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
-#[allow(dead_code)]
-const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
 
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
 const IOCTL_STORAGE_PREDICT_FAILURE: u32 = 0x002D1100;
-
-#[allow(dead_code)]
-const FSCTL_SET_REPARSE_POINT: u32 = 0x000900A4;
-#[allow(dead_code)]
-const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
 
 // HKEY_LOCAL_MACHINE: ((HKEY)(ULONG_PTR)((LONG)0x80000002))
 const HKEY_LOCAL_MACHINE: *mut c_void = (0x80000002_u32 as i32 as isize) as *mut c_void;
@@ -331,112 +318,6 @@ pub fn check_winfsp_available() -> Result<(), String> {
         Please download and install WinFsp from https://winfsp.dev/ \n\
         (or via Windows Terminal: 'winget install WinFsp.WinFsp') and restart SymStripe."
         .to_string())
-}
-
-#[allow(dead_code)]
-pub fn create_directory_junction(junction_path: &Path, target_dir: &Path) -> Result<(), String> {
-    let target_abs = match fs::canonicalize(target_dir) {
-        Ok(p) => p,
-        Err(_) => target_dir.to_path_buf(),
-    };
-
-    let target_str = target_abs.to_string_lossy().to_string();
-    let clean_target = target_str.strip_prefix(r"\\?\").unwrap_or(&target_str);
-
-    let substitute_name = format!(r"\??\{}", clean_target);
-    let print_name = clean_target.to_string();
-
-    let substitute_w = to_wide_null(&substitute_name);
-    let sub_bytes = (substitute_w.len() - 1) * 2;
-
-    let print_w = to_wide_null(&print_name);
-    let print_bytes = (print_w.len() - 1) * 2;
-
-    if !junction_path.exists() {
-        fs::create_dir_all(junction_path)
-            .map_err(|e| format!("Failed to create junction folder: {e}"))?;
-    }
-
-    let wide_junction = to_wide_null(&junction_path.to_string_lossy());
-
-    let handle = unsafe {
-        CreateFileW(
-            wide_junction.as_ptr(),
-            GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null_mut(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            std::ptr::null_mut(),
-        )
-    };
-
-    if handle == INVALID_HANDLE_VALUE {
-        let err = unsafe { GetLastError() };
-        return Err(format!(
-            "Failed to open junction directory handle (Win32 Error: {})",
-            err
-        ));
-    }
-
-    let path_buffer_len_bytes = (substitute_w.len() + print_w.len()) * 2;
-    let reparse_data_len = 8 + path_buffer_len_bytes;
-    let total_size = 8 + reparse_data_len;
-
-    let mut buf = vec![0u8; total_size];
-
-    buf[0..4].copy_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_ne_bytes());
-    buf[4..6].copy_from_slice(&(reparse_data_len as u16).to_ne_bytes());
-    buf[6..8].copy_from_slice(&0u16.to_ne_bytes());
-
-    buf[8..10].copy_from_slice(&0u16.to_ne_bytes());
-    buf[10..12].copy_from_slice(&(sub_bytes as u16).to_ne_bytes());
-
-    let print_offset = (substitute_w.len() * 2) as u16;
-    buf[12..14].copy_from_slice(&print_offset.to_ne_bytes());
-    buf[14..16].copy_from_slice(&(print_bytes as u16).to_ne_bytes());
-
-    let path_start = 16;
-    let sub_slice = unsafe {
-        std::slice::from_raw_parts(substitute_w.as_ptr() as *const u8, substitute_w.len() * 2)
-    };
-    buf[path_start..path_start + sub_slice.len()].copy_from_slice(sub_slice);
-
-    let print_start = path_start + sub_slice.len();
-    let print_slice =
-        unsafe { std::slice::from_raw_parts(print_w.as_ptr() as *const u8, print_w.len() * 2) };
-    buf[print_start..print_start + print_slice.len()].copy_from_slice(print_slice);
-
-    let mut bytes_returned = 0u32;
-    let ok = unsafe {
-        DeviceIoControl(
-            handle,
-            FSCTL_SET_REPARSE_POINT,
-            buf.as_ptr() as *const c_void,
-            total_size as u32,
-            std::ptr::null_mut(),
-            0,
-            &mut bytes_returned,
-            std::ptr::null_mut(),
-        )
-    };
-
-    let err = if ok == 0 {
-        unsafe { GetLastError() }
-    } else {
-        0
-    };
-    unsafe { CloseHandle(handle) };
-
-    if ok != 0 {
-        Ok(())
-    } else {
-        let _ = fs::remove_dir(junction_path);
-        Err(format!(
-            "DeviceIoControl(FSCTL_SET_REPARSE_POINT) failed with Win32 Error: {}",
-            err
-        ))
-    }
 }
 
 pub struct SmartDiskInfo {

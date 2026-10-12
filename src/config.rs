@@ -24,6 +24,9 @@ fn default_mount_point() -> String {
 fn default_custom_size_gb() -> String {
     "0".to_string()
 }
+fn default_ram_cache_mb() -> u32 {
+    1024
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Profile {
@@ -56,6 +59,8 @@ pub struct Profile {
     pub pool_mount_point: String,
     #[serde(default = "default_custom_size_gb")]
     pub pool_custom_size_gb: String,
+    #[serde(default = "default_ram_cache_mb")]
+    pub pool_ram_cache_mb: u32,
 
     // Enterprise VFS Features
     #[serde(default = "default_zero")]
@@ -82,26 +87,9 @@ impl Default for Profile {
             pool_stripe_mb: 16,
             pool_mount_point: "Z:".to_string(),
             pool_custom_size_gb: "0".to_string(),
+            pool_ram_cache_mb: 1024,
             pool_codec: 0,
             tiered_storage: false,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct AppConfig {
-    pub active_profile_index: usize,
-    #[serde(default = "default_false")]
-    pub auto_start: bool,
-    pub profiles: Vec<Profile>,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            active_profile_index: 0,
-            auto_start: false,
-            profiles: vec![Profile::default()],
         }
     }
 }
@@ -143,5 +131,23 @@ pub fn save_config(cfg: &AppConfig) {
         && fs::write(&tmp_path, json).is_ok()
     {
         let _ = fs::rename(&tmp_path, &path);
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AppConfig {
+    pub active_profile_index: usize,
+    #[serde(default = "default_false")]
+    pub auto_start: bool,
+    pub profiles: Vec<Profile>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            active_profile_index: 0,
+            auto_start: false,
+            profiles: vec![Profile::default()],
+        }
     }
 }
