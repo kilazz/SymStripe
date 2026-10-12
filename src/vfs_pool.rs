@@ -425,27 +425,30 @@ impl SymStripePoolFs {
         let mut part = part_arc.write();
         if part.dirty {
             let target_drive_idx = (part_index as usize) % self.members.len();
-            let base_path =
-                self.members[target_drive_idx].join(format!("{}.part{}", rel_path, part_index));
+            let ext = match part.codec {
+                VfsCodec::Lz4 => "lz4",
+                VfsCodec::Zstd => "zst",
+                VfsCodec::Store => "raw",
+            };
+
+            let part_filename = format!("{}.part{}.{}", rel_path, part_index, ext);
+            let base_path = self.members[target_drive_idx].join(part_filename);
             if let Some(parent) = base_path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
 
-            let (compressed, ext) = match part.codec {
-                VfsCodec::Lz4 => (lz4_flex::compress_prepend_size(&part.data), "lz4"),
-                VfsCodec::Zstd => (
-                    ZstdAtgCompressor::compress_atg(&part.data, 3)
-                        .unwrap_or_else(|_| part.data.clone()),
-                    "zst",
-                ),
-                VfsCodec::Store => (part.data.clone(), "raw"),
+            let compressed = match part.codec {
+                VfsCodec::Lz4 => lz4_flex::compress_prepend_size(&part.data),
+                VfsCodec::Zstd => ZstdAtgCompressor::compress_atg(&part.data, 3)
+                    .unwrap_or_else(|_| part.data.clone()),
+                VfsCodec::Store => part.data.clone(),
             };
 
             self.raw_bytes_written
                 .fetch_add(part.data.len() as u64, Ordering::Relaxed);
             self.compressed_bytes_written
                 .fetch_add(compressed.len() as u64, Ordering::Relaxed);
-            let _ = fs::write(base_path.with_extension(ext), compressed);
+            let _ = fs::write(&base_path, compressed);
             part.dirty = false;
         }
     }
@@ -495,23 +498,29 @@ impl SymStripePoolFs {
             }
         }
 
-        let base_path =
-            self.members[target_drive_idx].join(format!("{}.part{}", node.rel_path(), part_index));
+        let rel = node.rel_path();
+        let lz4_path =
+            self.members[target_drive_idx].join(format!("{}.part{}.lz4", rel, part_index));
+        let zst_path =
+            self.members[target_drive_idx].join(format!("{}.part{}.zst", rel, part_index));
+        let raw_path =
+            self.members[target_drive_idx].join(format!("{}.part{}.raw", rel, part_index));
+
         let mut data = Vec::new();
         let mut loaded_codec = node.file_codec;
 
-        if base_path.with_extension("lz4").exists() {
-            if let Ok(comp) = fs::read(base_path.with_extension("lz4")) {
+        if lz4_path.exists() {
+            if let Ok(comp) = fs::read(&lz4_path) {
                 data = lz4_flex::decompress_size_prepended(&comp).unwrap_or_default();
                 loaded_codec = VfsCodec::Lz4;
             }
-        } else if base_path.with_extension("zst").exists() {
-            if let Ok(comp) = fs::read(base_path.with_extension("zst")) {
+        } else if zst_path.exists() {
+            if let Ok(comp) = fs::read(&zst_path) {
                 data = ZstdAtgCompressor::decompress_atg(&comp).unwrap_or_default();
                 loaded_codec = VfsCodec::Zstd;
             }
-        } else if base_path.with_extension("raw").exists() {
-            data = fs::read(base_path.with_extension("raw")).unwrap_or_default();
+        } else if raw_path.exists() {
+            data = fs::read(&raw_path).unwrap_or_default();
             loaded_codec = VfsCodec::Store;
         }
 
@@ -962,8 +971,8 @@ impl FileSystemContext for SymStripePoolFs {
                     part_cache.remove(&part_idx);
                     let target_drive_idx = (part_idx as usize) % num_drives;
                     for ext in ["lz4", "zst", "raw"] {
-                        let part_path = self.members[target_drive_idx]
-                            .join(format!("{}.part{}.{}", rel, part_idx, ext));
+                        let part_filename = format!("{}.part{}.{}", rel, part_idx, ext);
+                        let part_path = self.members[target_drive_idx].join(part_filename);
                         let _ = fs::remove_file(part_path);
                     }
                 }
@@ -975,28 +984,30 @@ impl FileSystemContext for SymStripePoolFs {
                         part_arc.write().dirty = true;
                     } else {
                         let target_drive_idx = (boundary_idx as usize) % num_drives;
-                        let base_path = self.members[target_drive_idx]
-                            .join(format!("{}.part{}", rel, boundary_idx));
+                        let lz4_path = self.members[target_drive_idx]
+                            .join(format!("{}.part{}.lz4", rel, boundary_idx));
+                        let zst_path = self.members[target_drive_idx]
+                            .join(format!("{}.part{}.zst", rel, boundary_idx));
+                        let raw_path = self.members[target_drive_idx]
+                            .join(format!("{}.part{}.raw", rel, boundary_idx));
 
-                        if base_path.with_extension("lz4").exists()
-                            && let Ok(comp) = fs::read(base_path.with_extension("lz4"))
+                        if lz4_path.exists()
+                            && let Ok(comp) = fs::read(&lz4_path)
                             && let Ok(mut dec) = lz4_flex::decompress_size_prepended(&comp)
                         {
                             dec.truncate(rem_len as usize);
                             let new_comp = lz4_flex::compress_prepend_size(&dec);
-                            let _ = fs::write(base_path.with_extension("lz4"), new_comp);
-                        } else if base_path.with_extension("zst").exists()
-                            && let Ok(comp) = fs::read(base_path.with_extension("zst"))
+                            let _ = fs::write(&lz4_path, new_comp);
+                        } else if zst_path.exists()
+                            && let Ok(comp) = fs::read(&zst_path)
                             && let Ok(mut dec) = ZstdAtgCompressor::decompress_atg(&comp)
                         {
                             dec.truncate(rem_len as usize);
                             if let Ok(new_comp) = ZstdAtgCompressor::compress_atg(&dec, 3) {
-                                let _ = fs::write(base_path.with_extension("zst"), new_comp);
+                                let _ = fs::write(&zst_path, new_comp);
                             }
-                        } else if base_path.with_extension("raw").exists()
-                            && let Ok(f) = OpenOptions::new()
-                                .write(true)
-                                .open(base_path.with_extension("raw"))
+                        } else if raw_path.exists()
+                            && let Ok(f) = OpenOptions::new().write(true).open(&raw_path)
                         {
                             let _ = f.set_len(rem_len);
                         }
