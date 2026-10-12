@@ -1,13 +1,15 @@
 use crate::manifest::{
     ManifestFileEntry, StripingManifest, delete_manifest, load_manifest, save_manifest,
 };
-use crate::win32::{get_free_disk_space_bytes, test_symlink_privilege};
+use crate::win32::{copy_file_with_progress, get_free_disk_space_bytes, test_symlink_privilege};
 use std::fs;
 use std::os::windows::fs::symlink_file;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 const COMPANION_EXTENSIONS: &[&str] = &["utoc", "pak", "sig"];
+// Keep a safety reserve on destination target disks (512 MB)
+const DISK_SAFETY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 
 pub fn is_ext_match(path: &Path, exts: &[String]) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -147,6 +149,7 @@ pub struct SimulationPlan {
     pub total_drives: usize,
 }
 
+/// Calculates balanced multi-drive distribution strictly constrained by physical available space per spindle.
 pub fn calculate_allocation_plan(
     src_path: &Path,
     targets: &[PathBuf],
@@ -183,13 +186,51 @@ pub fn calculate_allocation_plan(
     let mut drive_bytes: Vec<u64> = vec![0; total_drives];
     let mut drive_buckets: Vec<Vec<(PathBuf, u64, bool)>> = vec![Vec::new(); total_drives];
 
+    // Query real physical free bytes for each spindle
+    let mut initial_free_space: Vec<u64> = Vec::with_capacity(total_drives);
+    initial_free_space.push(get_free_disk_space_bytes(src_path).unwrap_or(u64::MAX / 2));
+    for t in targets {
+        initial_free_space.push(get_free_disk_space_bytes(t).unwrap_or(0));
+    }
+
     for (f_path, size, is_media) in files.clone() {
+        // Target drives must have enough remaining space + safety threshold
+        let target_has_space = |idx: usize| -> bool {
+            let planned_alloc = drive_bytes[idx];
+            let free = initial_free_space[idx];
+            free.saturating_sub(planned_alloc) >= size + DISK_SAFETY_RESERVE_BYTES
+        };
+
         let best_drive = if is_media && total_drives > 1 {
-            (1..total_drives)
-                .min_by_key(|&idx| drive_bytes[idx])
-                .unwrap_or(1)
+            // Aggressive media routing: pick destination drive among targets with enough room,
+            // prioritizing the drive with greatest remaining capacity to balance spindles
+            let eligible_targets: Vec<usize> = (1..total_drives)
+                .filter(|&idx| target_has_space(idx))
+                .collect();
+
+            if !eligible_targets.is_empty() {
+                eligible_targets
+                    .into_iter()
+                    .max_by_key(|&idx| initial_free_space[idx].saturating_sub(drive_bytes[idx]))
+                    .unwrap_or(1)
+            } else {
+                0 // Fallback to Primary local drive if all targets lack capacity
+            }
         } else {
-            (0..total_drives)
+            // Standard files: consider all candidate drives that can host the block
+            let mut eligible_drives = Vec::new();
+            // Drive 0 (Primary) already holds the file locally
+            eligible_drives.push(0);
+
+            for idx in 1..total_drives {
+                if target_has_space(idx) {
+                    eligible_drives.push(idx);
+                }
+            }
+
+            // Among eligible drives, pick the one with least currently allocated bytes (round-robin / striping)
+            eligible_drives
+                .into_iter()
                 .min_by_key(|&idx| drive_bytes[idx])
                 .unwrap_or(0)
         };
@@ -234,18 +275,26 @@ pub fn execute_striping(
 
     for (idx, target) in targets.iter().enumerate() {
         let required = plan.drive_bytes[idx + 1];
-        if let Some(free) = get_free_disk_space_bytes(target).filter(|&free| free < required) {
+        if let Some(free) = get_free_disk_space_bytes(target)
+            .filter(|&free| free < required + DISK_SAFETY_RESERVE_BYTES)
+        {
             return Err(format!(
                 "ABORTED: Insufficient space on Drive {} ({})! Required: {:.2} GB, Available: {:.2} GB",
                 idx + 2,
                 target.display(),
-                required as f64 / 1e9,
+                (required + DISK_SAFETY_RESERVE_BYTES) as f64 / 1e9,
                 free as f64 / 1e9
             ));
         }
     }
 
     let files_to_move: usize = plan.drive_buckets.iter().skip(1).map(|b| b.len()).sum();
+    let total_bytes_to_move: u64 = plan
+        .drive_buckets
+        .iter()
+        .skip(1)
+        .flat_map(|b| b.iter().map(|f| f.1))
+        .sum();
 
     let mut manifest = load_manifest(src_path).unwrap_or_else(|| StripingManifest {
         game_path: src_path.to_string_lossy().to_string(),
@@ -254,6 +303,7 @@ pub fn execute_striping(
     });
 
     let mut moved_count = 0;
+    let mut bytes_moved_so_far: u64 = 0;
 
     for (target_idx, bucket) in plan.drive_buckets.into_iter().enumerate().skip(1) {
         let target_root = &targets[target_idx - 1];
@@ -280,23 +330,32 @@ pub fn execute_striping(
             let target_parent = target_file.parent().unwrap();
             let _ = fs::create_dir_all(target_parent);
 
-            let current_idx = moved_count + 1;
-            let pct = if files_to_move > 0 {
-                current_idx as f32 / files_to_move as f32
-            } else {
-                1.0
-            };
-            on_progress(current_idx, files_to_move, &filename, pct);
+            let current_file_idx = moved_count + 1;
 
-            // Step 1: Crash-consistent copy to .symstripe_tmp with atomic rename
+            // Step 1: Smooth CopyFileExW with byte-level progress reporting to prevent UI freezes
             let target_tmp = target_file.with_extension("symstripe_tmp");
-            if let Err(e) = fs::copy(&f_path, &target_tmp) {
+            let file_copied_bytes = std::sync::atomic::AtomicU64::new(0);
+
+            let copy_res = copy_file_with_progress(&f_path, &target_tmp, |transferred, _total| {
+                file_copied_bytes.store(transferred, std::sync::atomic::Ordering::Relaxed);
+                let current_total = bytes_moved_so_far + transferred;
+                let global_pct = if total_bytes_to_move > 0 {
+                    (current_total as f64 / total_bytes_to_move as f64).clamp(0.0, 1.0) as f32
+                } else {
+                    1.0
+                };
+                on_progress(current_file_idx, files_to_move, &filename, global_pct);
+                true
+            });
+
+            if let Err(e) = copy_res {
                 let _ = fs::remove_file(&target_tmp);
                 return Err(format!(
                     "Failed to copy file '{}' to target drive: {e}",
                     f_path.display()
                 ));
             }
+
             if let Err(e) = fs::rename(&target_tmp, &target_file) {
                 let _ = fs::remove_file(&target_tmp);
                 return Err(format!(
@@ -318,7 +377,9 @@ pub fn execute_striping(
                     let comp_dst = target_file.with_extension(ext);
                     let comp_tmp = comp_dst.with_extension("symstripe_tmp");
 
-                    if comp_src.exists() && fs::copy(&comp_src, &comp_tmp).is_ok() {
+                    if comp_src.exists()
+                        && copy_file_with_progress(&comp_src, &comp_tmp, |_, _| true).is_ok()
+                    {
                         if fs::rename(&comp_tmp, &comp_dst).is_ok() {
                             let comp_stage = PathBuf::from(format!(
                                 "{}.symstripe_stage",
@@ -414,7 +475,15 @@ pub fn execute_striping(
             });
             save_manifest(src_path, &manifest);
 
+            bytes_moved_so_far += size;
             moved_count += 1;
+
+            let final_pct = if total_bytes_to_move > 0 {
+                (bytes_moved_so_far as f64 / total_bytes_to_move as f64).clamp(0.0, 1.0) as f32
+            } else {
+                1.0
+            };
+            on_progress(moved_count, files_to_move, &filename, final_pct);
         }
     }
 
@@ -446,7 +515,7 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
                 }
             } else if target_path.exists() {
                 let _ = fs::remove_file(&link_path);
-                if fs::copy(&target_path, &link_path).is_ok() {
+                if copy_file_with_progress(&target_path, &link_path, |_, _| true).is_ok() {
                     let _ = fs::remove_file(&target_path);
                     if let Some(target_parent) = target_path.parent() {
                         clean_empty_parents(&target_path, target_parent);
@@ -472,7 +541,8 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
                         }
                     } else if comp_target.exists() {
                         let _ = fs::remove_file(&comp_primary);
-                        if fs::copy(&comp_target, &comp_primary).is_ok() {
+                        if copy_file_with_progress(&comp_target, &comp_primary, |_, _| true).is_ok()
+                        {
                             let _ = fs::remove_file(&comp_target);
                         }
                     }
@@ -533,7 +603,7 @@ pub fn execute_consolidate(src_path: &Path, chosen_target_dir: &Path) -> Result<
                 }
             } else if target_path.exists() {
                 let _ = fs::remove_file(&link_path);
-                if fs::copy(&target_path, &link_path).is_ok() {
+                if copy_file_with_progress(&target_path, &link_path, |_, _| true).is_ok() {
                     let _ = fs::remove_file(&target_path);
                     clean_empty_parents(&target_path, chosen_target_dir);
                     consolidated_count += 1;
@@ -557,7 +627,8 @@ pub fn execute_consolidate(src_path: &Path, chosen_target_dir: &Path) -> Result<
                         }
                     } else if comp_target.exists() {
                         let _ = fs::remove_file(&comp_primary);
-                        if fs::copy(&comp_target, &comp_primary).is_ok() {
+                        if copy_file_with_progress(&comp_target, &comp_primary, |_, _| true).is_ok()
+                        {
                             let _ = fs::remove_file(&comp_target);
                         }
                     }

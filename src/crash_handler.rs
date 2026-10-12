@@ -4,6 +4,9 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::panic;
 
+// Win32 Top-Level Exception Filter return codes
+const EXCEPTION_EXECUTE_HANDLER: i32 = 1;
+
 #[repr(C)]
 struct ExceptionRecord {
     exception_code: u32,
@@ -49,7 +52,7 @@ pub fn setup_crash_handler() {
 unsafe extern "system" fn unhandled_exception_filter(pointers: *mut ExceptionPointers) -> i32 {
     unsafe {
         if pointers.is_null() || (*pointers).exception_record.is_null() {
-            return 0; // EXCEPTION_CONTINUE_SEARCH
+            return EXCEPTION_EXECUTE_HANDLER;
         }
 
         let rec = &*(*pointers).exception_record;
@@ -75,7 +78,8 @@ unsafe extern "system" fn unhandled_exception_filter(pointers: *mut ExceptionPoi
 
         write_crash_report("WINDOWS_NATIVE_SEH_EXCEPTION", &details);
 
-        0 // EXCEPTION_CONTINUE_SEARCH
+        // Return EXCEPTION_EXECUTE_HANDLER to prevent recursive invocation loops and cleanly terminate
+        EXCEPTION_EXECUTE_HANDLER
     }
 }
 

@@ -1,14 +1,15 @@
 use crate::stripe_math::StripeConfig;
-use crate::win32::get_system_ram_mb;
+use crate::win32::{check_winfsp_available, get_system_ram_mb};
 use crate::zstd_atg::ZstdAtgCompressor;
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::os::windows::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use widestring::U16CStr;
@@ -25,6 +26,9 @@ const STATUS_ACCESS_DENIED: i32 = 0xC0000022_u32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC0000034_u32 as i32;
 const STATUS_IO_DEVICE_ERROR: i32 = 0xC0000185_u32 as i32;
 const STATUS_BUFFER_TOO_SMALL: i32 = 0xC0000023_u32 as i32;
+
+// Threshold for switching from sequential thread execution to Rayon parallel work-stealing (2 MB)
+const PARALLEL_IO_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
 
 pub type VfsLogCallback = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -43,6 +47,12 @@ impl VfsCodec {
             _ => Self::Lz4,
         }
     }
+}
+
+fn hash_path_id(rel_path: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rel_path.to_lowercase().hash(&mut hasher);
+    hasher.finish()
 }
 
 #[link(name = "advapi32")]
@@ -115,6 +125,7 @@ pub struct CachedPart {
     pub data: Vec<u8>,
     pub dirty: bool,
     pub last_access: std::time::Instant,
+    pub last_modified: std::time::Instant,
     pub codec: VfsCodec,
 }
 
@@ -227,7 +238,6 @@ impl SymStripePoolFs {
                 .collect::<Vec<_>>(),
         );
 
-        // Dynamic RAM cache budgeting: 256 MB to 1024 MB
         let ram_mb = get_system_ram_mb();
         let cache_budget_bytes = if ram_mb >= 32768 {
             1024 * 1024 * 1024
@@ -453,7 +463,7 @@ impl SymStripePoolFs {
         }
     }
 
-    fn flush_node_dirty_parts(&self, node: &FileNode) {
+    pub fn flush_node_dirty_parts(&self, node: &FileNode) {
         let rel = node.rel_path();
         let parts: Vec<(u64, Arc<RwLock<CachedPart>>)> = node
             .cached_parts
@@ -464,6 +474,19 @@ impl SymStripePoolFs {
 
         for (part_index, part_arc) in parts {
             self.evict_part_to_disk(&rel, part_index, part_arc);
+        }
+    }
+
+    pub fn flush_all_dirty_nodes(&self) {
+        let nodes: Vec<Arc<FileNode>> = self.file_nodes.read().values().cloned().collect();
+        for node in nodes {
+            if *node.is_modified.lock() {
+                self.flush_node_dirty_parts(&node);
+                let size = *node.file_size.lock();
+                if node.is_striped && size > 0 {
+                    self.save_meta_size(&node.rel_path(), size);
+                }
+            }
         }
     }
 
@@ -524,10 +547,12 @@ impl SymStripePoolFs {
             loaded_codec = VfsCodec::Store;
         }
 
+        let now = std::time::Instant::now();
         let part = Arc::new(RwLock::new(CachedPart {
             data,
             dirty: false,
-            last_access: std::time::Instant::now(),
+            last_access: now,
+            last_modified: now,
             codec: loaded_codec,
         }));
         cache.insert(part_index, part.clone());
@@ -646,8 +671,8 @@ impl FileSystemContext for SymStripePoolFs {
                 (current_size + 4095) & !4095
             };
             info.file_attributes = if is_dir { 0x10 } else { 0x80 };
-            info.hard_links = 0;
-            info.index_number = 0;
+            info.hard_links = 1;
+            info.index_number = hash_path_id(&rel_path);
 
             let check_path = if is_striped {
                 self.meta_path(&rel_path)
@@ -757,8 +782,8 @@ impl FileSystemContext for SymStripePoolFs {
             info.last_access_time = now_ft;
             info.last_write_time = now_ft;
             info.change_time = now_ft;
-            info.hard_links = 0;
-            info.index_number = 0;
+            info.hard_links = 1;
+            info.index_number = hash_path_id(&rel_path);
         }
 
         self.log(format!(
@@ -838,6 +863,8 @@ impl FileSystemContext for SymStripePoolFs {
         } else {
             file_info.file_attributes | file_attributes
         };
+        file_info.hard_links = 1;
+        file_info.index_number = hash_path_id(&rel);
         file_info.last_write_time = now_ft;
         file_info.change_time = now_ft;
 
@@ -874,7 +901,8 @@ impl FileSystemContext for SymStripePoolFs {
                 counter.fetch_add(buffer.len() as u64, Ordering::Relaxed);
             }
         } else {
-            let slices = self.stripe_config.map_io_slices(write_offset, buffer.len());
+            let buffer_len = buffer.len();
+            let slices = self.stripe_config.map_io_slices(write_offset, buffer_len);
             let mut tasks = Vec::with_capacity(slices.len());
             let mut remaining_buf = buffer;
 
@@ -889,25 +917,39 @@ impl FileSystemContext for SymStripePoolFs {
 
             let io_bytes = self.io_bytes.clone();
             let codec = node.file_codec;
-            tasks
-                .into_par_iter()
-                .for_each(|(slice, part_arc, src_slice)| {
-                    let mut part = part_arc.write();
-                    let start_idx = slice.offset_in_part as usize;
-                    let end_pos = start_idx + src_slice.len();
 
-                    if part.data.len() < end_pos {
-                        part.data.resize(end_pos, 0);
-                    }
+            let write_action = |slice: &crate::stripe_math::StripeSlice,
+                                part_arc: &Arc<RwLock<CachedPart>>,
+                                src_slice: &[u8]| {
+                let mut part = part_arc.write();
+                let start_idx = slice.offset_in_part as usize;
+                let end_pos = start_idx + src_slice.len();
 
-                    part.data[start_idx..end_pos].copy_from_slice(src_slice);
-                    part.dirty = true;
-                    part.codec = codec;
+                if part.data.len() < end_pos {
+                    part.data.resize(end_pos, 0);
+                }
 
-                    if let Some(counter) = io_bytes.get(slice.target_drive_idx) {
-                        counter.fetch_add(src_slice.len() as u64, Ordering::Relaxed);
-                    }
-                });
+                part.data[start_idx..end_pos].copy_from_slice(src_slice);
+                part.dirty = true;
+                part.last_modified = std::time::Instant::now();
+                part.codec = codec;
+
+                if let Some(counter) = io_bytes.get(slice.target_drive_idx) {
+                    counter.fetch_add(src_slice.len() as u64, Ordering::Relaxed);
+                }
+            };
+
+            if tasks.len() > 1 && buffer_len >= PARALLEL_IO_THRESHOLD_BYTES {
+                tasks
+                    .into_par_iter()
+                    .for_each(|(slice, part_arc, src_slice)| {
+                        write_action(&slice, &part_arc, src_slice);
+                    });
+            } else {
+                for (slice, part_arc, src_slice) in tasks {
+                    write_action(&slice, &part_arc, src_slice);
+                }
+            }
         }
 
         let new_len = write_offset + buffer.len() as u64;
@@ -918,8 +960,8 @@ impl FileSystemContext for SymStripePoolFs {
         file_info.file_size = *current_size;
         file_info.allocation_size = (*current_size + 4095) & !4095;
         file_info.file_attributes = 0x80;
-        file_info.hard_links = 0;
-        file_info.index_number = 0;
+        file_info.hard_links = 1;
+        file_info.index_number = hash_path_id(&node.rel_path());
 
         Ok(buffer.len() as u32)
     }
@@ -1019,8 +1061,8 @@ impl FileSystemContext for SymStripePoolFs {
         file_info.file_size = new_size;
         file_info.allocation_size = (new_size + 4095) & !4095;
         file_info.file_attributes = 0x80;
-        file_info.hard_links = 0;
-        file_info.index_number = 0;
+        file_info.hard_links = 1;
+        file_info.index_number = hash_path_id(&rel);
 
         Ok(())
     }
@@ -1042,6 +1084,8 @@ impl FileSystemContext for SymStripePoolFs {
         } else {
             0x80
         };
+        file_info.hard_links = 1;
+        file_info.index_number = hash_path_id(&ctx.rel_path());
         Ok(())
     }
 
@@ -1107,6 +1151,14 @@ impl FileSystemContext for SymStripePoolFs {
             }
 
             self.log(format!("[VFS PURGE] Deleted '{}'", rel));
+        } else if let Some(node) = &ctx.node
+            && *node.is_modified.lock()
+        {
+            self.flush_node_dirty_parts(node);
+            let size = *node.file_size.lock();
+            if node.is_striped && size > 0 {
+                self.save_meta_size(&node.rel_path(), size);
+            }
         }
     }
 
@@ -1189,7 +1241,6 @@ impl FileSystemContext for SymStripePoolFs {
                 }
             }
 
-            // Transfer in global FCB file node table
             {
                 let mut map = self.file_nodes.write();
                 if let Some(n) = map.remove(&old_rel.to_lowercase()) {
@@ -1255,7 +1306,6 @@ impl FileSystemContext for SymStripePoolFs {
                 }
             }
 
-            // If no more open handles, remove from global file_nodes registry to free RAM!
             if remaining == 0 {
                 let rel = node.rel_path();
                 self.file_nodes.write().remove(&rel.to_lowercase());
@@ -1279,8 +1329,8 @@ impl FileSystemContext for SymStripePoolFs {
         info.file_size = size;
         info.allocation_size = if ctx.is_dir { 0 } else { (size + 4095) & !4095 };
         info.file_attributes = if ctx.is_dir { 0x10 } else { 0x80 };
-        info.hard_links = 0;
-        info.index_number = 0;
+        info.hard_links = 1;
+        info.index_number = hash_path_id(&rel);
 
         let check_path = if is_striped {
             self.meta_path(&rel)
@@ -1302,11 +1352,25 @@ impl FileSystemContext for SymStripePoolFs {
     fn read(&self, ctx: &Self::FileContext, buffer: &mut [u8], offset: u64) -> winfsp::Result<u32> {
         let node = context_node(ctx)?;
 
+        // CRITICAL EOF & BOUNDS CHECK: Never allow reads beyond the true file size
+        let current_file_size = *node.file_size.lock();
+        if offset >= current_file_size {
+            return Ok(0); // Normal EOF indication to Win32 ReadFile
+        }
+
+        let max_possible_read = (current_file_size - offset) as usize;
+        let bytes_to_read = max_possible_read.min(buffer.len());
+        if bytes_to_read == 0 {
+            return Ok(0);
+        }
+
+        let target_slice = &mut buffer[..bytes_to_read];
+
         if !node.is_striped {
             let member_root = &self.members[node.member_idx];
             let file = node.get_or_open_direct_file(member_root, false)?;
             let bytes_read = file
-                .seek_read(buffer, offset)
+                .seek_read(target_slice, offset)
                 .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
 
             if let Some(counter) = self.io_bytes.get(node.member_idx) {
@@ -1316,47 +1380,60 @@ impl FileSystemContext for SymStripePoolFs {
             return Ok(bytes_read as u32);
         }
 
-        let slices = self.stripe_config.map_io_slices(offset, buffer.len());
+        let slices = self.stripe_config.map_io_slices(offset, bytes_to_read);
         let mut tasks = Vec::with_capacity(slices.len());
-        let mut remaining_buf = buffer;
+        let mut remaining_dest = target_slice;
 
         for slice in slices {
             let part_arc =
                 self.fetch_cached_part(node, slice.part_index, slice.target_drive_idx)?;
-            let len = slice.length.min(remaining_buf.len());
-            let (dest, rest) = remaining_buf.split_at_mut(len);
-            remaining_buf = rest;
+            let len = slice.length.min(remaining_dest.len());
+            let (dest, rest) = remaining_dest.split_at_mut(len);
+            remaining_dest = rest;
             tasks.push((slice, part_arc, dest));
         }
 
         let io_bytes = self.io_bytes.clone();
-        let results: Result<Vec<usize>, FspError> = tasks
-            .into_par_iter()
-            .map(|(slice, part_arc, dest)| {
-                let part = part_arc.read();
-                let src_len = part.data.len();
-                let offset_idx = slice.offset_in_part as usize;
 
-                let n = if offset_idx < src_len {
-                    let copy_len = (src_len - offset_idx).min(dest.len());
-                    dest[..copy_len].copy_from_slice(&part.data[offset_idx..offset_idx + copy_len]);
-                    copy_len
-                } else {
-                    0
-                };
+        let read_action = |slice: &crate::stripe_math::StripeSlice,
+                           part_arc: &Arc<RwLock<CachedPart>>,
+                           dest: &mut [u8]|
+         -> usize {
+            let part = part_arc.read();
+            let src_len = part.data.len();
+            let offset_idx = slice.offset_in_part as usize;
 
-                if n < dest.len() {
-                    dest[n..].fill(0);
+            if offset_idx < src_len {
+                let copy_len = (src_len - offset_idx).min(dest.len());
+                dest[..copy_len].copy_from_slice(&part.data[offset_idx..offset_idx + copy_len]);
+                if copy_len < dest.len() {
+                    dest[copy_len..].fill(0);
                 }
-
                 if let Some(counter) = io_bytes.get(slice.target_drive_idx) {
-                    counter.fetch_add(n as u64, Ordering::Relaxed);
+                    counter.fetch_add(copy_len as u64, Ordering::Relaxed);
                 }
-                Ok(dest.len())
-            })
-            .collect();
+                copy_len
+            } else {
+                dest.fill(0);
+                0
+            }
+        };
 
-        Ok(results?.into_iter().sum::<usize>() as u32)
+        let total_read_bytes = if tasks.len() > 1 && bytes_to_read >= PARALLEL_IO_THRESHOLD_BYTES {
+            let results: Result<Vec<usize>, FspError> = tasks
+                .into_par_iter()
+                .map(|(slice, part_arc, dest)| Ok(read_action(&slice, &part_arc, dest)))
+                .collect();
+            results?.into_iter().sum::<usize>()
+        } else {
+            let mut total = 0;
+            for (slice, part_arc, dest) in tasks {
+                total += read_action(&slice, &part_arc, dest);
+            }
+            total
+        };
+
+        Ok(total_read_bytes as u32)
     }
 
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
@@ -1436,8 +1513,8 @@ impl FileSystemContext for SymStripePoolFs {
             {
                 let info = dot.file_info_mut();
                 info.file_attributes = 0x10;
-                info.index_number = 0;
-                info.hard_links = 0;
+                info.index_number = hash_path_id(&ctx.rel_path());
+                info.hard_links = 1;
             }
             let _ = dot.set_name(".");
             let _ = dir_lock.write(&mut dot);
@@ -1446,8 +1523,8 @@ impl FileSystemContext for SymStripePoolFs {
             {
                 let info = dotdot.file_info_mut();
                 info.file_attributes = 0x10;
-                info.index_number = 0;
-                info.hard_links = 0;
+                info.index_number = hash_path_id(&format!("{}..", ctx.rel_path()));
+                info.hard_links = 1;
             }
             let _ = dotdot.set_name("..");
             let _ = dir_lock.write(&mut dotdot);
@@ -1495,8 +1572,8 @@ impl FileSystemContext for SymStripePoolFs {
                     info.file_size = size;
                     info.allocation_size = if is_dir { 0 } else { (size + 4095) & !4095 };
                     info.file_attributes = if is_dir { 0x10 } else { 0x80 };
-                    info.hard_links = 0;
-                    info.index_number = 0;
+                    info.hard_links = 1;
+                    info.index_number = hash_path_id(&format!("{}\\{}", rel, name));
 
                     if let Some(ft) = ft_opt {
                         info.creation_time = ft.creation_time;
@@ -1528,6 +1605,9 @@ pub struct VfsPoolSession {
     pub cache_misses: Arc<AtomicU64>,
     pub raw_bytes: Arc<AtomicU64>,
     pub compressed_bytes: Arc<AtomicU64>,
+    stop_flusher: Arc<AtomicBool>,
+    flusher_handle: Option<std::thread::JoinHandle<()>>,
+    fs_ref: SymStripePoolFs,
 }
 
 impl VfsPoolSession {
@@ -1538,6 +1618,16 @@ impl VfsPoolSession {
             .iter()
             .map(|c| c.swap(0, Ordering::Relaxed))
             .collect()
+    }
+}
+
+impl Drop for VfsPoolSession {
+    fn drop(&mut self) {
+        self.stop_flusher.store(true, Ordering::Relaxed);
+        if let Some(h) = self.flusher_handle.take() {
+            let _ = h.join();
+        }
+        self.fs_ref.flush_all_dirty_nodes();
     }
 }
 
@@ -1555,6 +1645,8 @@ pub fn mount_storage_pool(
     if members.is_empty() {
         return Err("Cannot mount pool: no storage member folders specified.".into());
     }
+
+    check_winfsp_available()?;
 
     let _init =
         winfsp::winfsp_init().map_err(|e| format!("WinFsp initialization failed: {:?}", e))?;
@@ -1584,12 +1676,26 @@ pub fn mount_storage_pool(
     vp.file_info_timeout(1000);
     vp.post_cleanup_when_modified_only(true);
 
-    let mut host =
-        FileSystemHost::new(vp, pool_fs).map_err(|e| format!("FileSystemHost error: {:?}", e))?;
+    let mut host = FileSystemHost::new(vp, pool_fs.clone())
+        .map_err(|e| format!("FileSystemHost error: {:?}", e))?;
     host.mount(mount_target)
         .map_err(|e| format!("Failed to mount '{}': {:?}", mount_target, e))?;
     FileSystemHost::<SymStripePoolFs>::start(&mut host)
         .map_err(|e| format!("Failed to start dispatcher: {:?}", e))?;
+
+    let stop_flusher = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop_flusher.clone();
+    let fs_bg = pool_fs.clone();
+
+    let flusher_handle = std::thread::spawn(move || {
+        while !stop_clone.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            if stop_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            fs_bg.flush_all_dirty_nodes();
+        }
+    });
 
     Ok(VfsPoolSession {
         _host: host,
@@ -1599,5 +1705,8 @@ pub fn mount_storage_pool(
         cache_misses,
         raw_bytes,
         compressed_bytes,
+        stop_flusher,
+        flusher_handle: Some(flusher_handle),
+        fs_ref: pool_fs,
     })
 }

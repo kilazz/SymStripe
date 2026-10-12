@@ -33,6 +33,25 @@ const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
 const HKEY_LOCAL_MACHINE: *mut c_void = (0x80000002_u32 as i32 as isize) as *mut c_void;
 const KEY_READ: u32 = 0x20019;
 
+// CopyFileExW progress routine return codes
+const PROGRESS_CONTINUE: u32 = 0;
+const PROGRESS_CANCEL: u32 = 1;
+
+#[allow(non_camel_case_types)]
+type LPPROGRESS_ROUTINE = Option<
+    unsafe extern "system" fn(
+        total_file_size: i64,
+        total_bytes_transferred: i64,
+        stream_size: i64,
+        stream_bytes_transferred: i64,
+        stream_number: u32,
+        callback_reason: u32,
+        source_file: Handle,
+        destination_file: Handle,
+        data: *mut c_void,
+    ) -> u32,
+>;
+
 #[repr(C)]
 struct MemoryStatusEx {
     length: u32,
@@ -83,6 +102,14 @@ unsafe extern "system" {
     fn DeleteFileW(lpFileName: *const u16) -> i32;
     fn GetLastError() -> u32;
     fn GlobalMemoryStatusEx(lpBuffer: *mut MemoryStatusEx) -> i32;
+    fn CopyFileExW(
+        lpExistingFileName: *const u16,
+        lpNewFileName: *const u16,
+        lpProgressRoutine: LPPROGRESS_ROUTINE,
+        lpData: *mut c_void,
+        pbCancel: *const i32,
+        dwCopyFlags: u32,
+    ) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -204,6 +231,106 @@ pub fn test_symlink_privilege() -> Result<(), (u32, bool)> {
         let dev_mode = is_developer_mode_enabled();
         Err((err, dev_mode))
     }
+}
+
+unsafe extern "system" fn copy_progress_bridge<F>(
+    total_file_size: i64,
+    total_bytes_transferred: i64,
+    _stream_size: i64,
+    _stream_bytes_transferred: i64,
+    _stream_number: u32,
+    _callback_reason: u32,
+    _source_file: Handle,
+    _destination_file: Handle,
+    data: *mut c_void,
+) -> u32
+where
+    F: FnMut(u64, u64) -> bool,
+{
+    if data.is_null() {
+        return PROGRESS_CONTINUE;
+    }
+
+    let callback = unsafe { &mut *(data as *mut F) };
+    let transferred = total_bytes_transferred.max(0) as u64;
+    let total = total_file_size.max(0) as u64;
+
+    if callback(transferred, total) {
+        PROGRESS_CONTINUE
+    } else {
+        PROGRESS_CANCEL
+    }
+}
+
+/// Copies a file with granular byte-by-byte progress feedback and cancellation support via Win32 CopyFileExW.
+pub fn copy_file_with_progress<F>(src: &Path, dst: &Path, mut progress_fn: F) -> Result<u64, String>
+where
+    F: FnMut(u64, u64) -> bool,
+{
+    let src_wide = to_wide_null(&src.to_string_lossy());
+    let dst_wide = to_wide_null(&dst.to_string_lossy());
+
+    let data_ptr = &mut progress_fn as *mut F as *mut c_void;
+
+    let res = unsafe {
+        CopyFileExW(
+            src_wide.as_ptr(),
+            dst_wide.as_ptr(),
+            Some(copy_progress_bridge::<F>),
+            data_ptr,
+            std::ptr::null(),
+            0,
+        )
+    };
+
+    if res != 0 {
+        let size = fs::metadata(dst).map(|m| m.len()).unwrap_or(0);
+        Ok(size)
+    } else {
+        let err = unsafe { GetLastError() };
+        Err(format!("CopyFileExW failed with Win32 Error: {}", err))
+    }
+}
+
+/// Verifies whether the WinFsp runtime is installed before invoking delay-loaded Fsp APIs.
+pub fn check_winfsp_available() -> Result<(), String> {
+    // 1. Check registry installation entries
+    for key_path in [r"SOFTWARE\WinFsp", r"SOFTWARE\WOW6432Node\WinFsp"] {
+        let wide_key = to_wide_null(key_path);
+        let mut hkey = std::ptr::null_mut();
+        let res = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                wide_key.as_ptr(),
+                0,
+                KEY_READ,
+                &mut hkey,
+            )
+        };
+        if res == 0 && !hkey.is_null() {
+            unsafe { RegCloseKey(hkey) };
+            return Ok(());
+        }
+    }
+
+    // 2. Check standard installation directories
+    let standard_paths = [
+        r"C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll",
+        r"C:\Program Files\WinFsp\bin\winfsp-x64.dll",
+        r"C:\Windows\System32\winfsp-x64.dll",
+    ];
+
+    for p in standard_paths {
+        if Path::new(p).exists() {
+            return Ok(());
+        }
+    }
+
+    Err("WinFsp runtime is not detected on this system!\n\n\
+        Virtual Storage Pool (VFS RAID-0) requires WinFsp.\n\
+        Please download and install WinFsp from https://winfsp.dev/ \n\
+        (or via Windows Terminal: 'winget install WinFsp.WinFsp') and restart SymStripe."
+        .to_string())
 }
 
 #[allow(dead_code)]
