@@ -6,29 +6,23 @@ use std::path::PathBuf;
 fn default_true() -> bool {
     true
 }
-
 fn default_false() -> bool {
     false
 }
-
-fn default_mode() -> i32 {
-    0 // 0 = In-Place Optimizer, 1 = Virtual Storage Pool
+fn default_zero() -> i32 {
+    0
 }
-
 fn default_pool_policy() -> i32 {
-    1 // 0 = Capacity (JBOD), 1 = Speed (RAID-0)
+    1
 }
-
 fn default_stripe_mb() -> u32 {
     16
 }
-
 fn default_mount_point() -> String {
     "Z:".to_string()
 }
-
 fn default_custom_size_gb() -> String {
-    "0".to_string() // 0 = Auto detect from physical drives
+    "0".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -48,7 +42,7 @@ pub struct Profile {
     #[serde(default = "default_true")]
     pub ue5_safe_mode: bool,
 
-    #[serde(default = "default_mode")]
+    #[serde(default = "default_zero")]
     pub mode_idx: i32,
 
     // Paradigm 2: Virtual Storage Pool
@@ -61,7 +55,13 @@ pub struct Profile {
     #[serde(default = "default_mount_point")]
     pub pool_mount_point: String,
     #[serde(default = "default_custom_size_gb")]
-    pub pool_custom_size_gb: String, // Added customizable size quota in GB
+    pub pool_custom_size_gb: String,
+
+    // Enterprise VFS Features
+    #[serde(default = "default_zero")]
+    pub pool_codec: i32,
+    #[serde(default = "default_false")]
+    pub tiered_storage: bool,
 }
 
 impl Default for Profile {
@@ -82,6 +82,8 @@ impl Default for Profile {
             pool_stripe_mb: 16,
             pool_mount_point: "Z:".to_string(),
             pool_custom_size_gb: "0".to_string(),
+            pool_codec: 0,
+            tiered_storage: false,
         }
     }
 }
@@ -89,6 +91,8 @@ impl Default for Profile {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppConfig {
     pub active_profile_index: usize,
+    #[serde(default = "default_false")]
+    pub auto_start: bool,
     pub profiles: Vec<Profile>,
 }
 
@@ -96,6 +100,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             active_profile_index: 0,
+            auto_start: false,
             profiles: vec![Profile::default()],
         }
     }
@@ -124,21 +129,6 @@ pub fn load_config() -> AppConfig {
     {
         return cfg;
     }
-
-    if let Ok(exe_path) = env::current_exe()
-        && let Some(parent) = exe_path.parent()
-    {
-        let legacy_path = parent.join("config.json");
-        if legacy_path.exists()
-            && let Ok(content) = fs::read_to_string(&legacy_path)
-            && let Ok(cfg) = serde_json::from_str::<AppConfig>(&content)
-            && !cfg.profiles.is_empty()
-        {
-            save_config(&cfg);
-            return cfg;
-        }
-    }
-
     AppConfig::default()
 }
 

@@ -2,11 +2,9 @@ use crate::manifest::{
     ManifestFileEntry, StripingManifest, delete_manifest, load_manifest, save_manifest,
 };
 use crate::win32::{get_free_disk_space_bytes, test_symlink_privilege};
-use std::collections::HashSet;
 use std::fs;
 use std::os::windows::fs::symlink_file;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use walkdir::WalkDir;
 
 const COMPANION_EXTENSIONS: &[&str] = &["utoc", "pak", "sig"];
@@ -208,24 +206,6 @@ pub fn calculate_allocation_plan(
     })
 }
 
-fn create_directory_junction(target_dir: &Path, junction_path: &Path) -> Result<(), String> {
-    let output = Command::new("cmd")
-        .args([
-            "/C",
-            "mklink",
-            "/J",
-            junction_path.to_str().unwrap_or_default(),
-            target_dir.to_str().unwrap_or_default(),
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
-    }
-    Ok(())
-}
-
 pub fn execute_striping(
     src_path: &Path,
     targets: &[PathBuf],
@@ -234,9 +214,10 @@ pub fn execute_striping(
     ue5_safe_mode: bool,
     mut on_progress: impl FnMut(usize, usize, &str, f32),
 ) -> Result<usize, String> {
-    if !ue5_safe_mode && let Err((os_err, dev_mode)) = test_symlink_privilege() {
+    // Verify unprivileged file symlink creation privilege
+    if let Err((os_err, dev_mode)) = test_symlink_privilege() {
         let dev_status = if dev_mode {
-            "Developer Mode: ENABLED (Policy requires restart or elevation)"
+            "Developer Mode: ENABLED (Policy requires application restart or administrative elevation)"
         } else {
             "Developer Mode: DISABLED in Windows Settings"
         };
@@ -246,8 +227,7 @@ pub fn execute_striping(
             {}\n\n\
             HOW TO FIX:\n\
             1. Enable Developer Mode: Press Win+I -> System -> For developers -> Turn 'Developer Mode' ON.\n\
-            2. OR Run SymStripe as Administrator.\n\
-            3. OR Check 'Unreal Engine / Safe Mode' (uses Directory Junctions, which NEVER require elevation).",
+            2. OR Run SymStripe as Administrator.",
             os_err, dev_status
         ));
     }
@@ -274,7 +254,6 @@ pub fn execute_striping(
     });
 
     let mut moved_count = 0;
-    let mut created_junctions = HashSet::new();
 
     for (target_idx, bucket) in plan.drive_buckets.into_iter().enumerate().skip(1) {
         let target_root = &targets[target_idx - 1];
@@ -326,12 +305,14 @@ pub fn execute_striping(
                 ));
             }
 
-            // Step 2: Co-locate companion files in Safe Mode with crash-consistent staging
-            if ue5_safe_mode
-                && f_path
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("ucas"))
-            {
+            // Step 2: In UE5 Safe Mode, co-locate IoStore companion files (.utoc, .pak, .sig) atomically to the same destination
+            let is_ucas = f_path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("ucas"));
+
+            let mut migrated_companions = Vec::new();
+
+            if ue5_safe_mode && is_ucas {
                 for ext in COMPANION_EXTENSIONS {
                     let comp_src = f_path.with_extension(ext);
                     let comp_dst = target_file.with_extension(ext);
@@ -339,12 +320,33 @@ pub fn execute_striping(
 
                     if comp_src.exists() && fs::copy(&comp_src, &comp_tmp).is_ok() {
                         if fs::rename(&comp_tmp, &comp_dst).is_ok() {
-                            if keep_backup {
-                                let comp_backup =
-                                    PathBuf::from(format!("{}.backup", comp_src.to_string_lossy()));
-                                let _ = fs::rename(&comp_src, &comp_backup);
+                            let comp_stage = PathBuf::from(format!(
+                                "{}.symstripe_stage",
+                                comp_src.to_string_lossy()
+                            ));
+                            let comp_backup =
+                                PathBuf::from(format!("{}.backup", comp_src.to_string_lossy()));
+
+                            let comp_dest = if keep_backup {
+                                &comp_backup
                             } else {
-                                let _ = fs::remove_file(&comp_src);
+                                &comp_stage
+                            };
+
+                            if fs::rename(&comp_src, comp_dest).is_ok() {
+                                if symlink_file(&comp_dst, &comp_src).is_ok() {
+                                    if !keep_backup {
+                                        let _ = fs::remove_file(&comp_stage);
+                                    }
+                                    migrated_companions.push((
+                                        comp_src,
+                                        comp_dst,
+                                        comp_dest.clone(),
+                                    ));
+                                } else {
+                                    let _ = fs::rename(comp_dest, &comp_src);
+                                    let _ = fs::remove_file(&comp_dst);
+                                }
                             }
                         } else {
                             let _ = fs::remove_file(&comp_tmp);
@@ -353,7 +355,7 @@ pub fn execute_striping(
                 }
             }
 
-            // Step 3: Staged rename
+            // Step 3: Rename original archive to stage or backup
             let stage_path = PathBuf::from(format!("{}.symstripe_stage", f_path.to_string_lossy()));
             let backup_path = PathBuf::from(format!("{}.backup", f_path.to_string_lossy()));
 
@@ -366,59 +368,37 @@ pub fn execute_striping(
             if let Err(e) = fs::rename(&f_path, stage_destination) {
                 let _ = fs::remove_file(&target_file);
                 clean_empty_parents(&target_file, target_root);
+
+                // Roll back companions
+                for (c_src, c_dst, c_dest) in migrated_companions {
+                    let _ = fs::remove_file(&c_src);
+                    let _ = fs::rename(c_dest, &c_src);
+                    let _ = fs::remove_file(c_dst);
+                }
+
                 return Err(format!(
                     "Failed to rename original file '{}': {e}",
                     f_path.display()
                 ));
             }
 
-            // Step 4: Link creation with full Safe Mode Rollback
-            if !ue5_safe_mode {
-                if let Err(sym_err) = symlink_file(&target_file, &f_path) {
-                    let _ = fs::rename(stage_destination, &f_path);
-                    let _ = fs::remove_file(&target_file);
-                    clean_empty_parents(&target_file, target_root);
+            // Step 4: Transparent in-place file symlink creation directly where the engine expects it
+            if let Err(sym_err) = symlink_file(&target_file, &f_path) {
+                let _ = fs::rename(stage_destination, &f_path);
+                let _ = fs::remove_file(&target_file);
+                clean_empty_parents(&target_file, target_root);
 
-                    return Err(format!(
-                        "Symlink creation failed for '{}': {}",
-                        f_path.display(),
-                        sym_err
-                    ));
+                for (c_src, c_dst, c_dest) in migrated_companions {
+                    let _ = fs::remove_file(&c_src);
+                    let _ = fs::rename(c_dest, &c_src);
+                    let _ = fs::remove_file(c_dst);
                 }
-            } else {
-                let src_parent = f_path.parent().unwrap();
-                let parent_name = src_parent
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Data");
-                let junction_name = format!("{}_Drive{}", parent_name, target_idx + 1);
-                let junction_path = src_parent.join(&junction_name);
 
-                if created_junctions.insert(junction_path.clone())
-                    && let Err(err) = create_directory_junction(target_parent, &junction_path)
-                {
-                    // Full Safe Mode Rollback
-                    let _ = fs::rename(stage_destination, &f_path);
-                    let _ = fs::remove_file(&target_file);
-                    clean_empty_parents(&target_file, target_root);
-
-                    if f_path
-                        .extension()
-                        .is_some_and(|e| e.eq_ignore_ascii_case("ucas"))
-                    {
-                        for ext in COMPANION_EXTENSIONS {
-                            let comp_src = f_path.with_extension(ext);
-                            let comp_dst = target_file.with_extension(ext);
-                            let comp_backup =
-                                PathBuf::from(format!("{}.backup", comp_src.to_string_lossy()));
-                            let _ = fs::remove_file(&comp_dst);
-                            if comp_backup.exists() {
-                                let _ = fs::rename(&comp_backup, &comp_src);
-                            }
-                        }
-                    }
-                    return Err(format!("Directory Junction creation failed: {}", err));
-                }
+                return Err(format!(
+                    "Symlink creation failed for '{}': {}",
+                    f_path.display(),
+                    sym_err
+                ));
             }
 
             if !keep_backup {
@@ -519,6 +499,7 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
         }
     }
 
+    // Clean up any legacy junction subfolders created by previous versions
     for entry in WalkDir::new(src_path).into_iter().filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy();
         if name.contains("_Drive") {

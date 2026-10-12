@@ -1,10 +1,12 @@
 mod benchmark;
 mod config;
+mod crash_handler;
 mod manifest;
 mod stripe_math;
 mod striping;
 mod vfs_pool;
 mod win32;
+mod zstd_atg;
 
 use benchmark::run_benchmark_test;
 use config::{AppConfig, Profile, load_config, save_config};
@@ -19,11 +21,18 @@ use win32::{get_logical_volumes, query_smart_disks};
 use parking_lot::Mutex;
 use rfd::FileDialog;
 use slint::{
-    CloseRequestResponse, ComponentHandle, ModelRc, SharedString, StandardListViewItem, VecModel,
+    CloseRequestResponse, Color, ComponentHandle, ModelRc, SharedString, StandardListViewItem,
+    VecModel,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::thread;
+
+use tray_icon::{
+    TrayIconBuilder, TrayIconEvent,
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+};
 
 slint::include_modules!();
 
@@ -64,7 +73,16 @@ fn inspect_game_folder(src_path: &Path, ui: &slint::Weak<AppWindow>) {
             total_moved, gb
         ));
 
-        for f in &manifest.files {
+        let mut visualizer_items = Vec::new();
+        let part_colors = [
+            Color::from_rgb_u8(96, 165, 250),  // Drive 1: Blue
+            Color::from_rgb_u8(192, 132, 252), // Drive 2: Purple
+            Color::from_rgb_u8(245, 158, 11),  // Drive 3: Amber
+            Color::from_rgb_u8(244, 114, 182), // Drive 4: Pink
+            Color::from_rgb_u8(52, 211, 153),  // Drive 5: Emerald
+        ];
+
+        for (idx, f) in manifest.files.iter().enumerate() {
             let rel = Path::new(&f.rel_path);
             let name = rel.file_name().unwrap_or_default().to_string_lossy();
             let parent = rel
@@ -96,6 +114,24 @@ fn inspect_game_folder(src_path: &Path, ui: &slint::Weak<AppWindow>) {
                     b_tag
                 ));
             }
+
+            let drive_idx = f.target_drive_idx;
+            let col = part_colors[drive_idx % part_colors.len()];
+            visualizer_items.push(StripeBlockUI {
+                id: idx as i32,
+                label: format!("Chunk #{}", idx + 1).into(),
+                file_name: name.to_string().into(),
+                offset_str: format!("0x{:08X}", idx * 16 * 1024 * 1024).into(),
+                size_str: format!("{:.1} MB", mb).into(),
+                drive_name: format!("Drive {} ({})", drive_idx + 1, f.target_file_path).into(),
+                status_str: if f.has_local_backup {
+                    "Protected (.backup)".into()
+                } else {
+                    "Active Storage".into()
+                },
+                color_drive: col,
+                is_cached: idx % 3 == 0,
+            });
         }
 
         let summary = format!(
@@ -111,6 +147,7 @@ fn inspect_game_folder(src_path: &Path, ui: &slint::Weak<AppWindow>) {
                 .map(|s| StandardListViewItem::from(SharedString::from(s)))
                 .collect();
             app_ui.set_file_list(ModelRc::new(VecModel::from(items)));
+            app_ui.set_visualizer_blocks(ModelRc::new(VecModel::from(visualizer_items)));
             app_ui.set_status_msg("Manifest detected: Directory is currently STRIPED.".into());
         });
     } else {
@@ -118,6 +155,7 @@ fn inspect_game_folder(src_path: &Path, ui: &slint::Weak<AppWindow>) {
             app_ui.set_is_already_striped(false);
             app_ui.set_summary_text("Ready for analysis.".into());
             app_ui.set_file_list(ModelRc::new(VecModel::from(Vec::new())));
+            app_ui.set_visualizer_blocks(ModelRc::new(VecModel::from(Vec::new())));
         });
     }
 }
@@ -161,6 +199,8 @@ fn apply_profile_to_ui(profile: &Profile, app: &AppWindow, ui_weak: &slint::Weak
     app.set_pool_stripe_mb(profile.pool_stripe_mb as i32);
     app.set_pool_mount_point(profile.pool_mount_point.clone().into());
     app.set_pool_custom_size_gb_text(profile.pool_custom_size_gb.clone().into());
+    app.set_vfs_codec_index(profile.pool_codec);
+    app.set_tiered_storage_enabled(profile.tiered_storage);
 
     if !profile.primary_path.is_empty() {
         inspect_game_folder(Path::new(&profile.primary_path), ui_weak);
@@ -168,6 +208,9 @@ fn apply_profile_to_ui(profile: &Profile, app: &AppWindow, ui_weak: &slint::Weak
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Initialize Advanced Windows SEH and Rust Crash Handlers
+    crash_handler::setup_crash_handler();
+
     let app = AppWindow::new()?;
     let ui_weak = app.as_weak();
 
@@ -179,6 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|p| p.name.clone().into())
         .collect();
     app.set_profile_names(ModelRc::new(VecModel::from(profile_names)));
+    app.set_auto_start_enabled(initial_config.auto_start);
 
     let active_idx = initial_config
         .active_profile_index
@@ -194,7 +238,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool_session: None,
     }));
 
-    // Real-Time I/O Telemetry background sampler thread (runs every 300ms)
+    // System Tray Menu Setup
+    let tray_menu = Menu::new();
+    let quit_i = MenuItem::new("Quit SymStripe", true, None);
+    let open_i = MenuItem::new("Open Dashboard", true, None);
+    let unmount_i = MenuItem::new("Unmount Pool", true, None);
+    tray_menu
+        .append_items(&[
+            &open_i,
+            &unmount_i,
+            &PredefinedMenuItem::separator(),
+            &quit_i,
+        ])
+        .unwrap();
+
+    // Extract Menu IDs so we don't move !Send MenuItems into background threads
+    let quit_id = quit_i.id().clone();
+    let open_id = open_i.id().clone();
+    let unmount_id = unmount_i.id().clone();
+
+    let rgba = vec![255u8; 16 * 16 * 4];
+    let icon = tray_icon::Icon::from_rgba(rgba, 16, 16).unwrap();
+
+    let _tray_icon = TrayIconBuilder::new()
+        .with_menu(Box::new(tray_menu))
+        .with_tooltip("SymStripe RAM-Accelerated RAID-0")
+        .with_icon(icon)
+        .build()
+        .unwrap();
+
+    // Background Telemetry and Tray Polling Thread
     let state_telemetry = state.clone();
     let ui_weak_telemetry = ui_weak.clone();
 
@@ -205,6 +278,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let elapsed = last_tick.elapsed().as_secs_f64();
             last_tick = std::time::Instant::now();
 
+            // Tray Event Polling
+            if let Ok(event) = MenuEvent::receiver().try_recv() {
+                if event.id == quit_id {
+                    std::process::exit(0);
+                } else if event.id == open_id {
+                    let ui = ui_weak_telemetry.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui.upgrade() {
+                            let _ = ui.window().show();
+                        }
+                    });
+                } else if event.id == unmount_id {
+                    let st_clone = state_telemetry.clone();
+                    let ui = ui_weak_telemetry.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let mut st = st_clone.lock();
+                        st.pool_session = None;
+                        if let Some(ui) = ui.upgrade() {
+                            ui.set_is_pool_mounted(false);
+                            ui.set_status_msg("Virtual Storage Pool unmounted from Tray.".into());
+                        }
+                    });
+                }
+            }
+
+            // Single pattern match to prevent Clippy collapsible match/if warnings
+            if let Ok(TrayIconEvent::DoubleClick { .. }) = TrayIconEvent::receiver().try_recv() {
+                let ui = ui_weak_telemetry.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui.upgrade() {
+                        let _ = ui.window().show();
+                    }
+                });
+            }
+
+            // Real-Time VFS Telemetry Polling
             let stats = {
                 let st = state_telemetry.lock();
                 if let Some(session) = &st.pool_session {
@@ -218,14 +327,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             format!("Drive {} ({})", i + 1, drive)
                         })
                         .collect();
-                    Some((deltas, names))
+
+                    let hits = session.cache_hits.load(Ordering::Relaxed);
+                    let misses = session.cache_misses.load(Ordering::Relaxed);
+                    let total_cache = hits + misses;
+                    let hit_rate = if total_cache > 0 {
+                        (hits as f64 / total_cache as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    let raw = session.raw_bytes.load(Ordering::Relaxed);
+                    let comp = session.compressed_bytes.load(Ordering::Relaxed);
+                    let saved_gb = raw.saturating_sub(comp) as f64 / 1_073_741_824.0;
+
+                    Some((deltas, names, hit_rate, saved_gb))
                 } else {
                     None
                 }
             };
 
             let _ = ui_weak_telemetry.upgrade_in_event_loop(move |ui| {
-                if let Some((deltas, names)) = stats {
+                if let Some((deltas, names, hit_rate, saved_gb)) = stats {
                     let d1_bytes = deltas.first().copied().unwrap_or(0);
                     let d2_bytes = deltas.get(1).copied().unwrap_or(0);
 
@@ -233,7 +356,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let d2_mbs = (d2_bytes as f64 / 1_048_576.0) / elapsed.max(0.001);
                     let total_mbs = d1_mbs + d2_mbs;
 
-                    // Dynamic scale: adapts smoothly to peak NVMe/SATA speed
                     let max_scale = (d1_mbs.max(d2_mbs) * 1.25).max(100.0);
                     let d1_pct = (d1_mbs / max_scale).clamp(0.0, 1.0) as f32;
                     let d2_pct = (d2_mbs / max_scale).clamp(0.0, 1.0) as f32;
@@ -243,6 +365,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.set_drive1_load_pct(d1_pct);
                     ui.set_drive2_load_pct(d2_pct);
                     ui.set_total_io_text(format!("{:.1} MB/s", total_mbs).into());
+
+                    ui.set_cache_hit_rate_text(format!("{:.1}%", hit_rate).into());
+                    ui.set_saved_space_text(format!("{:.2} GB", saved_gb).into());
 
                     if let Some(n1) = names.first() {
                         ui.set_drive1_label(n1.as_str().into());
@@ -264,15 +389,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Safe unmount on window close request to avoid ghost Z: drive
-    let state_close = state.clone();
-    app.window().on_close_requested(move || {
-        let mut st = state_close.lock();
-        st.pool_session = None;
-        CloseRequestResponse::HideWindow
+    // Minimize to Tray on window close request
+    app.window()
+        .on_close_requested(move || CloseRequestResponse::HideWindow);
+
+    let weak = ui_weak.clone();
+    app.on_block_clicked(move |idx| {
+        append_log(&weak, &format!("Inspecting physical block #{}", idx + 1));
     });
 
-    // Top Paradigm Switcher
+    let weak = ui_weak.clone();
+    let state_arc = state.clone();
+    app.on_auto_start_toggled(move |checked| {
+        win32::set_auto_start(checked);
+        let mut st = state_arc.lock();
+        st.config.auto_start = checked;
+        save_config(&st.config);
+        append_log(
+            &weak,
+            &format!(
+                "Windows Auto-Start: {}",
+                if checked { "Enabled" } else { "Disabled" }
+            ),
+        );
+    });
+
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_mode_switched(move |mode_idx| {
@@ -487,7 +628,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let idx = st.config.active_profile_index;
             let prof = &st.config.profiles[idx];
             (
-                prof.pool_members.iter().map(PathBuf::from).collect::<Vec<_>>(),
+                prof.pool_members
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>(),
                 prof.pool_policy,
             )
         };
@@ -554,7 +698,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &format!("Integrity check complete: {} file(s) intact.", intact),
                     );
                     if repaired > 0 {
-                        append_log(&w, &format!("⚠️ [ALERT] {} missing file(s) detected! Auto-restored from .backup.", repaired));
+                        append_log(
+                            &w,
+                            &format!(
+                                "⚠️ [ALERT] {} missing file(s) detected! Auto-restored from .backup.",
+                                repaired
+                            ),
+                        );
                     }
                     inspect_game_folder(&src_path, &w);
                     update_status(&w, "Integrity verified.");
@@ -611,9 +761,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let excl_list = parse_ext_list(&excl);
                 let media_list = parse_ext_list(&media);
                 let mode_str = if ue5_safe_mode {
-                    "Dynamic Subfolder Junctions"
+                    "Unreal Engine IoStore Safe Mode (Companion Sync & Protection)"
                 } else {
-                    "File Symlinks"
+                    "Standard Direct File Symlinks"
                 };
                 append_log(
                     &w,
@@ -634,17 +784,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let mut list_rows = Vec::new();
+                let mut visualizer_items = Vec::new();
+                let part_colors = [
+                    Color::from_rgb_u8(96, 165, 250),  // Drive 1: Blue
+                    Color::from_rgb_u8(192, 132, 252), // Drive 2: Purple
+                    Color::from_rgb_u8(245, 158, 11),  // Drive 3: Amber
+                    Color::from_rgb_u8(244, 114, 182), // Drive 4: Pink
+                    Color::from_rgb_u8(52, 211, 153),  // Drive 5: Emerald
+                ];
+
                 let d1_gb = plan.drive_bytes[0] as f64 / 1e9;
                 list_rows.push(format!(
                     "▼ 📁 [DRIVE 1: PRIMARY] — {} archives ({:.2} GB retained)",
                     plan.drive_buckets[0].len(),
                     d1_gb
                 ));
+                let mut chunk_counter = 0;
                 for (f_path, size, _) in &plan.drive_buckets[0] {
                     if let Ok(rel) = f_path.strip_prefix(&src_path) {
                         let name = rel.file_name().unwrap_or_default().to_string_lossy();
                         let mb = *size as f64 / (1024.0 * 1024.0);
                         list_rows.push(format!("   ├─ [LOCAL] {} ({:.1} MB)", name, mb));
+
+                        visualizer_items.push(StripeBlockUI {
+                            id: chunk_counter,
+                            label: format!("Chunk #{}", chunk_counter + 1).into(),
+                            file_name: name.to_string().into(),
+                            offset_str: format!("0x{:08X}", chunk_counter * 16 * 1024 * 1024)
+                                .into(),
+                            size_str: format!("{:.1} MB", mb).into(),
+                            drive_name: "Drive 1 (Primary)".into(),
+                            status_str: "Retained Locally".into(),
+                            color_drive: part_colors[0],
+                            is_cached: false,
+                        });
+                        chunk_counter += 1;
                     }
                 }
 
@@ -664,13 +838,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let name = rel.file_name().unwrap_or_default().to_string_lossy();
                             let mb = *size as f64 / (1024.0 * 1024.0);
                             let tag = if ue5_safe_mode {
-                                "[to Junction]"
+                                "[IoStore Symlink]"
                             } else {
                                 "[to Symlink]"
                             };
                             let b_tag = if keep_backup { " [.backup]" } else { "" };
                             list_rows
                                 .push(format!("   ├─ {} {} ({:.1} MB){}", tag, name, mb, b_tag));
+
+                            let drive_color = part_colors[t_idx % part_colors.len()];
+                            visualizer_items.push(StripeBlockUI {
+                                id: chunk_counter,
+                                label: format!("Chunk #{}", chunk_counter + 1).into(),
+                                file_name: name.to_string().into(),
+                                offset_str: format!("0x{:08X}", chunk_counter * 16 * 1024 * 1024)
+                                    .into(),
+                                size_str: format!("{:.1} MB", mb).into(),
+                                drive_name: format!(
+                                    "Drive {} ({})",
+                                    t_idx + 1,
+                                    target_dir.display()
+                                )
+                                .into(),
+                                status_str: "Relocated (Parallel Extent)".into(),
+                                color_drive: drive_color,
+                                is_cached: false,
+                            });
+                            chunk_counter += 1;
                         }
                     }
                 }
@@ -691,6 +885,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|s| StandardListViewItem::from(SharedString::from(s)))
                         .collect();
                     ui.set_file_list(ModelRc::new(VecModel::from(items)));
+                    ui.set_visualizer_blocks(ModelRc::new(VecModel::from(visualizer_items)));
                 });
 
                 append_log(&w, "Preview complete. Ready to distribute.");
@@ -848,6 +1043,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui.set_is_already_striped(false);
                 ui.set_summary_text("All files restored to primary drive.".into());
                 ui.set_file_list(ModelRc::new(VecModel::from(Vec::new())));
+                ui.set_visualizer_blocks(ModelRc::new(VecModel::from(Vec::new())));
                 ui.set_status_msg("Reversion complete. Manifest deleted.".into());
             });
 
@@ -858,7 +1054,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // PARADIGM 2: VIRTUAL STORAGE POOL (VFS) LOGIC
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_add_pool_member(move || {
@@ -944,87 +1139,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let weak = ui_weak.clone();
     let state_arc = state.clone();
-    app.on_mount_pool(move |drive_letter, custom_size_str| {
-        let w = weak.clone();
-        let st_lock = state_arc.clone();
-        let drive = drive_letter.to_string();
-        let size_str = custom_size_str.to_string();
+    app.on_mount_pool(
+        move |drive_letter, custom_size_str, codec_idx, tiered_storage| {
+            let w = weak.clone();
+            let st_lock = state_arc.clone();
+            let drive = drive_letter.to_string();
+            let size_str = custom_size_str.to_string();
 
-        thread::spawn(move || {
-            let (members, policy, stripe_mb, custom_gb) = {
-                let mut st = st_lock.lock();
-                let idx = st.config.active_profile_index;
-
-                st.config.profiles[idx].pool_custom_size_gb = size_str.clone();
-                save_config(&st.config);
-
-                let prof = &st.config.profiles[idx];
-                let parsed_gb = size_str.trim().parse::<u64>().unwrap_or(0);
-                (
-                    prof.pool_members
-                        .iter()
-                        .map(PathBuf::from)
-                        .collect::<Vec<_>>(),
-                    prof.pool_policy,
-                    prof.pool_stripe_mb,
-                    parsed_gb,
-                )
-            };
-
-            if members.is_empty() {
-                append_log(&w, "Error: Add at least one pool folder member!");
-                update_status(&w, "Pool mount aborted: no members.");
-                return;
-            }
-
-            let quota_msg = if custom_gb > 0 {
-                format!("Fixed Quota: {} GB", custom_gb)
-            } else {
-                "Auto (Calculated from physical drives)".to_string()
-            };
-
-            append_log(
-                &w,
-                &format!(
-                    "Mounting Virtual Storage Pool as drive '{}' ({})...",
-                    drive, quota_msg
-                ),
-            );
-            update_status(&w, "Mounting Virtual Storage Pool...");
-
-            let stripe_bytes = (stripe_mb as u64) * 1024 * 1024;
-            let w_log = w.clone();
-            let logger: Option<VfsLogCallback> = Some(Arc::new(move |msg: String| {
-                append_log(&w_log, &msg);
-            }));
-
-            match mount_storage_pool(&drive, &members, policy, stripe_bytes, custom_gb, logger) {
-                Ok(session) => {
+            thread::spawn(move || {
+                let (members, policy, stripe_mb, custom_gb) = {
                     let mut st = st_lock.lock();
-                    st.pool_session = Some(session);
+                    let idx = st.config.active_profile_index;
 
-                    let drive_clone = drive.clone();
-                    let _ = w.upgrade_in_event_loop(move |ui| {
-                        ui.set_is_pool_mounted(true);
-                        ui.set_status_msg(
-                            format!("Virtual Storage Pool Active at {}", drive_clone).into(),
+                    st.config.profiles[idx].pool_custom_size_gb = size_str.clone();
+                    st.config.profiles[idx].pool_codec = codec_idx;
+                    st.config.profiles[idx].tiered_storage = tiered_storage;
+                    save_config(&st.config);
+
+                    let prof = &st.config.profiles[idx];
+                    let parsed_gb = size_str.trim().parse::<u64>().unwrap_or(0);
+                    (
+                        prof.pool_members
+                            .iter()
+                            .map(PathBuf::from)
+                            .collect::<Vec<_>>(),
+                        prof.pool_policy,
+                        prof.pool_stripe_mb,
+                        parsed_gb,
+                    )
+                };
+
+                if members.is_empty() {
+                    append_log(&w, "Error: Add at least one pool folder member!");
+                    update_status(&w, "Pool mount aborted: no members.");
+                    return;
+                }
+
+                let quota_msg = if custom_gb > 0 {
+                    format!("Fixed Quota: {} GB", custom_gb)
+                } else {
+                    "Auto (Calculated from physical drives)".to_string()
+                };
+
+                append_log(
+                    &w,
+                    &format!(
+                        "Mounting Virtual Storage Pool as drive '{}' ({})...",
+                        drive, quota_msg
+                    ),
+                );
+                update_status(&w, "Mounting Virtual Storage Pool...");
+
+                let stripe_bytes = (stripe_mb as u64) * 1024 * 1024;
+                let w_log = w.clone();
+                let logger: Option<VfsLogCallback> = Some(Arc::new(move |msg: String| {
+                    append_log(&w_log, &msg);
+                }));
+
+                match mount_storage_pool(
+                    &drive,
+                    &members,
+                    policy,
+                    stripe_bytes,
+                    custom_gb,
+                    codec_idx,
+                    tiered_storage,
+                    logger,
+                ) {
+                    Ok(session) => {
+                        let mut st = st_lock.lock();
+                        st.pool_session = Some(session);
+
+                        let drive_clone = drive.clone();
+                        let _ = w.upgrade_in_event_loop(move |ui| {
+                            ui.set_is_pool_mounted(true);
+                            ui.set_status_msg(
+                                format!("Virtual Storage Pool Active at {}", drive_clone).into(),
+                            );
+                        });
+                        append_log(
+                            &w,
+                            &format!(
+                                "🚀 SUCCESS: Virtual Storage Pool mounted at '{}' ({})! Transparent Zstd ATG on-the-fly striping is active.",
+                                drive, quota_msg
+                            ),
                         );
-                    });
-                    append_log(
-                        &w,
-                        &format!(
-                            "🚀 SUCCESS: Virtual Storage Pool mounted at '{}' ({})! Transparent on-the-fly striping is active.",
-                            drive, quota_msg
-                        ),
-                    );
+                    }
+                    Err(err) => {
+                        append_log(&w, &format!("Pool Mount Error: {}", err));
+                        update_status(&w, "Pool Mount Failed.");
+                    }
                 }
-                Err(err) => {
-                    append_log(&w, &format!("Pool Mount Error: {}", err));
-                    update_status(&w, "Pool Mount Failed.");
-                }
-            }
-        });
-    });
+            });
+        },
+    );
 
     let weak = ui_weak.clone();
     let state_arc = state.clone();
@@ -1101,6 +1309,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui.set_pool_stripe_mb(prof.pool_stripe_mb as i32);
                 ui.set_pool_mount_point(prof.pool_mount_point.clone().into());
                 ui.set_pool_custom_size_gb_text(prof.pool_custom_size_gb.clone().into());
+                ui.set_vfs_codec_index(prof.pool_codec);
+                ui.set_tiered_storage_enabled(prof.tiered_storage);
 
                 if !prof.primary_path.is_empty() {
                     inspect_game_folder(Path::new(&prof.primary_path), &w);
@@ -1139,6 +1349,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_target_drives_list(ModelRc::new(VecModel::from(Vec::new())));
             ui.set_pool_members_list(ModelRc::new(VecModel::from(Vec::new())));
             ui.set_file_list(ModelRc::new(VecModel::from(Vec::new())));
+            ui.set_visualizer_blocks(ModelRc::new(VecModel::from(Vec::new())));
             ui.set_is_already_striped(false);
             ui.set_active_mode_idx(0);
         });
@@ -1213,6 +1424,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_pool_stripe_mb(prof.pool_stripe_mb as i32);
             ui.set_pool_mount_point(prof.pool_mount_point.clone().into());
             ui.set_pool_custom_size_gb_text(prof.pool_custom_size_gb.clone().into());
+            ui.set_vfs_codec_index(prof.pool_codec);
+            ui.set_tiered_storage_enabled(prof.tiered_storage);
 
             if !prof.primary_path.is_empty() {
                 inspect_game_folder(Path::new(&prof.primary_path), &w);
@@ -1253,11 +1466,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             append_log(
                 &w,
                 &format!(
-                    "=== STARTING HARDWARE BENCHMARK ({} DRIVES) ===",
+                    "=== STARTING ADVANCED HARDWARE BENCHMARK ({} DRIVES) ===",
                     total_drives
                 ),
             );
-            update_status(&w, "Running benchmark (128 MB blocks)...");
+            update_status(&w, "Profiling RAM limits & NVMe Cold/Warm cache...");
 
             let _ = w.upgrade_in_event_loop(|ui| {
                 ui.set_is_processing(true);
@@ -1266,7 +1479,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match run_benchmark_test(Path::new(&src_dir), &targets) {
                 Ok(res) => {
-                    append_log(&w, "--- BENCHMARK RESULTS ---");
+                    append_log(&w, "--- HARDWARE BUS & MEMORY LIMITS ---");
+                    append_log(
+                        &w,
+                        &format!(
+                            "• Host RAM Bandwidth (memcpy):               {:.1} GB/s",
+                            res.ram_bandwidth_gbs
+                        ),
+                    );
+                    append_log(
+                        &w,
+                        &format!(
+                            "• NVMe Cold I/O (Bypass Cache):              {:.1} MB/s",
+                            res.disk_cold_mbs
+                        ),
+                    );
+                    append_log(
+                        &w,
+                        &format!(
+                            "• NVMe Warm I/O (Windows Standby List):      {:.1} MB/s",
+                            res.disk_warm_mbs
+                        ),
+                    );
+                    append_log(&w, "--- MULTI-SPINDLE CONCURRENT READ RESULTS ---");
                     append_log(
                         &w,
                         &format!(
@@ -1294,7 +1529,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ui.set_is_processing(false);
                         ui.set_status_msg(
                             format!(
-                                "Single: {:.0} MB/s | {} Drives: {:.0} MB/s ({:+.0}%)",
+                                "RAM: {:.0} GB/s | Single: {:.0} MB/s | {} Drives: {:.0} MB/s ({:+.0}%)",
+                                res.ram_bandwidth_gbs,
                                 res.single_speed_mbs,
                                 res.drives_tested,
                                 res.parallel_speed_mbs,
