@@ -14,6 +14,8 @@ component CustomButton {
     callback clicked;
 
     height: 30px;
+    min-width: txt.min-width + 24px;
+    horizontal-stretch: 0;
 
     Rectangle {
         background: !root.enabled ? #202124 : (ta.has-hover ? root.primary-color.brighter(12%) : root.primary-color);
@@ -21,7 +23,7 @@ component CustomButton {
         border-width: 1px;
         border-color: !root.enabled ? #2b2d31 : root.primary-color.darker(10%);
 
-        Text {
+        txt := Text {
             text: root.text;
             color: !root.enabled ? #808080 : #ffffff;
             font-size: 11px;
@@ -62,9 +64,9 @@ component SectionHeader {
 export component AppWindow inherits Window {
     title: "SymStripe - Multi-Drive Storage Accelerator";
     min-width: 1040px;
-    min-height: 820px;
+    min-height: 840px;
     preferred-width: 1120px;
-    preferred-height: 860px;
+    preferred-height: 880px;
     background: #141414;
 
     // Profile state
@@ -92,6 +94,16 @@ export component AppWindow inherits Window {
     in-out property <string> pool_mount_point: "Z:";
     in-out property <string> pool_custom_size_gb_text: "0";
     in-out property <bool> is_pool_mounted: false;
+
+    // Real-Time I/O Telemetry properties
+    in-out property <string> drive1_label: "Drive 1 (Primary)";
+    in-out property <string> drive2_label: "Drive 2 (Secondary)";
+    in-out property <string> drive1_speed_text: "0.0 MB/s";
+    in-out property <string> drive2_speed_text: "0.0 MB/s";
+    in-out property <float> drive1_load_pct: 0.0;
+    in-out property <float> drive2_load_pct: 0.0;
+    in-out property <string> total_io_text: "0.0 MB/s";
+    in-out property <bool> is_io_active: false;
 
     // Diagnostics & Status
     in-out property <string> smart_alert_text: "";
@@ -139,19 +151,23 @@ export component AppWindow inherits Window {
 
         // TOP HEADER
         Rectangle {
-            height: 44px;
+            height: 48px;
             background: #1e1f22;
             border-radius: 4px;
             border-width: 1px;
             border-color: #2b2d31;
 
             HorizontalLayout {
-                padding-left: 12px;
-                padding-right: 12px;
-                alignment: space-between;
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 9px;
+                padding-bottom: 9px;
+                spacing: 10px;
 
                 VerticalLayout {
                     alignment: center;
+                    horizontal-stretch: 0;
+
                     Text {
                         text: "SYMSTRIPE PARALLEL ACCELERATOR";
                         font-size: 12px;
@@ -166,23 +182,22 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                HorizontalLayout {
-                    alignment: center;
-                    spacing: 8px;
-                    CustomButton {
-                        text: "Run Speed Benchmark";
-                        width: 150px;
-                        primary-color: #d97706;
-                        enabled: !root.is_processing;
-                        clicked => { root.run_benchmark(); }
-                    }
+                // Spacer pushing buttons cleanly to the right
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
 
-                    CustomButton {
-                        text: "Scan S.M.A.R.T. & Disks";
-                        width: 150px;
-                        primary-color: #2b2d31;
-                        clicked => { root.scan_drives(); }
-                    }
+                CustomButton {
+                    text: "Run Speed Benchmark";
+                    primary-color: #d97706;
+                    enabled: !root.is_processing;
+                    clicked => { root.run_benchmark(); }
+                }
+
+                CustomButton {
+                    text: "Scan S.M.A.R.T. & Disks";
+                    primary-color: #2b2d31;
+                    clicked => { root.scan_drives(); }
                 }
             }
         }
@@ -237,6 +252,7 @@ export component AppWindow inherits Window {
                             height: 30px;
                             ComboBox {
                                 model: root.profile_names;
+                                enabled: !root.is_pool_mounted && !root.is_processing;
                                 current-index <=> root.active_profile_idx;
                                 selected(val) => { root.profile_selected(root.active_profile_idx); }
                             }
@@ -244,6 +260,7 @@ export component AppWindow inherits Window {
                             CustomButton {
                                 text: "+ New";
                                 width: 50px;
+                                enabled: !root.is_pool_mounted && !root.is_processing;
                                 clicked => { root.create_profile(); }
                             }
 
@@ -251,6 +268,7 @@ export component AppWindow inherits Window {
                                 text: "Del";
                                 width: 40px;
                                 primary-color: #c94040;
+                                enabled: !root.is_pool_mounted && !root.is_processing;
                                 clicked => { root.delete_profile(); }
                             }
                         }
@@ -280,6 +298,7 @@ export component AppWindow inherits Window {
                                 }
 
                                 TouchArea {
+                                    enabled: !root.is_pool_mounted && !root.is_processing;
                                     clicked => { root.active_mode_idx = 0; root.mode_switched(0); }
                                 }
                             }
@@ -300,14 +319,13 @@ export component AppWindow inherits Window {
                                 }
 
                                 TouchArea {
+                                    enabled: !root.is_pool_mounted && !root.is_processing;
                                     clicked => { root.active_mode_idx = 1; root.mode_switched(1); }
                                 }
                             }
                         }
 
-                        // ==========================================
                         // PARADIGM 1: IN-PLACE GAME OPTIMIZER
-                        // ==========================================
                         if root.active_mode_idx == 0: VerticalLayout {
                             spacing: 12px;
 
@@ -322,12 +340,14 @@ export component AppWindow inherits Window {
                                 LineEdit {
                                     text <=> root.primary_path;
                                     placeholder-text: "E:\\Games\\Gears of War E-Day\\GoWEDay";
+                                    enabled: !root.is_processing;
                                     edited(val) => { root.primary_folder_changed(val); }
                                 }
 
                                 CustomButton {
                                     text: "...";
                                     width: 32px;
+                                    enabled: !root.is_processing;
                                     clicked => { root.primary_path = root.browse_primary_folder(); }
                                 }
                             }
@@ -372,6 +392,7 @@ export component AppWindow inherits Window {
                                     CustomButton {
                                         text: "+ Add Target (e.g. F:\\zzz)";
                                         primary-color: #f0b132;
+                                        enabled: !root.is_processing;
                                         clicked => { root.add_target_drive(); }
                                     }
 
@@ -386,6 +407,7 @@ export component AppWindow inherits Window {
                                         text: "Clear";
                                         primary-color: #2b2d31;
                                         width: 60px;
+                                        enabled: !root.is_processing;
                                         clicked => { root.clear_target_drives(); }
                                     }
                                 }
@@ -410,6 +432,7 @@ export component AppWindow inherits Window {
                                 LineEdit {
                                     width: 65px;
                                     text <=> root.min_size_mb_text;
+                                    enabled: !root.is_processing;
                                 }
 
                                 CustomButton {
@@ -435,6 +458,7 @@ export component AppWindow inherits Window {
                                 LineEdit {
                                     text <=> root.exclusions_text;
                                     placeholder-text: "exe, dll, pdb, utoc, sig...";
+                                    enabled: !root.is_processing;
                                 }
                             }
 
@@ -443,16 +467,43 @@ export component AppWindow inherits Window {
                                 CheckBox {
                                     text: "Unreal Engine / DirectStorage Safe Mode (Subfolder Junctions)";
                                     checked <=> root.ue5_safe_mode;
+                                    enabled: !root.is_processing;
                                 }
 
                                 CheckBox {
                                     text: "Keep local .backup on Drive 1 (Safe Mode)";
                                     checked <=> root.keep_backup;
+                                    enabled: !root.is_processing;
                                 }
 
                                 CheckBox {
                                     text: "Aggressive Media Offload (Force media to targets)";
                                     checked <=> root.aggressive_media;
+                                    enabled: !root.is_processing;
+                                }
+                            }
+
+                            Rectangle {
+                                background: #2b1f0e;
+                                border-radius: 4px;
+                                border-width: 1px;
+                                border-color: #d97706;
+                                VerticalLayout {
+                                    padding: 8px;
+                                    spacing: 4px;
+                                    Text {
+                                        text: "⚠️ IMPORTANT: STEAM & EPIC VERIFICATION WARNING";
+                                        font-size: 11px;
+                                        font-weight: 700;
+                                        color: #fbbf24;
+                                    }
+
+                                    Text {
+                                        text: "• Do NOT run 'Verify game files' in Steam/Epic while striped (the launcher will treat links as missing and re-download 50-100 GB).\n• Disable automatic updates (Steam: 'Only update this game when I launch it').\n• Always click 'Revert All to Primary' BEFORE installing game patches or DLCs!";
+                                        font-size: 10px;
+                                        color: #fde68a;
+                                        wrap: word-wrap;
+                                    }
                                 }
                             }
 
@@ -489,9 +540,7 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // ==========================================
                         // PARADIGM 2: VIRTUAL STORAGE POOL (VFS)
-                        // ==========================================
                         if root.active_mode_idx == 1: VerticalLayout {
                             spacing: 12px;
 
@@ -535,6 +584,7 @@ export component AppWindow inherits Window {
                                     CustomButton {
                                         text: "+ Add Pool Folder (e.g. E:\\Pool, F:\\Pool)";
                                         primary-color: #7e22ce;
+                                        enabled: !root.is_pool_mounted && !root.is_processing;
                                         clicked => { root.add_pool_member(); }
                                     }
 
@@ -542,6 +592,7 @@ export component AppWindow inherits Window {
                                         text: "Clear";
                                         primary-color: #2b2d31;
                                         width: 60px;
+                                        enabled: !root.is_pool_mounted && !root.is_processing;
                                         clicked => { root.clear_pool_members(); }
                                     }
                                 }
@@ -571,6 +622,7 @@ export component AppWindow inherits Window {
                                     }
 
                                     TouchArea {
+                                        enabled: !root.is_pool_mounted && !root.is_processing;
                                         clicked => { root.pool_policy_idx = 0; root.pool_policy_switched(0); }
                                     }
                                 }
@@ -591,6 +643,7 @@ export component AppWindow inherits Window {
                                     }
 
                                     TouchArea {
+                                        enabled: !root.is_pool_mounted && !root.is_processing;
                                         clicked => { root.pool_policy_idx = 1; root.pool_policy_switched(1); }
                                     }
                                 }
@@ -624,6 +677,7 @@ export component AppWindow inherits Window {
                                     }
 
                                     TouchArea {
+                                        enabled: !root.is_pool_mounted && !root.is_processing;
                                         clicked => { root.pool_stripe_mb = 4; root.pool_stripe_changed(4); }
                                     }
                                 }
@@ -645,6 +699,7 @@ export component AppWindow inherits Window {
                                     }
 
                                     TouchArea {
+                                        enabled: !root.is_pool_mounted && !root.is_processing;
                                         clicked => { root.pool_stripe_mb = 16; root.pool_stripe_changed(16); }
                                     }
                                 }
@@ -666,12 +721,12 @@ export component AppWindow inherits Window {
                                     }
 
                                     TouchArea {
+                                        enabled: !root.is_pool_mounted && !root.is_processing;
                                         clicked => { root.pool_stripe_mb = 64; root.pool_stripe_changed(64); }
                                     }
                                 }
                             }
 
-                            // Quota and Drive Letter Section
                             HorizontalLayout {
                                 height: 30px;
                                 spacing: 8px;
@@ -687,7 +742,7 @@ export component AppWindow inherits Window {
                                     width: 45px;
                                     text <=> root.pool_mount_point;
                                     placeholder-text: "Z:";
-                                    enabled: !root.is_pool_mounted;
+                                    enabled: !root.is_pool_mounted && !root.is_processing;
                                 }
 
                                 Text {
@@ -701,14 +756,14 @@ export component AppWindow inherits Window {
                                     width: 65px;
                                     text <=> root.pool_custom_size_gb_text;
                                     placeholder-text: "0 (Auto)";
-                                    enabled: !root.is_pool_mounted;
+                                    enabled: !root.is_pool_mounted && !root.is_processing;
                                 }
 
                                 CustomButton {
                                     text: "Auto";
                                     width: 40px;
                                     primary-color: #3e6a90;
-                                    enabled: !root.is_pool_mounted;
+                                    enabled: !root.is_pool_mounted && !root.is_processing;
                                     clicked => { root.auto_detect_pool_size(); }
                                 }
                             }
@@ -775,7 +830,7 @@ export component AppWindow inherits Window {
                 horizontal-stretch: 1;
 
                 Rectangle {
-                    vertical-stretch: 6;
+                    vertical-stretch: 5;
                     background: #1e1f22;
                     border-radius: 4px;
                     border-width: 1px;
@@ -828,7 +883,7 @@ export component AppWindow inherits Window {
                 }
 
                 Rectangle {
-                    vertical-stretch: 4;
+                    vertical-stretch: 3;
                     background: #18191b;
                     border-radius: 4px;
                     border-width: 1px;
@@ -848,6 +903,136 @@ export component AppWindow inherits Window {
                             read-only: true;
                             font-family: "Consolas";
                             font-size: 11px;
+                        }
+                    }
+                }
+
+                // Real-Time I/O Activity Telemetry Panel
+                Rectangle {
+                    height: 108px;
+                    background: #18191b;
+                    border-radius: 4px;
+                    border-width: 1px;
+                    border-color: #2b2d31;
+
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 6px;
+
+                        HorizontalLayout {
+                            alignment: space-between;
+                            Text {
+                                text: "LIVE I/O THROUGHPUT (REAL-TIME RAID-0 TELEMETRY)";
+                                font-size: 10px;
+                                font-weight: 700;
+                                color: #949ba4;
+                                vertical-alignment: center;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: end;
+                                Rectangle {
+                                    height: 16px;
+                                    background: root.is_io_active ? #064e3b : #202124;
+                                    border-radius: 3px;
+                                    border-width: 1px;
+                                    border-color: root.is_io_active ? #10b981 : #2b2d31;
+                                    HorizontalLayout {
+                                        padding-left: 6px;
+                                        padding-right: 6px;
+                                        alignment: center;
+                                        Text {
+                                            text: root.is_io_active ? "● ACTIVE" : "○ IDLE";
+                                            font-size: 9px;
+                                            font-weight: 800;
+                                            color: root.is_io_active ? #34d399 : #808080;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+
+                                Text {
+                                    text: "Total: " + root.total_io_text;
+                                    font-family: "Consolas";
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    color: root.is_io_active ? #4ade80 : #949ba4;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        // Drive 1 Meter
+                        VerticalLayout {
+                            spacing: 2px;
+                            HorizontalLayout {
+                                alignment: space-between;
+                                Text {
+                                    text: "💽 " + root.drive1_label;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                    color: #38bdf8;
+                                    overflow: elide;
+                                }
+
+                                Text {
+                                    text: root.drive1_speed_text;
+                                    font-family: "Consolas";
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                    color: #38bdf8;
+                                }
+                            }
+
+                            Rectangle {
+                                height: 8px;
+                                background: #141414;
+                                border-radius: 2px;
+                                Rectangle {
+                                    x: 0px;
+                                    width: parent.width * root.drive1_load_pct;
+                                    height: parent.height;
+                                    background: #0284c7;
+                                    border-radius: 2px;
+                                }
+                            }
+                        }
+
+                        // Drive 2 Meter
+                        VerticalLayout {
+                            spacing: 2px;
+                            HorizontalLayout {
+                                alignment: space-between;
+                                Text {
+                                    text: "💽 " + root.drive2_label;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                    color: #c084fc;
+                                    overflow: elide;
+                                }
+
+                                Text {
+                                    text: root.drive2_speed_text;
+                                    font-family: "Consolas";
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                    color: #c084fc;
+                                }
+                            }
+
+                            Rectangle {
+                                height: 8px;
+                                background: #141414;
+                                border-radius: 2px;
+                                Rectangle {
+                                    x: 0px;
+                                    width: parent.width * root.drive2_load_pct;
+                                    height: parent.height;
+                                    background: #7e22ce;
+                                    border-radius: 2px;
+                                }
+                            }
                         }
                     }
                 }

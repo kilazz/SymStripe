@@ -13,6 +13,11 @@ const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
 const IOCTL_STORAGE_PREDICT_FAILURE: u32 = 0x002D1100;
 
+// HKEY_LOCAL_MACHINE: ((HKEY)(ULONG_PTR)((LONG)0x80000002))
+// Sign-extended on 64-bit Windows to match the Win32 SDK definition (0xFFFFFFFF80000002)
+const HKEY_LOCAL_MACHINE: *mut c_void = (0x80000002_u32 as i32 as isize) as *mut c_void;
+const KEY_READ: u32 = 0x20019;
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetLogicalDrives() -> u32;
@@ -42,6 +47,33 @@ unsafe extern "system" {
         lpBytesReturned: *mut u32,
         lpOverlapped: *mut c_void,
     ) -> i32;
+    fn CreateSymbolicLinkW(
+        lpSymlinkFileName: *const u16,
+        lpTargetFileName: *const u16,
+        dwFlags: u32,
+    ) -> u8;
+    fn DeleteFileW(lpFileName: *const u16) -> i32;
+    fn GetLastError() -> u32;
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn RegOpenKeyExW(
+        hKey: *mut c_void,
+        lpSubKey: *const u16,
+        ulOptions: u32,
+        samDesired: u32,
+        phkResult: *mut *mut c_void,
+    ) -> i32;
+    fn RegQueryValueExW(
+        hKey: *mut c_void,
+        lpValueName: *const u16,
+        lpReserved: *mut u32,
+        lpType: *mut u32,
+        lpData: *mut u8,
+        lpcbData: *mut u32,
+    ) -> i32;
+    fn RegCloseKey(hKey: *mut c_void) -> i32;
 }
 
 pub fn to_wide_null(s: &str) -> Vec<u16> {
@@ -51,7 +83,8 @@ pub fn to_wide_null(s: &str) -> Vec<u16> {
         .collect()
 }
 
-pub fn get_free_disk_space_bytes(path: &Path) -> Option<u64> {
+/// Retrieves both free available space and total capacity for a given path.
+pub fn get_disk_space(path: &Path) -> Option<(u64, u64)> {
     let path_str = path.to_str()?;
     let wide = to_wide_null(path_str);
     let mut free_avail: u64 = 0;
@@ -61,7 +94,71 @@ pub fn get_free_disk_space_bytes(path: &Path) -> Option<u64> {
     let ok =
         unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_avail, &mut total, &mut total_free) };
 
-    if ok != 0 { Some(free_avail) } else { None }
+    if ok != 0 {
+        Some((free_avail, total))
+    } else {
+        None
+    }
+}
+
+pub fn get_free_disk_space_bytes(path: &Path) -> Option<u64> {
+    get_disk_space(path).map(|(free, _)| free)
+}
+
+/// Checks if Windows Developer Mode is enabled via the Windows Registry.
+pub fn is_developer_mode_enabled() -> bool {
+    let subkey = to_wide_null(r"SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock");
+    let val_name = to_wide_null("AllowDevelopmentWithoutDevLicense");
+    let mut hkey = std::ptr::null_mut();
+
+    let res = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
+    if res != 0 || hkey.is_null() {
+        return false;
+    }
+
+    let mut data: u32 = 0;
+    let mut data_size = std::mem::size_of::<u32>() as u32;
+    let mut type_val: u32 = 0;
+
+    let query_res = unsafe {
+        RegQueryValueExW(
+            hkey,
+            val_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut type_val,
+            &mut data as *mut u32 as *mut u8,
+            &mut data_size,
+        )
+    };
+
+    unsafe { RegCloseKey(hkey) };
+    query_res == 0 && data == 1
+}
+
+/// Probes whether the current process can create unprivileged file symlinks.
+pub fn test_symlink_privilege() -> Result<(), (u32, bool)> {
+    let temp_dir = std::env::temp_dir();
+    let target = temp_dir.join(".symstripe_probe_target.tmp");
+    let link = temp_dir.join(".symstripe_probe_link.tmp");
+
+    let _ = std::fs::write(&target, b"test");
+
+    let wide_target = to_wide_null(&target.to_string_lossy());
+    let wide_link = to_wide_null(&link.to_string_lossy());
+
+    // 0x2 = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+    let success = unsafe { CreateSymbolicLinkW(wide_link.as_ptr(), wide_target.as_ptr(), 0x2) };
+
+    let _ = std::fs::remove_file(&target);
+
+    if success != 0 {
+        let _ = unsafe { DeleteFileW(wide_link.as_ptr()) };
+        Ok(())
+    } else {
+        let err = unsafe { GetLastError() };
+        let dev_mode = is_developer_mode_enabled();
+        Err((err, dev_mode))
+    }
 }
 
 pub struct SmartDiskInfo {
@@ -133,7 +230,7 @@ fn map_bus_type(bus_type: u32) -> &'static str {
 pub fn query_smart_disks() -> Vec<SmartDiskInfo> {
     let mut results = Vec::new();
 
-    // Query physical drive devices PhysicalDrive0 through PhysicalDrive16
+    // Query physical drive devices PhysicalDrive0 through PhysicalDrive15
     for drive_idx in 0..16 {
         let drive_path = format!(r"\\.\PhysicalDrive{}", drive_idx);
         let wide_path = to_wide_null(&drive_path);

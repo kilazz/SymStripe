@@ -16,10 +16,13 @@ use striping::{
 use vfs_pool::{VfsLogCallback, VfsPoolSession, mount_storage_pool};
 use win32::{get_logical_volumes, query_smart_disks};
 
+use parking_lot::Mutex;
 use rfd::FileDialog;
-use slint::{ModelRc, SharedString, StandardListViewItem, VecModel};
+use slint::{
+    CloseRequestResponse, ComponentHandle, ModelRc, SharedString, StandardListViewItem, VecModel,
+};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
 slint::include_modules!();
@@ -191,11 +194,89 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool_session: None,
     }));
 
+    // Real-Time I/O Telemetry background sampler thread (runs every 300ms)
+    let state_telemetry = state.clone();
+    let ui_weak_telemetry = ui_weak.clone();
+
+    thread::spawn(move || {
+        let mut last_tick = std::time::Instant::now();
+        loop {
+            thread::sleep(std::time::Duration::from_millis(300));
+            let elapsed = last_tick.elapsed().as_secs_f64();
+            last_tick = std::time::Instant::now();
+
+            let stats = {
+                let st = state_telemetry.lock();
+                if let Some(session) = &st.pool_session {
+                    let deltas = session.sample_and_reset_io();
+                    let names: Vec<String> = session
+                        .member_paths
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| {
+                            let drive = p.to_string_lossy();
+                            format!("Drive {} ({})", i + 1, drive)
+                        })
+                        .collect();
+                    Some((deltas, names))
+                } else {
+                    None
+                }
+            };
+
+            let _ = ui_weak_telemetry.upgrade_in_event_loop(move |ui| {
+                if let Some((deltas, names)) = stats {
+                    let d1_bytes = deltas.first().copied().unwrap_or(0);
+                    let d2_bytes = deltas.get(1).copied().unwrap_or(0);
+
+                    let d1_mbs = (d1_bytes as f64 / 1_048_576.0) / elapsed.max(0.001);
+                    let d2_mbs = (d2_bytes as f64 / 1_048_576.0) / elapsed.max(0.001);
+                    let total_mbs = d1_mbs + d2_mbs;
+
+                    // Dynamic scale: adapts smoothly to peak NVMe/SATA speed
+                    let max_scale = (d1_mbs.max(d2_mbs) * 1.25).max(100.0);
+                    let d1_pct = (d1_mbs / max_scale).clamp(0.0, 1.0) as f32;
+                    let d2_pct = (d2_mbs / max_scale).clamp(0.0, 1.0) as f32;
+
+                    ui.set_drive1_speed_text(format!("{:.1} MB/s", d1_mbs).into());
+                    ui.set_drive2_speed_text(format!("{:.1} MB/s", d2_mbs).into());
+                    ui.set_drive1_load_pct(d1_pct);
+                    ui.set_drive2_load_pct(d2_pct);
+                    ui.set_total_io_text(format!("{:.1} MB/s", total_mbs).into());
+
+                    if let Some(n1) = names.first() {
+                        ui.set_drive1_label(n1.as_str().into());
+                    }
+                    if let Some(n2) = names.get(1) {
+                        ui.set_drive2_label(n2.as_str().into());
+                    }
+
+                    ui.set_is_io_active(total_mbs > 0.5);
+                } else {
+                    ui.set_drive1_speed_text("0.0 MB/s".into());
+                    ui.set_drive2_speed_text("0.0 MB/s".into());
+                    ui.set_drive1_load_pct(0.0);
+                    ui.set_drive2_load_pct(0.0);
+                    ui.set_total_io_text("0.0 MB/s".into());
+                    ui.set_is_io_active(false);
+                }
+            });
+        }
+    });
+
+    // Safe unmount on window close request to avoid ghost Z: drive
+    let state_close = state.clone();
+    app.window().on_close_requested(move || {
+        let mut st = state_close.lock();
+        st.pool_session = None;
+        CloseRequestResponse::HideWindow
+    });
+
     // Top Paradigm Switcher
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_mode_switched(move |mode_idx| {
-        let mut st = state_arc.lock().unwrap();
+        let mut st = state_arc.lock();
         let idx = st.config.active_profile_index;
         if let Some(prof) = st.config.profiles.get_mut(idx) {
             prof.mode_idx = mode_idx;
@@ -209,16 +290,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         append_log(&weak, &format!("Paradigm switched to: {}", mode_name));
     });
 
-    // ==========================================
     // PARADIGM 1: IN-PLACE GAME OPTIMIZER LOGIC
-    // ==========================================
-
     let state_arc = state.clone();
     let weak = ui_weak.clone();
     app.on_browse_primary_folder(move || {
         if let Some(p) = FileDialog::new().pick_folder() {
             let p_str = p.to_string_lossy().to_string();
-            let mut st = state_arc.lock().unwrap();
+            let mut st = state_arc.lock();
             let idx = st.config.active_profile_index;
             if let Some(prof) = st.config.profiles.get_mut(idx) {
                 prof.primary_path = p_str.clone();
@@ -243,7 +321,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state_arc = state.clone();
     app.on_add_target_drive(move || {
         if let Some(folder) = FileDialog::new().pick_folder() {
-            let mut st = state_arc.lock().unwrap();
+            let mut st = state_arc.lock();
             let folder_str = folder.to_string_lossy().to_string();
             let idx = st.config.active_profile_index;
 
@@ -274,7 +352,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_clear_target_drives(move || {
-        let mut st = state_arc.lock().unwrap();
+        let mut st = state_arc.lock();
         let idx = st.config.active_profile_index;
         if let Some(prof) = st.config.profiles.get_mut(idx) {
             prof.secondary_targets.clear();
@@ -295,7 +373,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         thread::spawn(move || {
             let (src_dir, targets) = {
-                let st = st_lock.lock().unwrap();
+                let st = st_lock.lock();
                 let idx = st.config.active_profile_index;
                 let prof = &st.config.profiles[idx];
                 (prof.primary_path.clone(), prof.secondary_targets.clone())
@@ -327,7 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match execute_consolidate(&src_path, &chosen_folder) {
                 Ok(count) => {
                     {
-                        let mut st = st_lock.lock().unwrap();
+                        let mut st = st_lock.lock();
                         let idx = st.config.active_profile_index;
                         if let Some(prof) = st.config.profiles.get_mut(idx) {
                             prof.secondary_targets.retain(|t| t != &chosen_str);
@@ -405,7 +483,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state_arc = state.clone();
     app.on_auto_detect_pool_size(move || {
         let (members, policy) = {
-            let st = state_arc.lock().unwrap();
+            let st = state_arc.lock();
             let idx = st.config.active_profile_index;
             let prof = &st.config.profiles[idx];
             (
@@ -508,7 +586,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             thread::spawn(move || {
                 let targets: Vec<PathBuf> = {
-                    let st = st_lock.lock().unwrap();
+                    let st = st_lock.lock();
                     let idx = st.config.active_profile_index;
                     st.config.profiles[idx]
                         .secondary_targets
@@ -533,7 +611,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let excl_list = parse_ext_list(&excl);
                 let media_list = parse_ext_list(&media);
                 let mode_str = if ue5_safe_mode {
-                    "UE5 Subfolder Junctions"
+                    "Dynamic Subfolder Junctions"
                 } else {
                     "File Symlinks"
                 };
@@ -586,7 +664,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let name = rel.file_name().unwrap_or_default().to_string_lossy();
                             let mb = *size as f64 / (1024.0 * 1024.0);
                             let tag = if ue5_safe_mode {
-                                "[to UE5 Junction]"
+                                "[to Junction]"
                             } else {
                                 "[to Symlink]"
                             };
@@ -640,7 +718,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             thread::spawn(move || {
                 {
-                    let mut st = st_lock.lock().unwrap();
+                    let mut st = st_lock.lock();
                     let idx = st.config.active_profile_index;
                     if let Some(prof) = st.config.profiles.get_mut(idx) {
                         prof.primary_path = src.clone();
@@ -655,7 +733,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let targets: Vec<PathBuf> = {
-                    let st = st_lock.lock().unwrap();
+                    let st = st_lock.lock();
                     let idx = st.config.active_profile_index;
                     st.config.profiles[idx]
                         .secondary_targets
@@ -780,15 +858,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // ==========================================
     // PARADIGM 2: VIRTUAL STORAGE POOL (VFS) LOGIC
-    // ==========================================
-
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_add_pool_member(move || {
         if let Some(folder) = FileDialog::new().pick_folder() {
-            let mut st = state_arc.lock().unwrap();
+            let mut st = state_arc.lock();
             let folder_str = folder.to_string_lossy().to_string();
             let idx = st.config.active_profile_index;
 
@@ -819,7 +894,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_clear_pool_members(move || {
-        let mut st = state_arc.lock().unwrap();
+        let mut st = state_arc.lock();
         let idx = st.config.active_profile_index;
         if let Some(prof) = st.config.profiles.get_mut(idx) {
             prof.pool_members.clear();
@@ -835,7 +910,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_pool_policy_switched(move |policy_idx| {
-        let mut st = state_arc.lock().unwrap();
+        let mut st = state_arc.lock();
         let idx = st.config.active_profile_index;
         if let Some(prof) = st.config.profiles.get_mut(idx) {
             prof.pool_policy = policy_idx;
@@ -855,7 +930,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_pool_stripe_changed(move |stripe_mb| {
-        let mut st = state_arc.lock().unwrap();
+        let mut st = state_arc.lock();
         let idx = st.config.active_profile_index;
         if let Some(prof) = st.config.profiles.get_mut(idx) {
             prof.pool_stripe_mb = stripe_mb as u32;
@@ -867,7 +942,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     });
 
-    // Mount Virtual Storage Pool (Z:) with Real-Time Tracing
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_mount_pool(move |drive_letter, custom_size_str| {
@@ -878,7 +952,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         thread::spawn(move || {
             let (members, policy, stripe_mb, custom_gb) = {
-                let mut st = st_lock.lock().unwrap();
+                let mut st = st_lock.lock();
                 let idx = st.config.active_profile_index;
 
                 st.config.profiles[idx].pool_custom_size_gb = size_str.clone();
@@ -926,7 +1000,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match mount_storage_pool(&drive, &members, policy, stripe_bytes, custom_gb, logger) {
                 Ok(session) => {
-                    let mut st = st_lock.lock().unwrap();
+                    let mut st = st_lock.lock();
                     st.pool_session = Some(session);
 
                     let drive_clone = drive.clone();
@@ -952,11 +1026,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // Unmount Virtual Storage Pool (Z:)
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_unmount_pool(move || {
-        let mut st = state_arc.lock().unwrap();
+        let mut st = state_arc.lock();
         st.pool_session = None;
 
         let _ = weak.upgrade_in_event_loop(|ui| {
@@ -966,11 +1039,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         append_log(&weak, "Virtual Storage Pool unmounted successfully.");
     });
 
-    // Live Rescan Virtual Pool Index Without Unmounting
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_refresh_pool_index(move || {
-        let st = state_arc.lock().unwrap();
+        let st = state_arc.lock();
         if let Some(session) = &st.pool_session {
             session.rescan();
             append_log(&weak, "✅ Virtual Storage Pool catalog refreshed live.");
@@ -980,11 +1052,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Profile Management Callbacks
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_profile_selected(move |idx| {
-        let mut st = state_arc.lock().unwrap();
+        let mut st = state_arc.lock();
         let idx = (idx as usize).min(st.config.profiles.len().saturating_sub(1));
         st.config.active_profile_index = idx;
         save_config(&st.config);
@@ -1042,7 +1113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_create_profile(move || {
-        let mut st = state_arc.lock().unwrap();
+        let mut st = state_arc.lock();
         let new_count = st.config.profiles.len() + 1;
         let new_profile = Profile {
             name: format!("Profile {}", new_count),
@@ -1077,7 +1148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_delete_profile(move || {
-        let mut st = state_arc.lock().unwrap();
+        let mut st = state_arc.lock();
         if st.config.profiles.len() <= 1 {
             append_log(&weak, "Cannot delete the only remaining profile.");
             return;
@@ -1150,7 +1221,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         append_log(&weak, &format!("Deleted profile '{}'.", deleted_name));
     });
 
-    // Hardware Benchmarking
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_run_benchmark(move || {
@@ -1159,7 +1229,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         thread::spawn(move || {
             let (src_dir, targets) = {
-                let st = st_lock.lock().unwrap();
+                let st = st_lock.lock();
                 let idx = st.config.active_profile_index;
                 let prof = &st.config.profiles[idx];
                 (
@@ -1244,7 +1314,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // Hardware S.M.A.R.T. Disks Query
     let weak = ui_weak.clone();
     app.on_scan_drives(move || {
         let w = weak.clone();
@@ -1303,5 +1372,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     app.run()?;
+
+    // Explicitly drop WinFsp session on termination
+    {
+        let mut st = state.lock();
+        st.pool_session = None;
+    }
+
     Ok(())
 }

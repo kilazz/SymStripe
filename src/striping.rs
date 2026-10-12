@@ -1,7 +1,7 @@
 use crate::manifest::{
     ManifestFileEntry, StripingManifest, delete_manifest, load_manifest, save_manifest,
 };
-use crate::win32::get_free_disk_space_bytes;
+use crate::win32::{get_free_disk_space_bytes, test_symlink_privilege};
 use std::collections::HashSet;
 use std::fs;
 use std::os::windows::fs::symlink_file;
@@ -11,7 +11,6 @@ use walkdir::WalkDir;
 
 const COMPANION_EXTENSIONS: &[&str] = &["utoc", "pak", "sig"];
 
-/// Checks if a file's extension matches any extension in the provided list.
 pub fn is_ext_match(path: &Path, exts: &[String]) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let ext_lower = ext.to_lowercase();
@@ -20,7 +19,6 @@ pub fn is_ext_match(path: &Path, exts: &[String]) -> bool {
     false
 }
 
-/// Parses a comma-delimited string of extensions into a normalized vector.
 pub fn parse_ext_list(ext_str: &str) -> Vec<String> {
     ext_str
         .split(',')
@@ -29,11 +27,7 @@ pub fn parse_ext_list(ext_str: &str) -> Vec<String> {
         .collect()
 }
 
-/// Detects memory-mapped engine metadata, TOCs, and IoStore header stubs.
-/// These files MUST remain on the primary drive (or be co-located inside a junction)
-/// to prevent engine bootstrapping failures.
 pub fn is_iostore_metadata_companion(path: &Path) -> bool {
-    // 1. pakchunk0 and global files contain root project descriptors (.uproject) and engine bootstrapping assets
     if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
         let name_lower = file_name.to_lowercase();
         if name_lower.starts_with("pakchunk0-") || name_lower.starts_with("global.") {
@@ -43,13 +37,9 @@ pub fn is_iostore_metadata_companion(path: &Path) -> bool {
 
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let ext_lower = ext.to_lowercase();
-
-        // 2. Never schedule individual standalone relocation for TOC, signatures, or index files
         if matches!(ext_lower.as_str(), "utoc" | "sig" | "toc" | "idx") {
             return true;
         }
-
-        // 3. Companion header .pak files
         if ext_lower == "pak" {
             let ucas_companion = path.with_extension("ucas");
             let utoc_companion = path.with_extension("utoc");
@@ -61,10 +51,13 @@ pub fn is_iostore_metadata_companion(path: &Path) -> bool {
     false
 }
 
-/// Traverses up the directory hierarchy and deletes empty parent directories.
-fn clean_empty_parents(file_path: &Path) {
+/// Safely traverses up and removes empty parent directories, bounded strictly by stop_at_root.
+fn clean_empty_parents(file_path: &Path, stop_at_root: &Path) {
     let mut current = file_path.to_path_buf();
     while let Some(parent) = current.parent() {
+        if parent == stop_at_root || !parent.starts_with(stop_at_root) {
+            break;
+        }
         if fs::remove_dir(parent).is_ok() {
             current = parent.to_path_buf();
         } else {
@@ -73,7 +66,6 @@ fn clean_empty_parents(file_path: &Path) {
     }
 }
 
-/// Automatically computes an optimal threshold size (in MB) covering ~80% of eligible data.
 pub fn auto_detect_threshold(src_path: &Path, exclusions: &[String]) -> Option<u64> {
     let mut files = Vec::new();
     let mut total_size: u64 = 0;
@@ -96,7 +88,7 @@ pub fn auto_detect_threshold(src_path: &Path, exclusions: &[String]) -> Option<u
 
     files.sort_by_key(|item| std::cmp::Reverse(*item));
 
-    let target_size = (total_size as f64 * 0.8) as u64; // ~80% target volume coverage
+    let target_size = (total_size as f64 * 0.8) as u64;
     let mut accumulated = 0;
     let mut threshold = files[0];
 
@@ -111,7 +103,6 @@ pub fn auto_detect_threshold(src_path: &Path, exclusions: &[String]) -> Option<u
     Some((threshold / 1_048_576).max(1))
 }
 
-/// Verifies all manifest symlinks against physical secondary targets, auto-restoring missing links from .backup.
 pub fn verify_and_repair_integrity(src_path: &Path) -> Result<(usize, usize), String> {
     let mut manifest = load_manifest(src_path).ok_or("No active manifest found.")?;
     let mut intact = 0;
@@ -135,7 +126,9 @@ pub fn verify_and_repair_integrity(src_path: &Path) -> Result<(usize, usize), St
             {
                 repaired += 1;
             }
-            clean_empty_parents(&target_path);
+            if let Some(target_parent) = target_path.parent() {
+                clean_empty_parents(&target_path, target_parent);
+            }
         }
     }
 
@@ -150,13 +143,12 @@ pub fn verify_and_repair_integrity(src_path: &Path) -> Result<(usize, usize), St
 }
 
 pub struct SimulationPlan {
-    pub files: Vec<(PathBuf, u64, bool)>, // (Path, Size, Is_Media)
+    pub files: Vec<(PathBuf, u64, bool)>,
     pub drive_bytes: Vec<u64>,
     pub drive_buckets: Vec<Vec<(PathBuf, u64, bool)>>,
     pub total_drives: usize,
 }
 
-/// Calculates an optimal multi-drive distribution plan using LPT bin-packing.
 pub fn calculate_allocation_plan(
     src_path: &Path,
     targets: &[PathBuf],
@@ -216,7 +208,6 @@ pub fn calculate_allocation_plan(
     })
 }
 
-/// Creates an NTFS Directory Junction via system `mklink /J`.
 fn create_directory_junction(target_dir: &Path, junction_path: &Path) -> Result<(), String> {
     let output = Command::new("cmd")
         .args([
@@ -235,7 +226,6 @@ fn create_directory_junction(target_dir: &Path, junction_path: &Path) -> Result<
     Ok(())
 }
 
-/// Executes striping relocation using either File Symlinks or UE5 Subfolder Directory Junctions.
 pub fn execute_striping(
     src_path: &Path,
     targets: &[PathBuf],
@@ -244,6 +234,24 @@ pub fn execute_striping(
     ue5_safe_mode: bool,
     mut on_progress: impl FnMut(usize, usize, &str, f32),
 ) -> Result<usize, String> {
+    if !ue5_safe_mode && let Err((os_err, dev_mode)) = test_symlink_privilege() {
+        let dev_status = if dev_mode {
+            "Developer Mode: ENABLED (Policy requires restart or elevation)"
+        } else {
+            "Developer Mode: DISABLED in Windows Settings"
+        };
+
+        return Err(format!(
+            "🛑 ABORTED BEFORE TRANSFER: Cannot create file symlinks (Win32 Error {}).\n\
+            {}\n\n\
+            HOW TO FIX:\n\
+            1. Enable Developer Mode: Press Win+I -> System -> For developers -> Turn 'Developer Mode' ON.\n\
+            2. OR Run SymStripe as Administrator.\n\
+            3. OR Check 'Unreal Engine / Safe Mode' (uses Directory Junctions, which NEVER require elevation).",
+            os_err, dev_status
+        ));
+    }
+
     for (idx, target) in targets.iter().enumerate() {
         let required = plan.drive_bytes[idx + 1];
         if let Some(free) = get_free_disk_space_bytes(target).filter(|&free| free < required) {
@@ -283,7 +291,6 @@ pub fn execute_striping(
                 .to_string_lossy()
                 .to_string();
 
-            // Safety guard: never relocate boot chunks or engine globals
             if filename.to_lowercase().starts_with("pakchunk0-")
                 || filename.to_lowercase().starts_with("global.")
             {
@@ -302,15 +309,24 @@ pub fn execute_striping(
             };
             on_progress(current_idx, files_to_move, &filename, pct);
 
-            // Step 1: Copy main payload to target drive
-            if let Err(e) = fs::copy(&f_path, &target_file) {
+            // Step 1: Crash-consistent copy to .symstripe_tmp with atomic rename
+            let target_tmp = target_file.with_extension("symstripe_tmp");
+            if let Err(e) = fs::copy(&f_path, &target_tmp) {
+                let _ = fs::remove_file(&target_tmp);
                 return Err(format!(
                     "Failed to copy file '{}' to target drive: {e}",
                     f_path.display()
                 ));
             }
+            if let Err(e) = fs::rename(&target_tmp, &target_file) {
+                let _ = fs::remove_file(&target_tmp);
+                return Err(format!(
+                    "Failed to finalize target file '{}': {e}",
+                    target_file.display()
+                ));
+            }
 
-            // Step 2: In UE5 Safe Mode, co-locate companion files (.utoc, .pak, .sig) alongside .ucas
+            // Step 2: Co-locate companion files in Safe Mode with crash-consistent staging
             if ue5_safe_mode
                 && f_path
                     .extension()
@@ -319,19 +335,25 @@ pub fn execute_striping(
                 for ext in COMPANION_EXTENSIONS {
                     let comp_src = f_path.with_extension(ext);
                     let comp_dst = target_file.with_extension(ext);
-                    if comp_src.exists() && fs::copy(&comp_src, &comp_dst).is_ok() {
-                        if keep_backup {
-                            let comp_backup =
-                                PathBuf::from(format!("{}.backup", comp_src.to_string_lossy()));
-                            let _ = fs::rename(&comp_src, &comp_backup);
+                    let comp_tmp = comp_dst.with_extension("symstripe_tmp");
+
+                    if comp_src.exists() && fs::copy(&comp_src, &comp_tmp).is_ok() {
+                        if fs::rename(&comp_tmp, &comp_dst).is_ok() {
+                            if keep_backup {
+                                let comp_backup =
+                                    PathBuf::from(format!("{}.backup", comp_src.to_string_lossy()));
+                                let _ = fs::rename(&comp_src, &comp_backup);
+                            } else {
+                                let _ = fs::remove_file(&comp_src);
+                            }
                         } else {
-                            let _ = fs::remove_file(&comp_src);
+                            let _ = fs::remove_file(&comp_tmp);
                         }
                     }
                 }
             }
 
-            // Step 3: Staged rename of original source file
+            // Step 3: Staged rename
             let stage_path = PathBuf::from(format!("{}.symstripe_stage", f_path.to_string_lossy()));
             let backup_path = PathBuf::from(format!("{}.backup", f_path.to_string_lossy()));
 
@@ -343,61 +365,66 @@ pub fn execute_striping(
 
             if let Err(e) = fs::rename(&f_path, stage_destination) {
                 let _ = fs::remove_file(&target_file);
-                clean_empty_parents(&target_file);
+                clean_empty_parents(&target_file, target_root);
                 return Err(format!(
                     "Failed to rename original file '{}': {e}",
                     f_path.display()
                 ));
             }
 
-            // Step 4: Linking strategy
+            // Step 4: Link creation with full Safe Mode Rollback
             if !ue5_safe_mode {
                 if let Err(sym_err) = symlink_file(&target_file, &f_path) {
-                    // Rollback on failure
                     let _ = fs::rename(stage_destination, &f_path);
                     let _ = fs::remove_file(&target_file);
-                    clean_empty_parents(&target_file);
+                    clean_empty_parents(&target_file, target_root);
 
-                    let mut err_msg = format!(
+                    return Err(format!(
                         "Symlink creation failed for '{}': {}",
                         f_path.display(),
                         sym_err
-                    );
-
-                    // Check for OS Error 1314 (ERROR_PRIVILEGE_NOT_HELD) or 5 (Access Denied)
-                    if let Some(os_err) = sym_err.raw_os_error()
-                        && (os_err == 1314 || os_err == 5)
-                    {
-                        err_msg = format!(
-                            "⚠️ ACCESS DENIED (OS Error {}).\n\
-                            Creating standard file symlinks requires Administrator privileges OR Windows Developer Mode to be enabled.\n\n\
-                            SOLUTION:\n\
-                            1. Restart SymStripe as Administrator.\n\
-                            2. OR Enable 'Unreal Engine / Safe Mode' checkbox (uses Directory Junctions, which do NOT require admin rights).",
-                            os_err
-                        );
-                    }
-                    return Err(err_msg);
+                    ));
                 }
-            } else if ue5_safe_mode {
-                // Subfolder Directory Junction (Paks_DriveX)
+            } else {
                 let src_parent = f_path.parent().unwrap();
-                let junction_name = format!("Paks_Drive{}", target_idx + 1);
+                let parent_name = src_parent
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Data");
+                let junction_name = format!("{}_Drive{}", parent_name, target_idx + 1);
                 let junction_path = src_parent.join(&junction_name);
 
                 if created_junctions.insert(junction_path.clone())
                     && let Err(err) = create_directory_junction(target_parent, &junction_path)
                 {
+                    // Full Safe Mode Rollback
+                    let _ = fs::rename(stage_destination, &f_path);
+                    let _ = fs::remove_file(&target_file);
+                    clean_empty_parents(&target_file, target_root);
+
+                    if f_path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("ucas"))
+                    {
+                        for ext in COMPANION_EXTENSIONS {
+                            let comp_src = f_path.with_extension(ext);
+                            let comp_dst = target_file.with_extension(ext);
+                            let comp_backup =
+                                PathBuf::from(format!("{}.backup", comp_src.to_string_lossy()));
+                            let _ = fs::remove_file(&comp_dst);
+                            if comp_backup.exists() {
+                                let _ = fs::rename(&comp_backup, &comp_src);
+                            }
+                        }
+                    }
                     return Err(format!("Directory Junction creation failed: {}", err));
                 }
             }
 
-            // Step 5: Clean temporary stage file if backup was not requested
             if !keep_backup {
                 let _ = fs::remove_file(&stage_path);
             }
 
-            // Step 6: Save manifest incrementally
             manifest.files.push(ManifestFileEntry {
                 rel_path: rel.to_string_lossy().to_string(),
                 target_drive_idx: target_idx,
@@ -414,7 +441,6 @@ pub fn execute_striping(
     Ok(moved_count)
 }
 
-/// Reverts all striped files back to the primary volume incrementally.
 pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize, f32)) -> usize {
     let mut reverted = 0;
 
@@ -433,19 +459,22 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
                 let _ = fs::remove_file(&link_path);
                 if fs::rename(&backup_path, &link_path).is_ok() {
                     let _ = fs::remove_file(&target_path);
-                    clean_empty_parents(&target_path);
+                    if let Some(target_parent) = target_path.parent() {
+                        clean_empty_parents(&target_path, target_parent);
+                    }
                     restored = true;
                 }
             } else if target_path.exists() {
                 let _ = fs::remove_file(&link_path);
                 if fs::copy(&target_path, &link_path).is_ok() {
                     let _ = fs::remove_file(&target_path);
-                    clean_empty_parents(&target_path);
+                    if let Some(target_parent) = target_path.parent() {
+                        clean_empty_parents(&target_path, target_parent);
+                    }
                     restored = true;
                 }
             }
 
-            // Restore companion files (.utoc, .pak, .sig) if this was a .ucas archive
             if link_path
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("ucas"))
@@ -490,13 +519,9 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
         }
     }
 
-    // Clean up Subfolder Junctions (Mode 1 cleanup)
     for entry in WalkDir::new(src_path).into_iter().filter_map(|e| e.ok()) {
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("Paks_Drive")
-        {
+        let name = entry.file_name().to_string_lossy();
+        if name.contains("_Drive") {
             let _ = fs::remove_dir(entry.path());
         }
     }
@@ -504,7 +529,6 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
     reverted
 }
 
-/// Safely consolidates files from a specific secondary folder back into the primary volume.
 pub fn execute_consolidate(src_path: &Path, chosen_target_dir: &Path) -> Result<usize, String> {
     let mut manifest =
         load_manifest(src_path).ok_or("No active manifest found for consolidation.")?;
@@ -523,14 +547,14 @@ pub fn execute_consolidate(src_path: &Path, chosen_target_dir: &Path) -> Result<
                 let _ = fs::remove_file(&link_path);
                 if fs::rename(&backup_path, &link_path).is_ok() {
                     let _ = fs::remove_file(&target_path);
-                    clean_empty_parents(&target_path);
+                    clean_empty_parents(&target_path, chosen_target_dir);
                     consolidated_count += 1;
                 }
             } else if target_path.exists() {
                 let _ = fs::remove_file(&link_path);
                 if fs::copy(&target_path, &link_path).is_ok() {
                     let _ = fs::remove_file(&target_path);
-                    clean_empty_parents(&target_path);
+                    clean_empty_parents(&target_path, chosen_target_dir);
                     consolidated_count += 1;
                 }
             }
