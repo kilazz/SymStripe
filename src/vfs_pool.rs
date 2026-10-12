@@ -1236,7 +1236,7 @@ impl FileSystemContext for SymStripePoolFs {
         }
 
         if let Some(node) = &ctx.node {
-            node.open_handles.fetch_sub(1, Ordering::Relaxed);
+            let remaining = node.open_handles.fetch_sub(1, Ordering::Relaxed) - 1;
 
             let was_modified = *node.is_modified.lock();
             if was_modified {
@@ -1253,6 +1253,12 @@ impl FileSystemContext for SymStripePoolFs {
                         mb
                     ));
                 }
+            }
+
+            // If no more open handles, remove from global file_nodes registry to free RAM!
+            if remaining == 0 {
+                let rel = node.rel_path();
+                self.file_nodes.write().remove(&rel.to_lowercase());
             }
         }
     }
