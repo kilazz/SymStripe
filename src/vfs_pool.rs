@@ -1352,10 +1352,10 @@ impl FileSystemContext for SymStripePoolFs {
     fn read(&self, ctx: &Self::FileContext, buffer: &mut [u8], offset: u64) -> winfsp::Result<u32> {
         let node = context_node(ctx)?;
 
-        // CRITICAL EOF & BOUNDS CHECK: Never allow reads beyond the true file size
+        // Strict EOF check: return 0 bytes when offset reaches or exceeds true file size
         let current_file_size = *node.file_size.lock();
         if offset >= current_file_size {
-            return Ok(0); // Normal EOF indication to Win32 ReadFile
+            return Ok(0);
         }
 
         let max_possible_read = (current_file_size - offset) as usize;
@@ -1611,6 +1611,7 @@ pub struct VfsPoolSession {
 }
 
 impl VfsPoolSession {
+    #[allow(dead_code)]
     pub fn rescan(&self) {}
 
     pub fn sample_and_reset_io(&self) -> Vec<u64> {

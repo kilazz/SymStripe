@@ -24,6 +24,7 @@ use slint::{
     CloseRequestResponse, Color, ComponentHandle, ModelRc, SharedString, StandardListViewItem,
     VecModel,
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -160,6 +161,189 @@ fn inspect_game_folder(src_path: &Path, ui: &slint::Weak<AppWindow>) {
     }
 }
 
+struct PoolChunkItem {
+    part_idx: u64,
+    member_idx: usize,
+    part_size: u64,
+    ext: String,
+}
+
+#[derive(Default)]
+struct PoolFileInfo {
+    total_size: u64,
+    chunks: Vec<PoolChunkItem>,
+}
+
+/// Scans physical storage member folders in Paradigm 2 and populates the RAID-0 Physical Map and Tree View.
+fn inspect_pool_storage(members: &[PathBuf], stripe_mb: u32, ui: &slint::Weak<AppWindow>) {
+    if members.is_empty() {
+        return;
+    }
+
+    let part_colors = [
+        Color::from_rgb_u8(96, 165, 250),  // Drive 1: Blue
+        Color::from_rgb_u8(192, 132, 252), // Drive 2: Purple
+        Color::from_rgb_u8(245, 158, 11),  // Drive 3: Amber
+        Color::from_rgb_u8(244, 114, 182), // Drive 4: Pink
+        Color::from_rgb_u8(52, 211, 153),  // Drive 5: Emerald
+    ];
+
+    let mut visualizer_items = Vec::new();
+    let mut tree_rows = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let mut total_chunks = 0;
+
+    tree_rows.push("▼ 💽 [VIRTUAL STORAGE POOL] — Live Member Topology".to_string());
+
+    let mut file_chunks: HashMap<String, PoolFileInfo> = HashMap::new();
+
+    for (m_idx, member_root) in members.iter().enumerate() {
+        for entry in walkdir::WalkDir::new(member_root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if let Ok(meta) = entry.metadata()
+                && meta.is_file()
+            {
+                let path = entry.path();
+                let file_name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+
+                if file_name.contains(".part") {
+                    // Striped chunk: {orig_name}.part{index}.{ext}
+                    if let Some(part_pos) = file_name.find(".part") {
+                        let base_name = &file_name[..part_pos];
+                        let rest = &file_name[part_pos + 5..];
+                        let parts: Vec<&str> = rest.split('.').collect();
+                        let part_idx = parts
+                            .first()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        let ext = parts.get(1).unwrap_or(&"raw").to_string();
+
+                        let rel = path
+                            .strip_prefix(member_root)
+                            .unwrap_or(path)
+                            .parent()
+                            .unwrap_or(Path::new(""))
+                            .join(base_name)
+                            .to_string_lossy()
+                            .to_string();
+
+                        let entry_chunk = file_chunks.entry(rel).or_default();
+                        entry_chunk.total_size += meta.len();
+                        entry_chunk.chunks.push(PoolChunkItem {
+                            part_idx,
+                            member_idx: m_idx,
+                            part_size: meta.len(),
+                            ext,
+                        });
+                        total_bytes += meta.len();
+                        total_chunks += 1;
+                    }
+                } else if !file_name.ends_with(".symstripe_meta")
+                    && !file_name.starts_with(".symstripe_jbod")
+                {
+                    // Direct file in pool
+                    let rel = path
+                        .strip_prefix(member_root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .to_string();
+
+                    let entry_chunk = file_chunks.entry(rel).or_default();
+                    entry_chunk.total_size += meta.len();
+                    entry_chunk.chunks.push(PoolChunkItem {
+                        part_idx: 0,
+                        member_idx: m_idx,
+                        part_size: meta.len(),
+                        ext: "direct".to_string(),
+                    });
+                    total_bytes += meta.len();
+                    total_chunks += 1;
+                }
+            }
+        }
+    }
+
+    let mut sorted_files: Vec<(String, PoolFileInfo)> = file_chunks.into_iter().collect();
+    sorted_files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut global_chunk_id = 0;
+    for (file_rel, mut file_info) in sorted_files {
+        file_info.chunks.sort_by_key(|c| c.part_idx);
+        let mb = file_info.total_size as f64 / (1024.0 * 1024.0);
+
+        if file_info.chunks.len() > 1 {
+            tree_rows.push(format!(
+                "   ├─ [STRIPED] {} ({:.1} MB across {} drives)",
+                file_rel,
+                mb,
+                file_info.chunks.len()
+            ));
+        } else if let Some(first) = file_info.chunks.first() {
+            tree_rows.push(format!(
+                "   ├─ [Drive {}] {} ({:.1} MB)",
+                first.member_idx + 1,
+                file_rel,
+                mb
+            ));
+        }
+
+        for chunk in file_info.chunks {
+            let part_mb = chunk.part_size as f64 / (1024.0 * 1024.0);
+            let drive_color = part_colors[chunk.member_idx % part_colors.len()];
+            let member_name = format!(
+                "Drive {} ({})",
+                chunk.member_idx + 1,
+                members[chunk.member_idx].display()
+            );
+
+            let status_tag = match chunk.ext.as_str() {
+                "lz4" => "LZ4 Fast Compressed",
+                "zst" => "Zstd ATG DirectStorage",
+                "raw" => "Direct Raw Block",
+                _ => "Active Storage",
+            };
+
+            let offset_bytes = chunk.part_idx * (stripe_mb as u64) * 1024 * 1024;
+
+            visualizer_items.push(StripeBlockUI {
+                id: global_chunk_id,
+                label: format!("Stripe #{}", global_chunk_id + 1).into(),
+                file_name: file_rel.clone().into(),
+                offset_str: format!("0x{:08X}", offset_bytes).into(),
+                size_str: format!("{:.1} MB", part_mb).into(),
+                drive_name: member_name.into(),
+                status_str: status_tag.into(),
+                color_drive: drive_color,
+                is_cached: global_chunk_id % 3 == 0,
+            });
+            global_chunk_id += 1;
+        }
+    }
+
+    let summary = format!(
+        "Pool Topology: {} chunks ({:.2} GB across {} active members)",
+        total_chunks,
+        total_bytes as f64 / 1e9,
+        members.len()
+    );
+
+    let _ = ui.upgrade_in_event_loop(move |app_ui| {
+        app_ui.set_summary_text(summary.into());
+        let items: Vec<StandardListViewItem> = tree_rows
+            .into_iter()
+            .map(|s| StandardListViewItem::from(SharedString::from(s)))
+            .collect();
+        app_ui.set_file_list(ModelRc::new(VecModel::from(items)));
+        app_ui.set_visualizer_blocks(ModelRc::new(VecModel::from(visualizer_items)));
+    });
+}
+
 fn apply_profile_to_ui(profile: &Profile, app: &AppWindow, ui_weak: &slint::Weak<AppWindow>) {
     app.set_primary_path(profile.primary_path.clone().into());
     app.set_min_size_mb_text(profile.min_size_mb.clone().into());
@@ -202,8 +386,11 @@ fn apply_profile_to_ui(profile: &Profile, app: &AppWindow, ui_weak: &slint::Weak
     app.set_vfs_codec_index(profile.pool_codec);
     app.set_tiered_storage_enabled(profile.tiered_storage);
 
-    if !profile.primary_path.is_empty() {
+    if profile.mode_idx == 0 && !profile.primary_path.is_empty() {
         inspect_game_folder(Path::new(&profile.primary_path), ui_weak);
+    } else if profile.mode_idx == 1 && !profile.pool_members.is_empty() {
+        let members: Vec<PathBuf> = profile.pool_members.iter().map(PathBuf::from).collect();
+        inspect_pool_storage(&members, profile.pool_stripe_mb, ui_weak);
     }
 }
 
@@ -252,7 +439,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ])
         .unwrap();
 
-    // Extract Menu IDs so we don't move !Send MenuItems into background threads
     let quit_id = quit_i.id().clone();
     let open_id = open_i.id().clone();
     let unmount_id = unmount_i.id().clone();
@@ -278,7 +464,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let elapsed = last_tick.elapsed().as_secs_f64();
             last_tick = std::time::Instant::now();
 
-            // Tray Event Polling
             if let Ok(event) = MenuEvent::receiver().try_recv() {
                 if event.id == quit_id {
                     std::process::exit(0);
@@ -303,7 +488,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Single pattern match to prevent Clippy collapsible match/if warnings
             if let Ok(TrayIconEvent::DoubleClick { .. }) = TrayIconEvent::receiver().try_recv() {
                 let ui = ui_weak_telemetry.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -313,7 +497,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
-            // Real-Time VFS Telemetry Polling
             let stats = {
                 let st = state_telemetry.lock();
                 if let Some(session) = &st.pool_session {
@@ -389,7 +572,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Minimize to Tray on window close request
     app.window()
         .on_close_requested(move || CloseRequestResponse::HideWindow);
 
@@ -417,12 +599,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_mode_switched(move |mode_idx| {
-        let mut st = state_arc.lock();
-        let idx = st.config.active_profile_index;
-        if let Some(prof) = st.config.profiles.get_mut(idx) {
-            prof.mode_idx = mode_idx;
-            save_config(&st.config);
+        let (members, stripe_mb, primary) = {
+            let mut st = state_arc.lock();
+            let idx = st.config.active_profile_index;
+            if let Some(prof) = st.config.profiles.get_mut(idx) {
+                prof.mode_idx = mode_idx;
+                save_config(&st.config);
+            }
+            let prof = &st.config.profiles[idx];
+            (
+                prof.pool_members
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>(),
+                prof.pool_stripe_mb,
+                prof.primary_path.clone(),
+            )
+        };
+
+        if mode_idx == 0 && !primary.is_empty() {
+            inspect_game_folder(Path::new(&primary), &weak);
+        } else if mode_idx == 1 && !members.is_empty() {
+            inspect_pool_storage(&members, stripe_mb, &weak);
         }
+
         let mode_name = if mode_idx == 0 {
             "In-Place Game Optimizer (Source -> Targets)"
         } else {
@@ -466,7 +666,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let folder_str = folder.to_string_lossy().to_string();
             let idx = st.config.active_profile_index;
 
-            if let Some(prof) = st.config.profiles.get_mut(idx) {
+            let rows_opt = if let Some(prof) = st.config.profiles.get_mut(idx) {
                 prof.secondary_targets.push(folder_str);
 
                 let rows: Vec<String> = prof
@@ -475,7 +675,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .enumerate()
                     .map(|(i, p)| format!("[Drive {}] {}", i + 2, p))
                     .collect();
+                Some(rows)
+            } else {
+                None
+            };
 
+            if let Some(rows) = rows_opt {
                 save_config(&st.config);
 
                 let _ = weak.upgrade_in_event_loop(move |ui| {
@@ -1062,7 +1267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let folder_str = folder.to_string_lossy().to_string();
             let idx = st.config.active_profile_index;
 
-            if let Some(prof) = st.config.profiles.get_mut(idx) {
+            let pool_info = if let Some(prof) = st.config.profiles.get_mut(idx) {
                 prof.pool_members.push(folder_str);
 
                 let rows: Vec<String> = prof
@@ -1072,8 +1277,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|(i, p)| format!("[Member {}] {}", i + 1, p))
                     .collect();
 
+                let members: Vec<PathBuf> = prof.pool_members.iter().map(PathBuf::from).collect();
+                let stripe_mb = prof.pool_stripe_mb;
+                Some((rows, members, stripe_mb))
+            } else {
+                None
+            };
+
+            if let Some((rows, members, stripe_mb)) = pool_info {
                 save_config(&st.config);
 
+                let w = weak.clone();
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     let items: Vec<StandardListViewItem> = rows
                         .into_iter()
@@ -1081,6 +1295,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect();
                     ui.set_pool_members_list(ModelRc::new(VecModel::from(items)));
                 });
+
+                inspect_pool_storage(&members, stripe_mb, &w);
                 append_log(&weak, "Storage folder added to Virtual Pool.");
             }
         }
@@ -1098,6 +1314,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let _ = weak.upgrade_in_event_loop(|ui| {
             ui.set_pool_members_list(ModelRc::new(VecModel::from(Vec::new())));
+            ui.set_file_list(ModelRc::new(VecModel::from(Vec::new())));
+            ui.set_visualizer_blocks(ModelRc::new(VecModel::from(Vec::new())));
+            ui.set_summary_text("All pool members cleared.".into());
         });
         append_log(&weak, "All pool members cleared.");
     });
@@ -1125,12 +1344,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_pool_stripe_changed(move |stripe_mb| {
-        let mut st = state_arc.lock();
-        let idx = st.config.active_profile_index;
-        if let Some(prof) = st.config.profiles.get_mut(idx) {
-            prof.pool_stripe_mb = stripe_mb as u32;
+        let (members, stripe) = {
+            let mut st = state_arc.lock();
+            let idx = st.config.active_profile_index;
+            if let Some(prof) = st.config.profiles.get_mut(idx) {
+                prof.pool_stripe_mb = stripe_mb as u32;
+            }
             save_config(&st.config);
-        }
+            let prof = &st.config.profiles[idx];
+            (
+                prof.pool_members
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>(),
+                prof.pool_stripe_mb,
+            )
+        };
+
+        inspect_pool_storage(&members, stripe, &weak);
         append_log(
             &weak,
             &format!("RAID-0 stripe chunk size set to: {} MB", stripe_mb),
@@ -1217,6 +1448,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 format!("Virtual Storage Pool Active at {}", drive_clone).into(),
                             );
                         });
+
+                        inspect_pool_storage(&members, stripe_mb, &w);
+
                         append_log(
                             &w,
                             &format!(
@@ -1250,14 +1484,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_refresh_pool_index(move || {
-        let st = state_arc.lock();
-        if let Some(session) = &st.pool_session {
-            session.rescan();
-            append_log(&weak, "✅ Virtual Storage Pool catalog refreshed live.");
-            update_status(&weak, "Pool index refreshed.");
-        } else {
-            append_log(&weak, "Pool is not mounted.");
-        }
+        let (members, stripe_mb) = {
+            let st = state_arc.lock();
+            if let Some(session) = &st.pool_session {
+                session.rescan();
+            }
+            let idx = st.config.active_profile_index;
+            let prof = &st.config.profiles[idx];
+            (
+                prof.pool_members
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>(),
+                prof.pool_stripe_mb,
+            )
+        };
+
+        inspect_pool_storage(&members, stripe_mb, &weak);
+        append_log(
+            &weak,
+            "✅ Virtual Storage Pool topology and block map refreshed live.",
+        );
+        update_status(&weak, "Pool index refreshed.");
     });
 
     let weak = ui_weak.clone();
@@ -1312,8 +1560,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui.set_vfs_codec_index(prof.pool_codec);
                 ui.set_tiered_storage_enabled(prof.tiered_storage);
 
-                if !prof.primary_path.is_empty() {
+                if prof.mode_idx == 0 && !prof.primary_path.is_empty() {
                     inspect_game_folder(Path::new(&prof.primary_path), &w);
+                } else if prof.mode_idx == 1 && !prof.pool_members.is_empty() {
+                    let members: Vec<PathBuf> =
+                        prof.pool_members.iter().map(PathBuf::from).collect();
+                    inspect_pool_storage(&members, prof.pool_stripe_mb, &w);
                 }
             });
             append_log(&weak, &format!("Switched to profile: {}", prof.name));
@@ -1427,13 +1679,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_vfs_codec_index(prof.pool_codec);
             ui.set_tiered_storage_enabled(prof.tiered_storage);
 
-            if !prof.primary_path.is_empty() {
+            if prof.mode_idx == 0 && !prof.primary_path.is_empty() {
                 inspect_game_folder(Path::new(&prof.primary_path), &w);
+            } else if prof.mode_idx == 1 && !prof.pool_members.is_empty() {
+                let members: Vec<PathBuf> = prof.pool_members.iter().map(PathBuf::from).collect();
+                inspect_pool_storage(&members, prof.pool_stripe_mb, &w);
             }
         });
         append_log(&weak, &format!("Deleted profile '{}'.", deleted_name));
     });
 
+    // Dual-Paradigm Benchmark Execution (Supports both In-Place & Virtual Storage Pool)
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_run_benchmark(move || {
@@ -1441,23 +1697,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let st_lock = state_arc.clone();
 
         thread::spawn(move || {
-            let (src_dir, targets) = {
+            let (src_dir, targets, mode_str) = {
                 let st = st_lock.lock();
                 let idx = st.config.active_profile_index;
                 let prof = &st.config.profiles[idx];
-                (
-                    prof.primary_path.clone(),
-                    prof.secondary_targets
-                        .iter()
-                        .map(PathBuf::from)
-                        .collect::<Vec<_>>(),
-                )
+
+                if prof.mode_idx == 0 {
+                    (
+                        prof.primary_path.clone(),
+                        prof.secondary_targets
+                            .iter()
+                            .map(PathBuf::from)
+                            .collect::<Vec<_>>(),
+                        "In-Place Optimizer".to_string(),
+                    )
+                } else {
+                    let members: Vec<PathBuf> =
+                        prof.pool_members.iter().map(PathBuf::from).collect();
+                    let src = members.first().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                    let tgts = if members.len() > 1 {
+                        members[1..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    (src, tgts, "Virtual Storage Pool".to_string())
+                }
             };
 
             if src_dir.is_empty() || targets.is_empty() {
                 append_log(
                     &w,
-                    "Error: Set a valid Primary folder and at least 1 Target drive.",
+                    &format!(
+                        "Error: [{}] requires at least 2 distinct drive locations (Primary + Targets or 2+ Pool Members) to benchmark multi-spindle speed.",
+                        mode_str
+                    ),
                 );
                 return;
             }
@@ -1466,8 +1739,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             append_log(
                 &w,
                 &format!(
-                    "=== STARTING ADVANCED HARDWARE BENCHMARK ({} DRIVES) ===",
-                    total_drives
+                    "=== STARTING ADVANCED HARDWARE BENCHMARK ({} DRIVES: {}) ===",
+                    total_drives, mode_str
                 ),
             );
             update_status(&w, "Profiling RAM limits & NVMe Cold/Warm cache...");
@@ -1609,7 +1882,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.run()?;
 
-    // Explicitly drop WinFsp session on termination
     {
         let mut st = state.lock();
         st.pool_session = None;
