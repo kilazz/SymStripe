@@ -85,7 +85,7 @@ pub struct DirectBuffer {
 
 pub struct FileNode {
     pub rel_path: RwLock<String>,
-    pub file_hash: u64,
+    pub file_hash: AtomicU64,
     pub is_striped: bool,
     pub present_on: Vec<usize>, // Supports JBOD (len=1) and RAID-1 Mirror (len=N)
     pub file_codec: VfsCodec,
@@ -429,7 +429,7 @@ impl SymStripePoolFs {
         let node = map.entry(key).or_insert_with(|| {
             Arc::new(FileNode {
                 rel_path: RwLock::new(rel_path.to_string()),
-                file_hash: hash_path_id(rel_path),
+                file_hash: AtomicU64::new(hash_path_id(rel_path)),
                 is_striped,
                 present_on,
                 file_codec,
@@ -527,7 +527,7 @@ impl SymStripePoolFs {
             return;
         }
 
-        let f_hash = node.file_hash;
+        let f_hash = node.file_hash.load(Ordering::Relaxed);
         let num_drives = self.members.len() as u64;
 
         let cache = self.global_cache.entries.lock();
@@ -579,8 +579,9 @@ impl SymStripePoolFs {
         target_drive_idx: usize,
         allow_prefetch: bool,
     ) -> Result<Arc<RwLock<CachedPart>>, FspError> {
+        let current_hash = node.file_hash.load(Ordering::Relaxed);
         let key = PartKey {
-            file_hash: node.file_hash,
+            file_hash: current_hash,
             part_index,
         };
 
@@ -652,7 +653,7 @@ impl SymStripePoolFs {
             last_access: Instant::now(),
             codec: loaded_codec,
             rel_path: rel,
-            file_hash: node.file_hash,
+            file_hash: current_hash,
             part_index,
         }));
 
@@ -708,7 +709,7 @@ impl SymStripePoolFs {
                 for step in 1..=PREFETCH_LOOKAHEAD_PARTS {
                     let next_p = part_index + step;
                     let next_key = PartKey {
-                        file_hash: node.file_hash,
+                        file_hash: current_hash,
                         part_index: next_p,
                     };
                     if next_p.saturating_mul(stripe_size) < file_size
@@ -726,13 +727,14 @@ impl SymStripePoolFs {
                 let node_clone = Arc::clone(node);
                 rayon::spawn(move || {
                     let num_drives = fs_clone.members.len() as u64;
-                    let drive_shift = node_clone.file_hash % num_drives;
+                    let c_hash = node_clone.file_hash.load(Ordering::Relaxed);
+                    let drive_shift = c_hash % num_drives;
                     for p_idx in candidates {
                         let target_d = ((p_idx + drive_shift) % num_drives) as usize;
                         let _ = fs_clone.fetch_cached_part(&node_clone, p_idx, target_d, false);
 
                         let key = PartKey {
-                            file_hash: node_clone.file_hash,
+                            file_hash: c_hash,
                             part_index: p_idx,
                         };
                         fs_clone.prefetch_in_flight.lock().remove(&key);
@@ -822,8 +824,28 @@ impl FileSystemContext for SymStripePoolFs {
             {
                 false
             } else {
-                // If we are unsure, we query the physical disk.
-                self.members.iter().any(|m| m.join(&rel_path).is_dir())
+                // If file is not in cache, query disk directly (avoids "no dot means folder" bug)
+                let mut found_as_file = false;
+                let mut found_as_dir = false;
+                for m in self.members.iter() {
+                    let p = m.join(&rel_path);
+                    if p.is_dir() {
+                        found_as_dir = true;
+                        break;
+                    }
+                    if p.is_file() {
+                        found_as_file = true;
+                        break;
+                    }
+                }
+
+                if found_as_dir {
+                    true
+                } else if found_as_file {
+                    false
+                } else {
+                    return Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND));
+                }
             }
         };
 
@@ -986,7 +1008,7 @@ impl FileSystemContext for SymStripePoolFs {
         let (is_striped, present_on, file_codec) = if is_dir {
             for m in self.members.iter() {
                 let _ = fs::create_dir_all(m.join(&rel_path));
-                // Create a folder hierarchy for future .part files as well.
+                // Create folder hierarchy for future .part storage
                 let _ = fs::create_dir_all(m.join(".symstripe_store").join(&rel_path));
             }
             (false, vec![], self.pool_codec)
@@ -1136,9 +1158,10 @@ impl FileSystemContext for SymStripePoolFs {
             }
         } else {
             let buffer_len = buffer.len();
+            let current_hash = node.file_hash.load(Ordering::Relaxed);
             let slices = self
                 .stripe_config
-                .map_io_slices(node.file_hash, write_offset, buffer_len);
+                .map_io_slices(current_hash, write_offset, buffer_len);
             let mut tasks = Vec::with_capacity(slices.len());
             let mut remaining_buf = buffer;
 
@@ -1276,9 +1299,10 @@ impl FileSystemContext for SymStripePoolFs {
             return Ok(copy_len as u32);
         }
 
+        let current_hash = node.file_hash.load(Ordering::Relaxed);
         let slices = self
             .stripe_config
-            .map_io_slices(node.file_hash, offset, bytes_to_read);
+            .map_io_slices(current_hash, offset, bytes_to_read);
         let num_slices = slices.len();
 
         let mut tasks = Vec::with_capacity(slices.len());
@@ -1465,49 +1489,44 @@ impl FileSystemContext for SymStripePoolFs {
                 node.direct_cache.lock().take();
                 self.file_nodes.write().remove(&rel.to_lowercase());
 
+                let current_hash = node.file_hash.load(Ordering::Relaxed);
                 {
                     let mut cache = self.global_cache.entries.lock();
-                    cache.retain(|k, _| k.file_hash != node.file_hash);
+                    cache.retain(|k, _| k.file_hash != current_hash);
                 }
 
                 if node.is_striped {
                     let meta_p = self.meta_path(&rel);
+
+                    let mut file_size = *node.file_size.lock();
+                    if file_size == 0
+                        && let Ok(s) = fs::read_to_string(&meta_p)
+                    {
+                        file_size = s.trim().parse::<u64>().unwrap_or(0);
+                    }
+
                     if let Ok(m) = fs::metadata(&meta_p) {
                         self.sub_used_bytes(m.len());
                     }
-                    let _ = fs::remove_file(meta_p);
+                    let _ = fs::remove_file(&meta_p);
 
-                    let parent_opt = Path::new(&rel).parent();
-                    let file_name = Path::new(&rel)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy();
-                    let prefix = format!("{}.part", file_name);
+                    // Direct targeted O(1) chunk deletion to eliminate O(N^2) directory scanning
+                    let stripe_size = self.stripe_config.stripe_size_bytes;
+                    let num_parts =
+                        (file_size + stripe_size.saturating_sub(1)) / stripe_size.max(1);
+                    let num_drives = self.members.len() as u64;
+                    let drive_shift = current_hash % num_drives;
 
-                    for m in self.members.iter() {
-                        let targets = [
-                            match parent_opt {
-                                Some(p) if !p.as_os_str().is_empty() => {
-                                    m.join(".symstripe_store").join(p)
-                                }
-                                _ => m.join(".symstripe_store"),
-                            },
-                            match parent_opt {
-                                Some(p) if !p.as_os_str().is_empty() => m.join(p),
-                                _ => m.to_path_buf(),
-                            },
-                        ];
+                    for part_index in 0..=(num_parts + 2) {
+                        let target_drive_idx = ((part_index + drive_shift) % num_drives) as usize;
+                        for ext in ["lz4", "zst", "raw"] {
+                            let (store_p, legacy_p) =
+                                self.resolve_part_paths(target_drive_idx, &rel, part_index, ext);
 
-                        for dir in targets {
-                            if let Ok(entries) = fs::read_dir(dir) {
-                                for entry in entries.flatten() {
-                                    let n = entry.file_name().to_string_lossy().to_string();
-                                    if n.starts_with(&prefix) {
-                                        if let Ok(m) = entry.metadata() {
-                                            self.sub_used_bytes(m.len());
-                                        }
-                                        let _ = fs::remove_file(entry.path());
-                                    }
+                            for p in [store_p, legacy_p] {
+                                if let Ok(m) = fs::metadata(&p) {
+                                    self.sub_used_bytes(m.len());
+                                    let _ = fs::remove_file(&p);
                                 }
                             }
                         }
@@ -1770,45 +1789,49 @@ impl FileSystemContext for SymStripePoolFs {
                 if let Some(parent) = new_m.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
+
+                let mut file_size = *node.file_size.lock();
+                if file_size == 0
+                    && let Ok(s) = fs::read_to_string(&old_m)
+                {
+                    file_size = s.trim().parse::<u64>().unwrap_or(0);
+                }
+
                 if old_m.exists() {
                     let _ = fs::rename(&old_m, &new_m);
                 }
 
-                // Rename all file chunks (.part) on all drives in the array
-                let old_file_name = Path::new(&old_rel)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
-                let new_file_name = Path::new(&new_rel)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
-                let old_prefix = format!("{}.part", old_file_name);
-                let new_prefix = format!("{}.part", new_file_name);
+                // Direct targeted O(1) chunk rename (prevents orphan chunks and hash drift)
+                let stripe_size = self.stripe_config.stripe_size_bytes;
+                let num_parts = (file_size + stripe_size.saturating_sub(1)) / stripe_size.max(1);
+                let num_drives = self.members.len() as u64;
 
-                let old_parent = Path::new(&old_rel).parent();
-                let new_parent = Path::new(&new_rel).parent();
+                let old_hash = node.file_hash.load(Ordering::Relaxed);
+                let new_hash = hash_path_id(&new_rel);
+                let old_shift = old_hash % num_drives;
+                let new_shift = new_hash % num_drives;
 
-                for m in self.members.iter() {
-                    let old_dir = match old_parent {
-                        Some(p) if !p.as_os_str().is_empty() => m.join(".symstripe_store").join(p),
-                        _ => m.join(".symstripe_store"),
-                    };
-                    let new_dir = match new_parent {
-                        Some(p) if !p.as_os_str().is_empty() => m.join(".symstripe_store").join(p),
-                        _ => m.join(".symstripe_store"),
-                    };
+                for part_index in 0..=(num_parts + 2) {
+                    let old_drive_idx = ((part_index + old_shift) % num_drives) as usize;
+                    let new_drive_idx = ((part_index + new_shift) % num_drives) as usize;
 
-                    let _ = fs::create_dir_all(&new_dir);
+                    for ext in ["lz4", "zst", "raw"] {
+                        let (old_store, old_legacy) =
+                            self.resolve_part_paths(old_drive_idx, &old_rel, part_index, ext);
+                        let (new_store, _new_legacy) =
+                            self.resolve_part_paths(new_drive_idx, &new_rel, part_index, ext);
 
-                    if let Ok(entries) = fs::read_dir(&old_dir) {
-                        for entry in entries.flatten() {
-                            let file_str = entry.file_name().to_string_lossy().to_string();
-                            if file_str.starts_with(&old_prefix) {
-                                let new_file_str = file_str.replacen(&old_prefix, &new_prefix, 1);
-                                let old_path = entry.path();
-                                let new_path = new_dir.join(new_file_str);
-                                let _ = fs::rename(old_path, new_path);
+                        for p in [old_store, old_legacy] {
+                            if p.exists() {
+                                if let Some(parent) = new_store.parent() {
+                                    let _ = fs::create_dir_all(parent);
+                                }
+                                // If the chunk must cross physical drives due to hash drift
+                                if fs::rename(&p, &new_store).is_err()
+                                    && fs::copy(&p, &new_store).is_ok()
+                                {
+                                    let _ = fs::remove_file(&p);
+                                }
                             }
                         }
                     }
@@ -1818,6 +1841,9 @@ impl FileSystemContext for SymStripePoolFs {
                 if let Some(sz) = meta.remove(&old_rel.to_lowercase()) {
                     meta.insert(new_rel.to_lowercase(), sz);
                 }
+
+                // Update file hash so subsequent read operations resolve to new chunk locations
+                node.file_hash.store(new_hash, Ordering::Relaxed);
             } else {
                 for &member_idx in &node.present_on {
                     let _spindle_guard = self.spindle_locks[member_idx].lock();
