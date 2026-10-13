@@ -814,15 +814,17 @@ impl FileSystemContext for SymStripePoolFs {
 
         let is_dir = if rel_path.is_empty() {
             true
-        } else if self
-            .meta_sizes
-            .read()
-            .contains_key(&rel_path.to_lowercase())
-            || self.jbod_map.read().contains_key(&rel_path.to_lowercase())
-        {
-            false
         } else {
-            !rel_path.contains('.')
+            let key = rel_path.to_lowercase();
+            if self.meta_sizes.read().contains_key(&key)
+                || self.jbod_map.read().contains_key(&key)
+                || self.file_nodes.read().contains_key(&key)
+            {
+                false
+            } else {
+                // If we are unsure, we query the physical disk.
+                self.members.iter().any(|m| m.join(&rel_path).is_dir())
+            }
         };
 
         let desc = get_default_security_descriptor();
@@ -984,6 +986,8 @@ impl FileSystemContext for SymStripePoolFs {
         let (is_striped, present_on, file_codec) = if is_dir {
             for m in self.members.iter() {
                 let _ = fs::create_dir_all(m.join(&rel_path));
+                // Create a folder hierarchy for future .part files as well.
+                let _ = fs::create_dir_all(m.join(".symstripe_store").join(&rel_path));
             }
             (false, vec![], self.pool_codec)
         } else if self.tiered_storage && is_hot_meta {
@@ -1095,6 +1099,10 @@ impl FileSystemContext for SymStripePoolFs {
                 .map(|&member_idx| {
                     let _spindle_guard = self.spindle_locks[member_idx].lock();
                     let p = self.members[member_idx].join(node.rel_path());
+
+                    if let Some(parent) = p.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
 
                     let file = OpenOptions::new()
                         .read(true)
@@ -1637,6 +1645,9 @@ impl FileSystemContext for SymStripePoolFs {
             let mut size_diff = 0i64;
             for &member_idx in &node.present_on {
                 let p = self.members[member_idx].join(&rel);
+                if let Some(parent) = p.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
                 let old_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
 
                 let _spindle_guard = self.spindle_locks[member_idx].lock();
@@ -1685,6 +1696,9 @@ impl FileSystemContext for SymStripePoolFs {
             let mut size_diff = 0i64;
             for &member_idx in &node.present_on {
                 let p = self.members[member_idx].join(&rel);
+                if let Some(parent) = p.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
                 let old_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
 
                 let _spindle_guard = self.spindle_locks[member_idx].lock();
@@ -1753,9 +1767,53 @@ impl FileSystemContext for SymStripePoolFs {
             if node.is_striped {
                 let old_m = self.meta_path(&old_rel);
                 let new_m = self.meta_path(&new_rel);
-                if old_m.exists() {
-                    let _ = fs::rename(old_m, new_m);
+                if let Some(parent) = new_m.parent() {
+                    let _ = fs::create_dir_all(parent);
                 }
+                if old_m.exists() {
+                    let _ = fs::rename(&old_m, &new_m);
+                }
+
+                // Rename all file chunks (.part) on all drives in the array
+                let old_file_name = Path::new(&old_rel)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let new_file_name = Path::new(&new_rel)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let old_prefix = format!("{}.part", old_file_name);
+                let new_prefix = format!("{}.part", new_file_name);
+
+                let old_parent = Path::new(&old_rel).parent();
+                let new_parent = Path::new(&new_rel).parent();
+
+                for m in self.members.iter() {
+                    let old_dir = match old_parent {
+                        Some(p) if !p.as_os_str().is_empty() => m.join(".symstripe_store").join(p),
+                        _ => m.join(".symstripe_store"),
+                    };
+                    let new_dir = match new_parent {
+                        Some(p) if !p.as_os_str().is_empty() => m.join(".symstripe_store").join(p),
+                        _ => m.join(".symstripe_store"),
+                    };
+
+                    let _ = fs::create_dir_all(&new_dir);
+
+                    if let Ok(entries) = fs::read_dir(&old_dir) {
+                        for entry in entries.flatten() {
+                            let file_str = entry.file_name().to_string_lossy().to_string();
+                            if file_str.starts_with(&old_prefix) {
+                                let new_file_str = file_str.replacen(&old_prefix, &new_prefix, 1);
+                                let old_path = entry.path();
+                                let new_path = new_dir.join(new_file_str);
+                                let _ = fs::rename(old_path, new_path);
+                            }
+                        }
+                    }
+                }
+
                 let mut meta = self.meta_sizes.write();
                 if let Some(sz) = meta.remove(&old_rel.to_lowercase()) {
                     meta.insert(new_rel.to_lowercase(), sz);
@@ -1768,7 +1826,9 @@ impl FileSystemContext for SymStripePoolFs {
                     if let Some(parent) = new_f.parent() {
                         let _ = fs::create_dir_all(parent);
                     }
-                    let _ = fs::rename(old_f, new_f);
+                    if old_f.exists() {
+                        let _ = fs::rename(old_f, new_f);
+                    }
                 }
             }
         }
