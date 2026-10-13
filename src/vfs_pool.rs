@@ -27,7 +27,6 @@ const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC0000034_u32 as i32;
 const STATUS_IO_DEVICE_ERROR: i32 = 0xC0000185_u32 as i32;
 const STATUS_BUFFER_TOO_SMALL: i32 = 0xC0000023_u32 as i32;
 
-// Threshold for switching from sequential thread execution to Rayon parallel work-stealing (2 MB)
 const PARALLEL_IO_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
 
 pub type VfsLogCallback = Arc<dyn Fn(String) + Send + Sync>;
@@ -120,7 +119,6 @@ fn get_current_filetime() -> u64 {
     (dur.as_secs() + 11644473600) * 10_000_000 + (dur.subsec_nanos() as u64 / 100)
 }
 
-/// In-Memory Accelerated Cache Part
 pub struct CachedPart {
     pub data: Vec<u8>,
     pub dirty: bool,
@@ -128,7 +126,6 @@ pub struct CachedPart {
     pub codec: VfsCodec,
 }
 
-/// File Control Block (FCB) — global file node shared across all open handles
 pub struct FileNode {
     pub rel_path: RwLock<String>,
     pub file_hash: u64,
@@ -136,7 +133,6 @@ pub struct FileNode {
     pub member_idx: usize,
     pub file_codec: VfsCodec,
     pub file_size: Mutex<u64>,
-    pub direct_file: RwLock<Option<Arc<File>>>,
     pub cached_parts: Mutex<HashMap<u64, Arc<RwLock<CachedPart>>>>,
     pub is_modified: Mutex<bool>,
     pub open_handles: AtomicUsize,
@@ -146,47 +142,8 @@ impl FileNode {
     pub fn rel_path(&self) -> String {
         self.rel_path.read().clone()
     }
-
-    pub fn get_or_open_direct_file(
-        &self,
-        member_root: &Path,
-        for_write: bool,
-    ) -> Result<Arc<File>, FspError> {
-        {
-            let guard = self.direct_file.read();
-            if let Some(f) = guard.as_ref() {
-                return Ok(f.clone());
-            }
-        }
-
-        let mut guard = self.direct_file.write();
-        if let Some(f) = guard.as_ref() {
-            return Ok(f.clone());
-        }
-
-        let rel = self.rel_path();
-        let p = member_root.join(&rel);
-
-        let mut opts = OpenOptions::new();
-        opts.read(true);
-        if for_write {
-            opts.write(true).create(true);
-        } else {
-            opts.write(true); // Attempt write, fallback below if locked
-        }
-
-        let file = opts
-            .open(&p)
-            .or_else(|_| OpenOptions::new().read(true).open(&p))
-            .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-
-        let arc_file = Arc::new(file);
-        *guard = Some(arc_file.clone());
-        Ok(arc_file)
-    }
 }
 
-/// Context Control Block (CCB) — per-open-handle context for WinFsp
 pub struct PoolFileHandle {
     pub is_dir: bool,
     pub rel_path: RwLock<String>,
@@ -210,14 +167,11 @@ pub struct SymStripePoolFs {
     pub pool_codec: VfsCodec,
     pub tiered_storage: bool,
     pub logger: Option<VfsLogCallback>,
-    pub usage_cache: Arc<Mutex<(std::time::Instant, u64)>>,
     pub jbod_map: Arc<RwLock<HashMap<String, usize>>>,
-
-    // FCB Registry: single global node map to prevent cache desynchronization
     pub file_nodes: Arc<RwLock<HashMap<String, Arc<FileNode>>>>,
     pub max_cache_parts: usize,
+    pub pool_used_bytes: Arc<AtomicU64>,
 
-    // Telemetry Trackers
     pub io_bytes: Arc<Vec<AtomicU64>>,
     pub cache_hits: Arc<AtomicU64>,
     pub cache_misses: Arc<AtomicU64>,
@@ -244,6 +198,18 @@ impl SymStripePoolFs {
                 .collect::<Vec<_>>(),
         );
 
+        // One-time fast initial scan to calculate existing pool used bytes
+        let mut initial_used: u64 = 0;
+        for m in &members {
+            for entry in walkdir::WalkDir::new(m).into_iter().filter_map(|e| e.ok()) {
+                if let Ok(meta) = entry.metadata()
+                    && meta.is_file()
+                {
+                    initial_used += meta.len();
+                }
+            }
+        }
+
         let ram_mb = get_system_ram_mb();
         let cache_budget_bytes = if ram_cache_mb > 0 {
             (ram_cache_mb as u64) * 1024 * 1024
@@ -266,13 +232,10 @@ impl SymStripePoolFs {
             pool_codec: VfsCodec::from_i32(codec_idx),
             tiered_storage,
             logger,
-            usage_cache: Arc::new(Mutex::new((
-                std::time::Instant::now() - std::time::Duration::from_secs(10),
-                0,
-            ))),
             jbod_map: Arc::new(RwLock::new(HashMap::new())),
             file_nodes: Arc::new(RwLock::new(HashMap::new())),
             max_cache_parts,
+            pool_used_bytes: Arc::new(AtomicU64::new(initial_used)),
             io_bytes,
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
@@ -407,7 +370,6 @@ impl SymStripePoolFs {
                 member_idx,
                 file_codec,
                 file_size: Mutex::new(initial_size),
-                direct_file: RwLock::new(None),
                 cached_parts: Mutex::new(HashMap::new()),
                 is_modified: Mutex::new(false),
                 open_handles: AtomicUsize::new(0),
@@ -416,23 +378,6 @@ impl SymStripePoolFs {
 
         node.open_handles.fetch_add(1, Ordering::Relaxed);
         node.clone()
-    }
-
-    fn calculate_pool_used_bytes(&self) -> u64 {
-        let mut total_used: u64 = 0;
-        for member in self.members.iter() {
-            for entry in walkdir::WalkDir::new(member)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                if let Ok(meta) = entry.metadata()
-                    && meta.is_file()
-                {
-                    total_used += meta.len();
-                }
-            }
-        }
-        total_used
     }
 
     fn evict_part_to_disk(
@@ -444,7 +389,6 @@ impl SymStripePoolFs {
     ) {
         let mut part = part_arc.write();
         if part.dirty {
-            // Apply Hash-Shift for 50/50 Multi-Disk Balancing
             let num_drives = self.members.len() as u64;
             let drive_shift = file_hash % num_drives;
             let target_drive_idx = ((part_index + drive_shift) % num_drives) as usize;
@@ -461,6 +405,9 @@ impl SymStripePoolFs {
                 let _ = fs::create_dir_all(parent);
             }
 
+            // Check if old part file exists to subtract its old size
+            let old_len = fs::metadata(&base_path).map(|m| m.len()).unwrap_or(0);
+
             let compressed = match part.codec {
                 VfsCodec::Lz4 => lz4_flex::compress_prepend_size(&part.data),
                 VfsCodec::Zstd => ZstdAtgCompressor::compress_atg(&part.data, 3)
@@ -468,10 +415,20 @@ impl SymStripePoolFs {
                 VfsCodec::Store => part.data.clone(),
             };
 
+            let new_len = compressed.len() as u64;
+            let diff = new_len as i64 - old_len as i64;
+            if diff > 0 {
+                self.pool_used_bytes
+                    .fetch_add(diff as u64, Ordering::Relaxed);
+            } else if diff < 0 {
+                self.pool_used_bytes
+                    .fetch_sub((-diff) as u64, Ordering::Relaxed);
+            }
+
             self.raw_bytes_written
                 .fetch_add(part.data.len() as u64, Ordering::Relaxed);
             self.compressed_bytes_written
-                .fetch_add(compressed.len() as u64, Ordering::Relaxed);
+                .fetch_add(new_len, Ordering::Relaxed);
             let _ = fs::write(&base_path, compressed);
             part.dirty = false;
         }
@@ -836,8 +793,8 @@ impl FileSystemContext for SymStripePoolFs {
 
         let rel = node.rel_path();
         if !node.is_striped {
-            let f = node.get_or_open_direct_file(&self.members[node.member_idx], true)?;
-            let _ = f.set_len(0);
+            let p = self.members[node.member_idx].join(&rel);
+            let _ = OpenOptions::new().write(true).truncate(true).open(&p);
         } else {
             self.save_meta_size(&rel, 0);
             node.cached_parts.lock().clear();
@@ -908,9 +865,27 @@ impl FileSystemContext for SymStripePoolFs {
 
         if !node.is_striped {
             let member_root = &self.members[node.member_idx];
-            let file = node.get_or_open_direct_file(member_root, true)?;
+            let p = member_root.join(node.rel_path());
+
+            let old_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&p)
+                .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+
             file.seek_write(buffer, write_offset)
                 .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+
+            let new_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(old_len);
+            let diff = new_len as i64 - old_len as i64;
+            if diff > 0 {
+                self.pool_used_bytes
+                    .fetch_add(diff as u64, Ordering::Relaxed);
+            }
 
             if let Some(counter) = self.io_bytes.get(node.member_idx) {
                 counter.fetch_add(buffer.len() as u64, Ordering::Relaxed);
@@ -1001,9 +976,20 @@ impl FileSystemContext for SymStripePoolFs {
 
         let rel = node.rel_path();
         if !node.is_striped {
-            let member_root = &self.members[node.member_idx];
-            let file = node.get_or_open_direct_file(member_root, true)?;
-            let _ = file.set_len(new_size);
+            let p = self.members[node.member_idx].join(&rel);
+            let old_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            if let Ok(file) = OpenOptions::new().write(true).open(&p) {
+                let _ = file.set_len(new_size);
+            }
+            let new_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(old_len);
+            let diff = new_len as i64 - old_len as i64;
+            if diff > 0 {
+                self.pool_used_bytes
+                    .fetch_add(diff as u64, Ordering::Relaxed);
+            } else if diff < 0 {
+                self.pool_used_bytes
+                    .fetch_sub((-diff) as u64, Ordering::Relaxed);
+            }
         } else {
             self.save_meta_size(&rel, new_size);
 
@@ -1034,6 +1020,9 @@ impl FileSystemContext for SymStripePoolFs {
                     for ext in ["lz4", "zst", "raw"] {
                         let part_filename = format!("{}.part{}.{}", rel, part_idx, ext);
                         let part_path = self.members[target_drive_idx].join(part_filename);
+                        if let Ok(m) = fs::metadata(&part_path) {
+                            self.pool_used_bytes.fetch_sub(m.len(), Ordering::Relaxed);
+                        }
                         let _ = fs::remove_file(part_path);
                     }
                 }
@@ -1058,21 +1047,42 @@ impl FileSystemContext for SymStripePoolFs {
                             && let Ok(comp) = fs::read(&lz4_path)
                             && let Ok(mut dec) = lz4_flex::decompress_size_prepended(&comp)
                         {
+                            let old_len = lz4_path.metadata().map(|m| m.len()).unwrap_or(0);
                             dec.truncate(rem_len as usize);
                             let new_comp = lz4_flex::compress_prepend_size(&dec);
+                            let new_len = new_comp.len() as u64;
                             let _ = fs::write(&lz4_path, new_comp);
+                            let diff = old_len as i64 - new_len as i64;
+                            if diff > 0 {
+                                self.pool_used_bytes
+                                    .fetch_sub(diff as u64, Ordering::Relaxed);
+                            }
                         } else if zst_path.exists()
                             && let Ok(comp) = fs::read(&zst_path)
                             && let Ok(mut dec) = ZstdAtgCompressor::decompress_atg(&comp)
                         {
+                            let old_len = zst_path.metadata().map(|m| m.len()).unwrap_or(0);
                             dec.truncate(rem_len as usize);
                             if let Ok(new_comp) = ZstdAtgCompressor::compress_atg(&dec, 3) {
+                                let new_len = new_comp.len() as u64;
                                 let _ = fs::write(&zst_path, new_comp);
+                                let diff = old_len as i64 - new_len as i64;
+                                if diff > 0 {
+                                    self.pool_used_bytes
+                                        .fetch_sub(diff as u64, Ordering::Relaxed);
+                                }
                             }
                         } else if raw_path.exists()
                             && let Ok(f) = OpenOptions::new().write(true).open(&raw_path)
                         {
+                            let old_len = raw_path.metadata().map(|m| m.len()).unwrap_or(0);
                             let _ = f.set_len(rem_len);
+                            let new_len = rem_len;
+                            let diff = old_len as i64 - new_len as i64;
+                            if diff > 0 {
+                                self.pool_used_bytes
+                                    .fetch_sub(diff as u64, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -1133,13 +1143,16 @@ impl FileSystemContext for SymStripePoolFs {
                 }
             } else if let Some(node) = &ctx.node {
                 *node.is_modified.lock() = false;
-                *node.direct_file.write() = None;
                 node.cached_parts.lock().clear();
 
                 self.file_nodes.write().remove(&rel.to_lowercase());
 
                 if node.is_striped {
-                    let _ = fs::remove_file(self.meta_path(&rel));
+                    let meta_p = self.meta_path(&rel);
+                    if let Ok(m) = fs::metadata(&meta_p) {
+                        self.pool_used_bytes.fetch_sub(m.len(), Ordering::Relaxed);
+                    }
+                    let _ = fs::remove_file(meta_p);
 
                     let parent_opt = Path::new(&rel).parent();
                     let file_name = Path::new(&rel)
@@ -1157,13 +1170,20 @@ impl FileSystemContext for SymStripePoolFs {
                             for entry in entries.flatten() {
                                 let n = entry.file_name().to_string_lossy().to_string();
                                 if n.starts_with(&prefix) {
+                                    if let Ok(m) = entry.metadata() {
+                                        self.pool_used_bytes.fetch_sub(m.len(), Ordering::Relaxed);
+                                    }
                                     let _ = fs::remove_file(entry.path());
                                 }
                             }
                         }
                     }
                 } else {
-                    let _ = fs::remove_file(self.members[node.member_idx].join(&rel));
+                    let target_p = self.members[node.member_idx].join(&rel);
+                    if let Ok(m) = fs::metadata(&target_p) {
+                        self.pool_used_bytes.fetch_sub(m.len(), Ordering::Relaxed);
+                    }
+                    let _ = fs::remove_file(target_p);
                     if node.member_idx != 0 {
                         self.jbod_map.write().remove(&rel.to_lowercase());
                         self.save_jbod_catalog();
@@ -1287,10 +1307,6 @@ impl FileSystemContext for SymStripePoolFs {
             }
 
             if let Some(node) = &ctx.node {
-                if let Some(f) = node.direct_file.read().as_ref() {
-                    let _ = f.sync_all();
-                }
-
                 self.flush_node_dirty_parts(node);
 
                 let size = *node.file_size.lock();
@@ -1389,7 +1405,10 @@ impl FileSystemContext for SymStripePoolFs {
 
         if !node.is_striped {
             let member_root = &self.members[node.member_idx];
-            let file = node.get_or_open_direct_file(member_root, false)?;
+            let p = member_root.join(node.rel_path());
+
+            let file = File::open(&p).map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+
             let bytes_read = file
                 .seek_read(target_slice, offset)
                 .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
@@ -1462,17 +1481,9 @@ impl FileSystemContext for SymStripePoolFs {
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
         let (total_bytes, free_bytes) = if self.custom_size_gb > 0 {
             let total = self.custom_size_gb * 1024 * 1024 * 1024;
-            let used = {
-                let mut cache = self.usage_cache.lock();
-                if cache.0.elapsed() > std::time::Duration::from_secs(2) {
-                    let calc = self.calculate_pool_used_bytes();
-                    *cache = (std::time::Instant::now(), calc);
-                    calc
-                } else {
-                    cache.1
-                }
-            };
-            (total, total.saturating_sub(used))
+            let used = self.pool_used_bytes.load(Ordering::Relaxed);
+            let free = total.saturating_sub(used);
+            (total, free)
         } else if self.policy == 1 {
             let mut min_free = u64::MAX;
             let mut min_total = u64::MAX;
