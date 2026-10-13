@@ -10,14 +10,16 @@ import {
 import {
     Theme,
     StripeBlockUI,
+    GraphPoint,
     Card,
     CustomButton,
     LegendBadge,
 } from "theme.slint";
 import { BlockMap } from "block_map.slint";
+import { PerformanceGraph } from "performance_graph.slint";
 import { TelemetryPanel } from "telemetry_panel.slint";
 
-export { StripeBlockUI }
+export { StripeBlockUI, GraphPoint }
 export component AppWindow inherits Window {
     title: "SymStripe Studio - RAM & Parallel Storage Accelerator";
     min-width: 1140px;
@@ -70,6 +72,10 @@ export component AppWindow inherits Window {
     in-out property <string> total_io_text: "0.0 MB/s";
     in-out property <bool> is_io_active: false;
 
+    // Performance Graph Properties
+    in-out property <[GraphPoint]> graph_data: [];
+    in-out property <string> insights_text: "⚪ System Idle";
+
     // Diagnostics & Status
     in-out property <string> smart_alert_text: "";
     in-out property <float> progress: 0.0;
@@ -80,7 +86,7 @@ export component AppWindow inherits Window {
     in-out property <[StandardListViewItem]> file_list: [];
 
     // Right Display Switcher & Visualizer State
-    in-out property <int> right_display_mode: 0; // 0 = Tree View, 1 = RAID-0 Physical Block Map
+    in-out property <int> right_display_mode: 0; // 0 = Tree View, 1 = RAID-0 Map, 2 = Perf Monitor
     in-out property <[StripeBlockUI]> visualizer_blocks: [];
     in-out property <int> selected_block_idx: -1;
     in-out property <int> density_mode_idx: 0;
@@ -118,6 +124,8 @@ export component AppWindow inherits Window {
     callback run_benchmark();
     callback auto_start_toggled(bool);
     callback block_clicked(int);
+    callback copy_ai_report();
+    callback set_graph_window(int);
 
     VerticalLayout {
         padding: 10px;
@@ -860,7 +868,7 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // RIGHT DISPLAY PANEL (FILE TREE VIEW & RAID-0 BLOCK MAP)
+            // RIGHT DISPLAY PANEL (FILE TREE VIEW & RAID-0 BLOCK MAP & PERFORMANCE GRAPH)
             VerticalLayout {
                 spacing: 8px;
                 horizontal-stretch: 1;
@@ -927,6 +935,27 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
+
+                                Rectangle {
+                                    width: 150px;
+                                    height: 26px;
+                                    background: root.right_display_mode == 2 ? Theme.accent-emerald : Theme.surface-nested;
+                                    border-radius: 3px;
+                                    border-width: 1px;
+                                    border-color: root.right_display_mode == 2 ? #34d399 : Theme.border-card;
+                                    Text {
+                                        text: "📈 Performance Monitor";
+                                        font-size: 11px;
+                                        font-weight: 700;
+                                        color: root.right_display_mode == 2 ? Theme.text-bright : Theme.text-muted;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+
+                                    TouchArea {
+                                        clicked => { root.right_display_mode = 2; }
+                                    }
+                                }
                             }
 
                             if root.right_display_mode == 0: Text {
@@ -981,6 +1010,13 @@ export component AppWindow inherits Window {
                             selected_block_idx <=> root.selected_block_idx;
                             density_mode_idx <=> root.density_mode_idx;
                             block_clicked(idx) => { root.block_clicked(idx); }
+                        }
+
+                        if root.right_display_mode == 2: PerformanceGraph {
+                            data: root.graph_data;
+                            insights_text: root.insights_text;
+                            copy_ai_report => { root.copy_ai_report(); }
+                            set_window(w) => { root.set_graph_window(w); }
                         }
                     }
                 }

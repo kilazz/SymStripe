@@ -83,7 +83,6 @@ pub fn apply_profile_to_ui(profile: &Profile, app: &AppWindow, ui_weak: &slint::
     }
 }
 
-/// Initializes initial UI state from active profile and config.
 pub fn init_ui_state(app: &AppWindow, state: Arc<Mutex<AppState>>) {
     let st = state.lock();
     let profile_names: Vec<SharedString> = st
@@ -106,17 +105,67 @@ pub fn init_ui_state(app: &AppWindow, state: Arc<Mutex<AppState>>) {
     }
 }
 
-/// Binds all Slint user interface event callbacks to domain logic.
 pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
     let ui_weak = app.as_weak();
 
-    // Block Inspector Callback
+    // AI Diagnostics Report Copy Handler using native Windows clip.exe
+    let weak = ui_weak.clone();
+    let state_arc = state.clone();
+    app.on_copy_ai_report(move || {
+        let st = state_arc.lock();
+        let mut report = String::from("=== SYMSTRIPE AI DIAGNOSTIC REPORT ===\n");
+        let win = st.graph_window_secs;
+        let skip = st.metrics.len().saturating_sub(win);
+
+        let mut d1_max = 0.0_f32;
+        let mut d2_max = 0.0_f32;
+        let mut d1_lat = 0;
+        let mut d2_lat = 0;
+        let mut count = 0;
+
+        for pt in st.metrics.iter().skip(skip) {
+            d1_max = d1_max.max(pt.d1_mbs);
+            d2_max = d2_max.max(pt.d2_mbs);
+            d1_lat = d1_lat.max(pt.d1_lat);
+            d2_lat = d2_lat.max(pt.d2_lat);
+            count += 1;
+        }
+
+        report.push_str(&format!("Window Analyzed: {} seconds\n", count));
+        report.push_str(&format!(
+            "Drive 1: Peak Read: {:.1} MB/s | Max Latency: {} ms\n",
+            d1_max, d1_lat
+        ));
+        report.push_str(&format!(
+            "Drive 2: Peak Read: {:.1} MB/s | Max Latency: {} ms\n",
+            d2_max, d2_lat
+        ));
+
+        // Natively invoke Windows clipboard utility
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        if let Ok(mut child) = Command::new("clip").stdin(Stdio::piped()).spawn()
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            let _ = stdin.write_all(report.as_bytes());
+        }
+
+        let w = weak.clone();
+        let _ = weak.upgrade_in_event_loop(move |_ui| {
+            append_log(&w, "📋 AI Diagnostics Report copied to clipboard!");
+        });
+    });
+
+    let state_arc = state.clone();
+    app.on_set_graph_window(move |secs| {
+        state_arc.lock().graph_window_secs = secs as usize;
+    });
+
     let weak = ui_weak.clone();
     app.on_block_clicked(move |idx| {
         append_log(&weak, &format!("Inspecting physical block #{}", idx + 1));
     });
 
-    // Auto-Start Windows Startup Toggle
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_auto_start_toggled(move |checked| {
@@ -133,7 +182,6 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
         );
     });
 
-    // Mode Switcher (Paradigm 1 vs Paradigm 2)
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_mode_switched(move |mode_idx| {
@@ -166,7 +214,10 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
         } else {
             "Virtual Storage Pool (Unified Multi-Drive VFS)"
         };
-        append_log(&weak, &format!("Paradigm switched to: {}", mode_name));
+        append_log(
+            &weak,
+            &format!("Architecture Paradigm switched to: {}", mode_name),
+        );
     });
 
     // PARADIGM 1: IN-PLACE GAME OPTIMIZER HANDLERS
@@ -344,7 +395,7 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
                 append_log(
                     &w,
                     &format!(
-                        "Auto-Detect: Set threshold to {} MB to cover ~80% of data.",
+                        "Auto-Detect: Set threshold to {} MB to cover ~85% of data.",
                         optimal_mb
                     ),
                 );
@@ -857,7 +908,7 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
         let mut valid_drives = 0;
 
         for member in &members {
-            if let Some(free) = crate::win32::get_free_disk_space_bytes(member) {
+            if let Some((free, _)) = crate::win32::get_disk_space(member) {
                 total_free_bytes += free;
                 if free < min_free_bytes {
                     min_free_bytes = free;
@@ -896,11 +947,11 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
     app.on_auto_detect_ram_cache(move || {
         let ram_mb = crate::win32::get_system_ram_mb();
         let recommended_mb = if ram_mb >= 32768 {
-            2048
+            4096
         } else if ram_mb >= 16384 {
-            1024
+            2048
         } else {
-            512
+            1024
         };
         let w = weak.clone();
         let _ = weak.upgrade_in_event_loop(move |ui| {

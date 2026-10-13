@@ -24,6 +24,12 @@ const KEY_READ: u32 = 0x20019;
 const PROGRESS_CONTINUE: u32 = 0;
 const PROGRESS_CANCEL: u32 = 1;
 
+// Process Information and Priority constants
+const PROCESS_POWER_THROTTLING: u32 = 4;
+const PROCESS_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
+const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
+const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x00008000;
+
 #[allow(non_camel_case_types)]
 type LPPROGRESS_ROUTINE = Option<
     unsafe extern "system" fn(
@@ -50,6 +56,13 @@ struct MemoryStatusEx {
     total_virtual: u64,
     avail_virtual: u64,
     avail_extended_virtual: u64,
+}
+
+#[repr(C)]
+struct ProcessPowerThrottlingState {
+    version: u32,
+    control_mask: u32,
+    state_mask: u32,
 }
 
 #[link(name = "kernel32")]
@@ -97,6 +110,14 @@ unsafe extern "system" {
         pbCancel: *const i32,
         dwCopyFlags: u32,
     ) -> i32;
+    fn GetCurrentProcess() -> Handle;
+    fn SetPriorityClass(hProcess: Handle, dwPriorityClass: u32) -> i32;
+    fn SetProcessInformation(
+        hProcess: Handle,
+        ProcessInformationClass: u32,
+        ProcessInformation: *const c_void,
+        ProcessInformationSize: u32,
+    ) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -124,6 +145,30 @@ pub fn to_wide_null(s: &str) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+/// Elevates process priority to Above Normal and disables Windows 11 EcoQoS / Efficiency Mode.
+pub fn boost_process_priority() {
+    unsafe {
+        let process = GetCurrentProcess();
+
+        // 1. Elevate process priority to prevent thread starvation and audio DPC latency
+        SetPriorityClass(process, ABOVE_NORMAL_PRIORITY_CLASS);
+
+        // 2. Explicitly disable Windows 11 Power Throttling (Efficiency / EcoQoS Mode)
+        let throttling = ProcessPowerThrottlingState {
+            version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            control_mask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            state_mask: 0, // StateMask = 0 turns off throttling
+        };
+
+        SetProcessInformation(
+            process,
+            PROCESS_POWER_THROTTLING,
+            &throttling as *const _ as *const c_void,
+            std::mem::size_of::<ProcessPowerThrottlingState>() as u32,
+        );
+    }
 }
 
 pub fn get_system_ram_mb() -> u64 {
@@ -281,7 +326,6 @@ where
 
 /// Verifies whether the WinFsp runtime is installed before invoking delay-loaded Fsp APIs.
 pub fn check_winfsp_available() -> Result<(), String> {
-    // 1. Check registry installation entries
     for key_path in [r"SOFTWARE\WinFsp", r"SOFTWARE\WOW6432Node\WinFsp"] {
         let wide_key = to_wide_null(key_path);
         let mut hkey = std::ptr::null_mut();
@@ -300,7 +344,6 @@ pub fn check_winfsp_available() -> Result<(), String> {
         }
     }
 
-    // 2. Check standard installation directories
     let standard_paths = [
         r"C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll",
         r"C:\Program Files\WinFsp\bin\winfsp-x64.dll",

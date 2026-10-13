@@ -1,0 +1,117 @@
+import { Theme, GraphPoint, CustomButton } from "theme.slint";
+
+export component PerformanceGraph inherits Rectangle {
+    in property <[GraphPoint]> data;
+    in property <string> insights_text: "⚪ Idle";
+    in-out property <int> time_scale: 60;
+
+    callback copy_ai_report();
+    callback set_window(int);
+
+    VerticalLayout {
+        spacing: 8px;
+
+        HorizontalLayout {
+            alignment: space-between;
+            Text {
+                text: "📈 PERFORMANCE & BOTTLENECK MONITOR";
+                font-size: 11px;
+                font-weight: 700;
+                color: Theme.accent-cyan;
+                vertical-alignment: center;
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                CustomButton {
+                    text: "60s";
+                    primary-color: root.time_scale == 60 ? Theme.accent-blue : Theme.surface-card;
+                    clicked => { root.set_window(60); root.time_scale = 60; }
+                }
+
+                CustomButton {
+                    text: "3m";
+                    primary-color: root.time_scale == 180 ? Theme.accent-blue : Theme.surface-card;
+                    clicked => { root.set_window(180); root.time_scale = 180; }
+                }
+
+                CustomButton {
+                    text: "5m";
+                    primary-color: root.time_scale == 300 ? Theme.accent-blue : Theme.surface-card;
+                    clicked => { root.set_window(300); root.time_scale = 300; }
+                }
+
+                Rectangle {
+                    width: 10px;
+                }
+
+                CustomButton {
+                    text: "📋 Copy AI Diagnostics Report";
+                    primary-color: Theme.accent-emerald;
+                    clicked => { root.copy_ai_report(); }
+                }
+            }
+        }
+
+        // Live Bar Chart Canvas
+        Rectangle {
+            vertical-stretch: 1;
+            background: Theme.surface-nested;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: #24242C;
+
+            HorizontalLayout {
+                spacing: 0px;
+                for pt in root.data: Rectangle {
+                    // Replaced cyclic binding `width: parent.width / root.data.length` 
+                    // with `horizontal-stretch: 1` to fix the Slint layout loop warning.
+                    horizontal-stretch: 1;
+
+                    // Drive 1 Bar (Blue)
+                    Rectangle {
+                        y: parent.height * (1.0 - pt.d1_val);
+                        height: parent.height * pt.d1_val;
+                        background: Theme.accent-blue;
+                        opacity: 0.8;
+                    }
+
+                    // Drive 2 Bar (Purple) layered
+                    Rectangle {
+                        y: parent.height * (1.0 - pt.d2_val);
+                        height: parent.height * pt.d2_val;
+                        background: Theme.accent-purple;
+                        opacity: 0.6;
+                    }
+
+                    // Red Stall Dot (Micro-Stall / Latency spike indicator)
+                    if pt.is_stall: Rectangle {
+                        y: 2px;
+                        width: min(4px, parent.width);
+                        height: 4px;
+                        border-radius: 2px;
+                        background: Theme.primary;
+                    }
+                }
+            }
+        }
+
+        // Smart Insights Footer
+        Rectangle {
+            height: 24px;
+            background: Theme.surface-card;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: Theme.border-card;
+            HorizontalLayout {
+                padding-left: 8px;
+                Text {
+                    text: "Smart Insights: " + root.insights_text;
+                    font-size: 11px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
