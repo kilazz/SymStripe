@@ -16,7 +16,7 @@ fn default_pool_policy() -> i32 {
     1
 }
 fn default_stripe_mb() -> u32 {
-    16
+    64 // Optimal 64 MB default stripe size for HDDs and large container archives
 }
 fn default_mount_point() -> String {
     "Z:".to_string()
@@ -25,7 +25,7 @@ fn default_custom_size_gb() -> String {
     "0".to_string()
 }
 fn default_ram_cache_mb() -> u32 {
-    1024
+    2048 // 2048 MB default RAM cache budget for smooth asset streaming
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -62,7 +62,7 @@ pub struct Profile {
     #[serde(default = "default_ram_cache_mb")]
     pub pool_ram_cache_mb: u32,
 
-    // Enterprise VFS Features
+    // VFS Advanced Codec & Tiering Features
     #[serde(default = "default_zero")]
     pub pool_codec: i32,
     #[serde(default = "default_false")]
@@ -75,7 +75,7 @@ impl Default for Profile {
             name: "Default Profile".to_string(),
             primary_path: String::new(),
             secondary_targets: Vec::new(),
-            min_size_mb: "50".to_string(),
+            min_size_mb: "64".to_string(),
             exclusions: "exe, dll, pdb, utoc, sig".to_string(),
             media_extensions: "bik, bk2, mp4, fsb, pck, wem".to_string(),
             keep_backup: true,
@@ -84,10 +84,10 @@ impl Default for Profile {
             mode_idx: 0,
             pool_members: Vec::new(),
             pool_policy: 1,
-            pool_stripe_mb: 16,
+            pool_stripe_mb: 64,
             pool_mount_point: "Z:".to_string(),
             pool_custom_size_gb: "0".to_string(),
-            pool_ram_cache_mb: 1024,
+            pool_ram_cache_mb: 2048,
             pool_codec: 0,
             tiered_storage: false,
         }

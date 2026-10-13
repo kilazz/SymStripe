@@ -8,8 +8,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 const COMPANION_EXTENSIONS: &[&str] = &["utoc", "pak", "sig"];
-// Keep a safety reserve on destination target disks (512 MB)
-const DISK_SAFETY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
+const DISK_SAFETY_RESERVE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GB safety margin
 
 pub fn is_ext_match(path: &Path, exts: &[String]) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -27,9 +26,13 @@ pub fn parse_ext_list(ext_str: &str) -> Vec<String> {
         .collect()
 }
 
+/// Identifies files that MUST stay on the Primary drive (core engine & bootstrap packages).
+/// Companion files (.utoc, .sig) are skipped as standalone candidates so they don't get
+/// scattered across different drives independently from their parent .ucas archive.
 pub fn is_iostore_metadata_companion(path: &Path) -> bool {
     if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
         let name_lower = file_name.to_lowercase();
+        // pakchunk0 holds engine core, critical bytecode, and initial shaders
         if name_lower.starts_with("pakchunk0-") || name_lower.starts_with("global.") {
             return true;
         }
@@ -37,13 +40,13 @@ pub fn is_iostore_metadata_companion(path: &Path) -> bool {
 
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let ext_lower = ext.to_lowercase();
+        // Skip companions from independent allocation: they move strictly with their parent .ucas
         if matches!(ext_lower.as_str(), "utoc" | "sig" | "toc" | "idx") {
             return true;
         }
         if ext_lower == "pak" {
             let ucas_companion = path.with_extension("ucas");
-            let utoc_companion = path.with_extension("utoc");
-            if ucas_companion.exists() || utoc_companion.exists() {
+            if ucas_companion.exists() {
                 return true;
             }
         }
@@ -51,7 +54,6 @@ pub fn is_iostore_metadata_companion(path: &Path) -> bool {
     false
 }
 
-/// Safely traverses up and removes empty parent directories, bounded strictly by stop_at_root.
 fn clean_empty_parents(file_path: &Path, stop_at_root: &Path) {
     let mut current = file_path.to_path_buf();
     while let Some(parent) = current.parent() {
@@ -87,8 +89,7 @@ pub fn auto_detect_threshold(src_path: &Path, exclusions: &[String]) -> Option<u
     }
 
     files.sort_by_key(|item| std::cmp::Reverse(*item));
-
-    let target_size = (total_size as f64 * 0.8) as u64;
+    let target_size = (total_size as f64 * 0.85) as u64;
     let mut accumulated = 0;
     let mut threshold = files[0];
 
@@ -100,7 +101,7 @@ pub fn auto_detect_threshold(src_path: &Path, exclusions: &[String]) -> Option<u
         }
     }
 
-    Some((threshold / 1_048_576).max(1))
+    Some((threshold / 1_048_576).max(64))
 }
 
 pub fn verify_and_repair_integrity(src_path: &Path) -> Result<(usize, usize), String> {
@@ -149,7 +150,6 @@ pub struct SimulationPlan {
     pub total_drives: usize,
 }
 
-/// Calculates balanced multi-drive distribution strictly constrained by physical available space per spindle.
 pub fn calculate_allocation_plan(
     src_path: &Path,
     targets: &[PathBuf],
@@ -162,6 +162,7 @@ pub fn calculate_allocation_plan(
 
     for entry in WalkDir::new(src_path).into_iter().filter_map(|e| e.ok()) {
         let p = entry.path();
+
         if is_ext_match(p, exclusions) || is_iostore_metadata_companion(p) {
             continue;
         }
@@ -186,7 +187,6 @@ pub fn calculate_allocation_plan(
     let mut drive_bytes: Vec<u64> = vec![0; total_drives];
     let mut drive_buckets: Vec<Vec<(PathBuf, u64, bool)>> = vec![Vec::new(); total_drives];
 
-    // Query real physical free bytes for each spindle
     let mut initial_free_space: Vec<u64> = Vec::with_capacity(total_drives);
     initial_free_space.push(get_free_disk_space_bytes(src_path).unwrap_or(u64::MAX / 2));
     for t in targets {
@@ -194,42 +194,33 @@ pub fn calculate_allocation_plan(
     }
 
     for (f_path, size, is_media) in files.clone() {
-        // Target drives must have enough remaining space + safety threshold
         let target_has_space = |idx: usize| -> bool {
-            let planned_alloc = drive_bytes[idx];
+            let planned = drive_bytes[idx];
             let free = initial_free_space[idx];
-            free.saturating_sub(planned_alloc) >= size + DISK_SAFETY_RESERVE_BYTES
+            free.saturating_sub(planned) >= size + DISK_SAFETY_RESERVE_BYTES
         };
 
         let best_drive = if is_media && total_drives > 1 {
-            // Aggressive media routing: pick destination drive among targets with enough room,
-            // prioritizing the drive with greatest remaining capacity to balance spindles
-            let eligible_targets: Vec<usize> = (1..total_drives)
+            let eligible: Vec<usize> = (1..total_drives)
                 .filter(|&idx| target_has_space(idx))
                 .collect();
-
-            if !eligible_targets.is_empty() {
-                eligible_targets
+            if !eligible.is_empty() {
+                eligible
                     .into_iter()
                     .max_by_key(|&idx| initial_free_space[idx].saturating_sub(drive_bytes[idx]))
                     .unwrap_or(1)
             } else {
-                0 // Fallback to Primary local drive if all targets lack capacity
+                0
             }
         } else {
-            // Standard files: consider all candidate drives that can host the block
-            let mut eligible_drives = Vec::new();
-            // Drive 0 (Primary) already holds the file locally
-            eligible_drives.push(0);
-
+            let mut eligible = Vec::new();
+            eligible.push(0);
             for idx in 1..total_drives {
                 if target_has_space(idx) {
-                    eligible_drives.push(idx);
+                    eligible.push(idx);
                 }
             }
-
-            // Among eligible drives, pick the one with least currently allocated bytes (round-robin / striping)
-            eligible_drives
+            eligible
                 .into_iter()
                 .min_by_key(|&idx| drive_bytes[idx])
                 .unwrap_or(0)
@@ -255,20 +246,15 @@ pub fn execute_striping(
     ue5_safe_mode: bool,
     mut on_progress: impl FnMut(usize, usize, &str, f32),
 ) -> Result<usize, String> {
-    // Verify unprivileged file symlink creation privilege
     if let Err((os_err, dev_mode)) = test_symlink_privilege() {
         let dev_status = if dev_mode {
-            "Developer Mode: ENABLED (Policy requires application restart or administrative elevation)"
+            "Developer Mode: ENABLED (Policy requires administrative elevation)"
         } else {
             "Developer Mode: DISABLED in Windows Settings"
         };
-
         return Err(format!(
-            "🛑 ABORTED BEFORE TRANSFER: Cannot create file symlinks (Win32 Error {}).\n\
-            {}\n\n\
-            HOW TO FIX:\n\
-            1. Enable Developer Mode: Press Win+I -> System -> For developers -> Turn 'Developer Mode' ON.\n\
-            2. OR Run SymStripe as Administrator.",
+            "🛑 SYMLINK PRIVILEGE ERROR (Win32 Error {}).\n{}\n\
+            Please enable Windows Developer Mode or launch SymStripe as Administrator.",
             os_err, dev_status
         ));
     }
@@ -279,7 +265,7 @@ pub fn execute_striping(
             .filter(|&free| free < required + DISK_SAFETY_RESERVE_BYTES)
         {
             return Err(format!(
-                "ABORTED: Insufficient space on Drive {} ({})! Required: {:.2} GB, Available: {:.2} GB",
+                "Insufficient space on Target Drive {} ({})! Required: {:.2} GB, Available: {:.2} GB",
                 idx + 2,
                 target.display(),
                 (required + DISK_SAFETY_RESERVE_BYTES) as f64 / 1e9,
@@ -320,6 +306,7 @@ pub fn execute_striping(
                 .to_string_lossy()
                 .to_string();
 
+            // pakchunk0 and global.* MUST remain intact on the primary drive
             if filename.to_lowercase().starts_with("pakchunk0-")
                 || filename.to_lowercase().starts_with("global.")
             {
@@ -332,12 +319,9 @@ pub fn execute_striping(
 
             let current_file_idx = moved_count + 1;
 
-            // Step 1: Smooth CopyFileExW with byte-level progress reporting to prevent UI freezes
+            // 1. Transfer main archive file (.ucas, .pak, media, etc.)
             let target_tmp = target_file.with_extension("symstripe_tmp");
-            let file_copied_bytes = std::sync::atomic::AtomicU64::new(0);
-
             let copy_res = copy_file_with_progress(&f_path, &target_tmp, |transferred, _total| {
-                file_copied_bytes.store(transferred, std::sync::atomic::Ordering::Relaxed);
                 let current_total = bytes_moved_so_far + transferred;
                 let global_pct = if total_bytes_to_move > 0 {
                     (current_total as f64 / total_bytes_to_move as f64).clamp(0.0, 1.0) as f32
@@ -350,21 +334,20 @@ pub fn execute_striping(
 
             if let Err(e) = copy_res {
                 let _ = fs::remove_file(&target_tmp);
-                return Err(format!(
-                    "Failed to copy file '{}' to target drive: {e}",
-                    f_path.display()
-                ));
+                return Err(format!("Failed to copy file '{}': {e}", f_path.display()));
             }
 
             if let Err(e) = fs::rename(&target_tmp, &target_file) {
                 let _ = fs::remove_file(&target_tmp);
                 return Err(format!(
-                    "Failed to finalize target file '{}': {e}",
+                    "Failed to finalize destination file '{}': {e}",
                     target_file.display()
                 ));
             }
 
-            // Step 2: In UE5 Safe Mode, co-locate IoStore companion files (.utoc, .pak, .sig) atomically to the same destination
+            // 2. UE5 IoStore Companion Co-location:
+            // Unreal Engine requires .utoc, .pak, and .sig to physically reside in the EXACT SAME
+            // destination folder as .ucas, otherwise FFileIoStore fails to mount the container.
             let is_ucas = f_path
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("ucas"));
@@ -416,10 +399,9 @@ pub fn execute_striping(
                 }
             }
 
-            // Step 3: Rename original archive to stage or backup
+            // 3. Rename original archive to stage or backup
             let stage_path = PathBuf::from(format!("{}.symstripe_stage", f_path.to_string_lossy()));
             let backup_path = PathBuf::from(format!("{}.backup", f_path.to_string_lossy()));
-
             let stage_destination = if keep_backup {
                 &backup_path
             } else {
@@ -430,7 +412,6 @@ pub fn execute_striping(
                 let _ = fs::remove_file(&target_file);
                 clean_empty_parents(&target_file, target_root);
 
-                // Roll back companions
                 for (c_src, c_dst, c_dest) in migrated_companions {
                     let _ = fs::remove_file(&c_src);
                     let _ = fs::rename(c_dest, &c_src);
@@ -438,12 +419,12 @@ pub fn execute_striping(
                 }
 
                 return Err(format!(
-                    "Failed to rename original file '{}': {e}",
+                    "Failed to rename source file '{}': {e}",
                     f_path.display()
                 ));
             }
 
-            // Step 4: Transparent in-place file symlink creation directly where the engine expects it
+            // 4. Create transparent in-place symlink
             if let Err(sym_err) = symlink_file(&target_file, &f_path) {
                 let _ = fs::rename(stage_destination, &f_path);
                 let _ = fs::remove_file(&target_file);
@@ -524,6 +505,7 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
                 }
             }
 
+            // Revert all co-located companion files (.utoc, .pak, .sig) back to primary
             if link_path
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("ucas"))
@@ -559,24 +541,14 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
                 save_manifest(src_path, &manifest);
             }
 
-            let current_idx = reverted;
             let pct = if total > 0 {
-                current_idx as f32 / total as f32
+                reverted as f32 / total as f32
             } else {
                 1.0
             };
-            on_progress(current_idx, total, pct);
+            on_progress(reverted, total, pct);
         }
     }
-
-    // Clean up any legacy junction subfolders created by previous versions
-    for entry in WalkDir::new(src_path).into_iter().filter_map(|e| e.ok()) {
-        let name = entry.file_name().to_string_lossy();
-        if name.contains("_Drive") {
-            let _ = fs::remove_dir(entry.path());
-        }
-    }
-
     reverted
 }
 

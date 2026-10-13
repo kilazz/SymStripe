@@ -19,7 +19,7 @@ import { TelemetryPanel } from "telemetry_panel.slint";
 
 export { StripeBlockUI }
 export component AppWindow inherits Window {
-    title: "SymStripe Studio - RAM Accelerated RAID-0 Optimizer";
+    title: "SymStripe Studio - RAM & Parallel Storage Accelerator";
     min-width: 1140px;
     min-height: 860px;
     preferred-width: 1200px;
@@ -30,13 +30,13 @@ export component AppWindow inherits Window {
     in-out property <[string]> profile_names: ["Default Profile"];
     in-out property <int> active_profile_idx: 0;
 
-    // Top Paradigm Architecture: 0 = In-Place Optimizer, 1 = Virtual Storage Pool
+    // Top Architecture Paradigm: 0 = In-Place Optimizer, 1 = Virtual Storage Pool
     in-out property <int> active_mode_idx: 0;
 
     // Paradigm 1: In-Place Game Optimizer Properties
     in-out property <string> primary_path: "";
     in-out property <[StandardListViewItem]> target_drives_list: [];
-    in-out property <string> min_size_mb_text: "50";
+    in-out property <string> min_size_mb_text: "64";
     in-out property <string> exclusions_text: "exe, dll, pdb, utoc, sig";
     in-out property <string> media_extensions_text: "bik, bk2, mp4, fsb, pck, wem";
     in-out property <bool> keep_backup: true;
@@ -47,10 +47,10 @@ export component AppWindow inherits Window {
     // Paradigm 2: Virtual Storage Pool Properties
     in-out property <[StandardListViewItem]> pool_members_list: [];
     in-out property <int> pool_policy_idx: 1; // 0 = Capacity (JBOD), 1 = Speed (RAID-0)
-    in-out property <int> pool_stripe_mb: 16;
+    in-out property <int> pool_stripe_mb: 64;
     in-out property <string> pool_mount_point: "Z:";
     in-out property <string> pool_custom_size_gb_text: "0";
-    in-out property <string> pool_ram_cache_mb_text: "1024";
+    in-out property <string> pool_ram_cache_mb_text: "2048";
     in-out property <bool> is_pool_mounted: false;
 
     // Enterprise VFS Features
@@ -74,7 +74,7 @@ export component AppWindow inherits Window {
     in-out property <string> smart_alert_text: "";
     in-out property <float> progress: 0.0;
     in-out property <bool> is_processing: false;
-    in-out property <string> log_text: "System ready. Select paradigm to begin.\n";
+    in-out property <string> log_text: "System initialized. Ready.\n";
     in-out property <string> status_msg: "Ready";
     in-out property <string> summary_text: "No files analyzed yet.";
     in-out property <[StandardListViewItem]> file_list: [];
@@ -143,14 +143,14 @@ export component AppWindow inherits Window {
                     horizontal-stretch: 0;
 
                     Text {
-                        text: "SYMSTRIPE PARALLEL ACCELERATOR";
+                        text: "SYMSTRIPE STUDIO - HIGH-THROUGHPUT STORAGE ACCELERATOR";
                         font-size: 12px;
                         font-weight: 800;
                         color: Theme.text-bright;
                     }
 
                     Text {
-                        text: "Multi-Spindle RAM-Accelerated I/O, VFS Zstd ATG Compression & Hardware Stripe Pools";
+                        text: "Multi-Spindle I/O, Unreal Engine 5 IoStore Stream Optimizer, and Zstd ATG VFS Pools";
                         font-size: 10px;
                         color: Theme.accent-cyan;
                     }
@@ -168,7 +168,7 @@ export component AppWindow inherits Window {
                 }
 
                 CustomButton {
-                    text: "Scan S.M.A.R.T. & Disks";
+                    text: "Scan S.M.A.R.T. Disks";
                     primary-color: Theme.border-card;
                     clicked => { root.scan_drives(); }
                 }
@@ -245,7 +245,7 @@ export component AppWindow inherits Window {
                         }
 
                         Card {
-                            title: "STORAGE ACCELERATION PARADIGM";
+                            title: "STORAGE ACCELERATION ARCHITECTURE";
                             header-color: Theme.accent-purple;
 
                             HorizontalLayout {
@@ -300,7 +300,7 @@ export component AppWindow inherits Window {
                             spacing: 12px;
 
                             Card {
-                                title: "PRIMARY DRIVE (GAME SOURCE DIRECTORY)";
+                                title: "PRIMARY DIRECTORY (ORIGINAL GAME ROOT)";
                                 header-color: Theme.accent-blue;
 
                                 HorizontalLayout {
@@ -308,7 +308,7 @@ export component AppWindow inherits Window {
                                     height: 30px;
                                     LineEdit {
                                         text <=> root.primary_path;
-                                        placeholder-text: "E:\\Games\\Gears of War E-Day\\GoWEDay";
+                                        placeholder-text: "E:\\Games\\GameTitle";
                                         enabled: !root.is_processing;
                                         edited(val) => { root.primary_folder_changed(val); }
                                     }
@@ -323,7 +323,7 @@ export component AppWindow inherits Window {
                             }
 
                             Card {
-                                title: "SECONDARY TARGET DRIVES (DESTINATIONS)";
+                                title: "SECONDARY TARGET DRIVES (DESTINATION SPINDLES)";
                                 header-color: Theme.accent-amber;
 
                                 VerticalLayout {
@@ -359,7 +359,7 @@ export component AppWindow inherits Window {
                                     HorizontalLayout {
                                         spacing: 6px;
                                         CustomButton {
-                                            text: "+ Add Target (e.g. F:\\zzz)";
+                                            text: "+ Add Target Drive";
                                             primary-color: Theme.accent-amber;
                                             enabled: !root.is_processing;
                                             clicked => { root.add_target_drive(); }
@@ -383,7 +383,7 @@ export component AppWindow inherits Window {
                             }
 
                             Card {
-                                title: "STRIPING RULES & COMPATIBILITY";
+                                title: "STREAMING ENGINE RULES & COMPATIBILITY";
                                 header-color: Theme.accent-emerald;
 
                                 HorizontalLayout {
@@ -416,7 +416,7 @@ export component AppWindow inherits Window {
                                     spacing: 8px;
                                     alignment: start;
                                     Text {
-                                        text: "Exclude Extensions:";
+                                        text: "Excluded Extensions:";
                                         vertical-alignment: center;
                                         font-size: 11px;
                                         color: Theme.text-main;
@@ -432,19 +432,19 @@ export component AppWindow inherits Window {
                                 VerticalLayout {
                                     spacing: 5px;
                                     CheckBox {
-                                        text: "Unreal Engine IoStore Safe Mode (Companion Sync & Protection)";
+                                        text: "Unreal Engine IoStore Mode (Pin .utoc/.sig to Primary, offload .ucas)";
                                         checked <=> root.ue5_safe_mode;
                                         enabled: !root.is_processing;
                                     }
 
                                     CheckBox {
-                                        text: "Keep local .backup on Drive 1 (Safe Mode)";
+                                        text: "Retain local .backup files on Primary Drive (Safe Mode)";
                                         checked <=> root.keep_backup;
                                         enabled: !root.is_processing;
                                     }
 
                                     CheckBox {
-                                        text: "Aggressive Media Offload (Force media to targets)";
+                                        text: "Aggressive Media Offload (Force .bik, .mp4, audio to secondary drives)";
                                         checked <=> root.aggressive_media;
                                         enabled: !root.is_processing;
                                     }
@@ -459,14 +459,14 @@ export component AppWindow inherits Window {
                                         padding: 8px;
                                         spacing: 4px;
                                         Text {
-                                            text: "⚠️ IMPORTANT: STEAM & EPIC VERIFICATION WARNING";
+                                            text: "⚠️ ADVISORY: STEAM & EPIC GAME VERIFICATION";
                                             font-size: 11px;
                                             font-weight: 700;
                                             color: #fbbf24;
                                         }
 
                                         Text {
-                                            text: "• Do NOT run 'Verify game files' in Steam/Epic while striped (the launcher will treat links as missing and re-download 50-100 GB).\n• Disable automatic updates (Steam: 'Only update this game when I launch it').\n• Always click 'Revert All to Primary' BEFORE installing game patches or DLCs!";
+                                            text: "• Do not run launcher 'Verify integrity' while files are striped (launchers may replace symlinks with full downloads).\n• Temporarily pause automatic background updates for optimized titles.\n• Always click 'Revert All to Primary' prior to applying official game patches!";
                                             font-size: 10px;
                                             color: #fde68a;
                                             wrap: word-wrap;
@@ -476,7 +476,7 @@ export component AppWindow inherits Window {
 
                                 HorizontalLayout {
                                     CustomButton {
-                                        text: "Analyze & Preview Split (Dry Run)";
+                                        text: "Analyze & Preview Distribution (Dry Run)";
                                         primary-color: #4a5d6e;
                                         enabled: !root.is_processing && !root.is_already_striped;
                                         clicked => {
@@ -549,7 +549,7 @@ export component AppWindow inherits Window {
                                     HorizontalLayout {
                                         spacing: 6px;
                                         CustomButton {
-                                            text: "+ Add Pool Folder (e.g. E:\\Pool, F:\\Pool)";
+                                            text: "+ Add Pool Folder (e.g., E:\\Pool, F:\\Pool)";
                                             primary-color: Theme.accent-purple;
                                             enabled: !root.is_pool_mounted && !root.is_processing;
                                             clicked => { root.add_pool_member(); }
@@ -566,7 +566,7 @@ export component AppWindow inherits Window {
                             }
 
                             Card {
-                                title: "POOL ALLOCATION STRATEGY";
+                                title: "POOL ALLOCATION & STRIPING STRATEGY";
                                 header-color: Theme.accent-purple;
 
                                 HorizontalLayout {
@@ -600,7 +600,7 @@ export component AppWindow inherits Window {
                                         border-width: 1px;
                                         border-color: root.pool_policy_idx == 1 ? #c084fc : Theme.border-card;
                                         Text {
-                                            text: "⚡ Speed (RAID-0 Striping + RAM)";
+                                            text: "⚡ Speed (RAID-0 + RAM Cache)";
                                             font-size: 11px;
                                             font-weight: 700;
                                             color: root.pool_policy_idx == 1 ? Theme.text-bright : Theme.text-muted;
@@ -617,35 +617,13 @@ export component AppWindow inherits Window {
 
                                 if root.pool_policy_idx == 1: HorizontalLayout {
                                     height: 30px;
-                                    spacing: 8px;
+                                    spacing: 6px;
                                     alignment: start;
                                     Text {
-                                        text: "Stripe Extent Block Size:";
+                                        text: "HDD Stripe Block:";
                                         vertical-alignment: center;
                                         font-size: 11px;
                                         color: Theme.text-main;
-                                    }
-
-                                    Rectangle {
-                                        width: 55px;
-                                        height: 26px;
-                                        background: root.pool_stripe_mb == 4 ? Theme.accent-purple : Theme.surface-nested;
-                                        border-radius: 3px;
-                                        border-width: 1px;
-                                        border-color: root.pool_stripe_mb == 4 ? #c084fc : Theme.border-card;
-                                        Text {
-                                            text: "4 MB";
-                                            font-size: 10px;
-                                            font-weight: 700;
-                                            color: Theme.text-bright;
-                                            horizontal-alignment: center;
-                                            vertical-alignment: center;
-                                        }
-
-                                        TouchArea {
-                                            enabled: !root.is_pool_mounted && !root.is_processing;
-                                            clicked => { root.pool_stripe_mb = 4; root.pool_stripe_changed(4); }
-                                        }
                                     }
 
                                     Rectangle {
@@ -671,14 +649,14 @@ export component AppWindow inherits Window {
                                     }
 
                                     Rectangle {
-                                        width: 55px;
+                                        width: 95px;
                                         height: 26px;
-                                        background: root.pool_stripe_mb == 64 ? Theme.accent-purple : Theme.surface-nested;
+                                        background: root.pool_stripe_mb == 64 ? Theme.accent-emerald : Theme.surface-nested;
                                         border-radius: 3px;
                                         border-width: 1px;
-                                        border-color: root.pool_stripe_mb == 64 ? #c084fc : Theme.border-card;
+                                        border-color: root.pool_stripe_mb == 64 ? #34d399 : Theme.border-card;
                                         Text {
-                                            text: "64 MB";
+                                            text: "★ 64 MB (HDD)";
                                             font-size: 10px;
                                             font-weight: 700;
                                             color: Theme.text-bright;
@@ -689,6 +667,50 @@ export component AppWindow inherits Window {
                                         TouchArea {
                                             enabled: !root.is_pool_mounted && !root.is_processing;
                                             clicked => { root.pool_stripe_mb = 64; root.pool_stripe_changed(64); }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        width: 65px;
+                                        height: 26px;
+                                        background: root.pool_stripe_mb == 128 ? Theme.accent-purple : Theme.surface-nested;
+                                        border-radius: 3px;
+                                        border-width: 1px;
+                                        border-color: root.pool_stripe_mb == 128 ? #c084fc : Theme.border-card;
+                                        Text {
+                                            text: "128 MB";
+                                            font-size: 10px;
+                                            font-weight: 700;
+                                            color: Theme.text-bright;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+
+                                        TouchArea {
+                                            enabled: !root.is_pool_mounted && !root.is_processing;
+                                            clicked => { root.pool_stripe_mb = 128; root.pool_stripe_changed(128); }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        width: 65px;
+                                        height: 26px;
+                                        background: root.pool_stripe_mb == 256 ? Theme.accent-purple : Theme.surface-nested;
+                                        border-radius: 3px;
+                                        border-width: 1px;
+                                        border-color: root.pool_stripe_mb == 256 ? #c084fc : Theme.border-card;
+                                        Text {
+                                            text: "256 MB";
+                                            font-size: 10px;
+                                            font-weight: 700;
+                                            color: Theme.text-bright;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+
+                                        TouchArea {
+                                            enabled: !root.is_pool_mounted && !root.is_processing;
+                                            clicked => { root.pool_stripe_mb = 256; root.pool_stripe_changed(256); }
                                         }
                                     }
                                 }
@@ -759,7 +781,7 @@ export component AppWindow inherits Window {
                                     }
 
                                     Text {
-                                        text: "Raw uncompressed RAM buffer";
+                                        text: "High-speed RAM buffer";
                                         vertical-alignment: center;
                                         font-size: 10px;
                                         color: Theme.text-muted;
@@ -769,7 +791,7 @@ export component AppWindow inherits Window {
                                 HorizontalLayout {
                                     spacing: 6px;
                                     CustomButton {
-                                        text: root.is_pool_mounted ? "🛑 Stop & Unmount Virtual Pool" : "🚀 Mount Virtual Storage Pool (" + root.pool_mount_point + ")";
+                                        text: root.is_pool_mounted ? "🛑 Stop & Unmount Pool" : "🚀 Mount Virtual Storage Pool (" + root.pool_mount_point + ")";
                                         primary-color: root.is_pool_mounted ? Theme.primary : Theme.accent-purple;
                                         enabled: !root.is_processing;
                                         clicked => {
@@ -789,7 +811,7 @@ export component AppWindow inherits Window {
                                 }
 
                                 Card {
-                                    title: "TRANSPARENT ON-THE-FLY COMPRESSION (ZSTD ATG 256K)";
+                                    title: "ON-THE-FLY COMPRESSION & ASSET TIERING";
                                     header-color: Theme.accent-purple;
 
                                     VerticalLayout {
@@ -806,14 +828,14 @@ export component AppWindow inherits Window {
 
                                             ComboBox {
                                                 width: 220px;
-                                                model: ["LZ4 (High Speed)", "Zstd ATG (256K L3 Cache Bound)", "Store (Raw)"];
+                                                model: ["LZ4 (High Speed)", "Zstd ATG (256K Cache Bound)", "Store (Raw)"];
                                                 current-index <=> root.vfs_codec_index;
                                                 enabled: !root.is_pool_mounted && !root.is_processing;
                                             }
                                         }
 
                                         CheckBox {
-                                            text: "Tiered Storage (Hot on NVMe, Cold/Video on HDD)";
+                                            text: "Tiered Storage (Keep IoStore metadata on Drive 1, bulk on secondary)";
                                             checked <=> root.tiered_storage_enabled;
                                             enabled: !root.is_pool_mounted && !root.is_processing;
                                         }
@@ -825,7 +847,7 @@ export component AppWindow inherits Window {
                                         }
 
                                         Text {
-                                            text: "Mount drive " + root.pool_mount_point + " and set it as your Steam library. DirectStorage-grade Zstd ATG bounds window memory to 256 KB, eliminating CPU cache thrashing during high-speed gaming reads.";
+                                            text: "Mount drive " + root.pool_mount_point + " as your game target. DirectStorage-grade Zstd ATG caps internal sliding memory to 256 KB, ensuring zero L3 cache thrashing and sustained read bandwidth on mechanical disks.";
                                             font-size: 11px;
                                             color: Theme.text-muted;
                                             wrap: word-wrap;
@@ -838,7 +860,7 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // RIGHT DISPLAY PANEL (DUAL VIEW: TREE VIEW vs RAID-0 PHYSICAL BLOCK MAP)
+            // RIGHT DISPLAY PANEL (FILE TREE VIEW & RAID-0 BLOCK MAP)
             VerticalLayout {
                 spacing: 8px;
                 horizontal-stretch: 1;
@@ -854,7 +876,6 @@ export component AppWindow inherits Window {
                         padding: 8px;
                         spacing: 6px;
 
-                        // Top View Mode Toolbar
                         HorizontalLayout {
                             alignment: space-between;
                             HorizontalLayout {
@@ -932,7 +953,6 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // View 0: Classical List Tree View
                         if root.right_display_mode == 0: ListView {
                             for item in root.file_list: Rectangle {
                                 height: 22px;
@@ -956,7 +976,6 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // View 1: Interactive RAID-0 Block Map Matrix
                         if root.right_display_mode == 1: BlockMap {
                             blocks: root.visualizer_blocks;
                             selected_block_idx <=> root.selected_block_idx;
@@ -976,7 +995,7 @@ export component AppWindow inherits Window {
                         padding: 8px;
                         spacing: 4px;
                         Text {
-                            text: "TERMINAL EXECUTION LOG";
+                            text: "SYSTEM & EXECUTION LOG";
                             font-size: 10px;
                             font-weight: 700;
                             color: Theme.accent-amber;
@@ -991,7 +1010,6 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // Real-Time I/O Activity Telemetry Panel Component
                 TelemetryPanel {
                     drive1_label: root.drive1_label;
                     drive2_label: root.drive2_label;
