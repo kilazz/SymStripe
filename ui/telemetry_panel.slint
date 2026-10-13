@@ -1,0 +1,178 @@
+import { Theme, LegendBadge } from "theme.slint";
+
+export component TelemetryPanel inherits Rectangle {
+    in property <string> drive1_label: "Drive 1 (Primary)";
+    in property <string> drive2_label: "Drive 2 (Secondary)";
+    in property <string> drive1_speed_text: "0.0 MB/s";
+    in property <string> drive2_speed_text: "0.0 MB/s";
+    in property <float> drive1_load_pct: 0.0;
+    in property <float> drive2_load_pct: 0.0;
+    in property <string> total_io_text: "0.0 MB/s";
+    in property <bool> is_io_active: false;
+    in property <string> cache_hit_rate_text: "0.0%";
+    in property <string> saved_space_text: "0.00 GB";
+
+    height: 125px;
+    background: Theme.surface-nested;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: Theme.border-card;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 6px;
+
+        HorizontalLayout {
+            alignment: space-between;
+            Text {
+                text: "LIVE I/O THROUGHPUT (REAL-TIME RAID-0 TELEMETRY)";
+                font-size: 10px;
+                font-weight: 700;
+                color: Theme.text-muted;
+                vertical-alignment: center;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                Rectangle {
+                    height: 16px;
+                    background: root.is_io_active ? #064e3b : #202124;
+                    border-radius: 3px;
+                    border-width: 1px;
+                    border-color: root.is_io_active ? Theme.accent-emerald : Theme.border-card;
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        alignment: center;
+                        Text {
+                            text: root.is_io_active ? "● ACTIVE" : "○ IDLE";
+                            font-size: 9px;
+                            font-weight: 800;
+                            color: root.is_io_active ? #34d399 : #808080;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Total: " + root.total_io_text;
+                    font-family: "Consolas";
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: root.is_io_active ? #4ade80 : Theme.text-muted;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // Drive 1 Meter
+        VerticalLayout {
+            spacing: 2px;
+            HorizontalLayout {
+                alignment: space-between;
+                LegendBadge {
+                    badge-color: Theme.accent-blue;
+                    label: root.drive1_label;
+                }
+
+                Text {
+                    text: root.drive1_speed_text;
+                    font-family: "Consolas";
+                    font-size: 10px;
+                    font-weight: 700;
+                    color: Theme.accent-blue;
+                }
+            }
+
+            Rectangle {
+                height: 8px;
+                background: Theme.surface-dark;
+                border-radius: 2px;
+                Rectangle {
+                    x: 0px;
+                    width: parent.width * root.drive1_load_pct;
+                    height: parent.height;
+                    background: Theme.accent-blue;
+                    border-radius: 2px;
+                }
+            }
+        }
+
+        // Drive 2 Meter
+        VerticalLayout {
+            spacing: 2px;
+            HorizontalLayout {
+                alignment: space-between;
+                LegendBadge {
+                    badge-color: Theme.accent-purple;
+                    label: root.drive2_label;
+                }
+
+                Text {
+                    text: root.drive2_speed_text;
+                    font-family: "Consolas";
+                    font-size: 10px;
+                    font-weight: 700;
+                    color: Theme.accent-purple;
+                }
+            }
+
+            Rectangle {
+                height: 8px;
+                background: Theme.surface-dark;
+                border-radius: 2px;
+                Rectangle {
+                    x: 0px;
+                    width: parent.width * root.drive2_load_pct;
+                    height: parent.height;
+                    background: Theme.accent-purple;
+                    border-radius: 2px;
+                }
+            }
+        }
+
+        // RAM Cache Metrics
+        HorizontalLayout {
+            padding-top: 4px;
+            spacing: 16px;
+            alignment: start;
+
+            HorizontalLayout {
+                spacing: 4px;
+                Text {
+                    text: "RAM Cache Hit Rate:";
+                    color: Theme.text-muted;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.cache_hit_rate_text;
+                    color: Theme.accent-emerald;
+                    font-size: 11px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 4px;
+                Text {
+                    text: "Saved Space (LZ4/ATG):";
+                    color: Theme.text-muted;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.saved_space_text;
+                    color: Theme.accent-cyan;
+                    font-size: 11px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

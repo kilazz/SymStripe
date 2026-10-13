@@ -1,0 +1,225 @@
+import { Theme, StripeBlockUI, LegendBadge } from "theme.slint";
+import { ComboBox, ScrollView } from "std-widgets.slint";
+
+export component BlockMap inherits VerticalLayout {
+    in property <[StripeBlockUI]> blocks: [];
+    in-out property <int> selected_block_idx: -1;
+    in-out property <int> density_mode_idx: 0;
+
+    callback block_clicked(int);
+
+    spacing: 8px;
+
+    map-focus-scope := FocusScope {
+        property <length> avail-w: max(200px, self.width - 32px);
+        property <length> avail-h: max(150px, self.height - 110px);
+        property <int> total-n: max(1, root.blocks.length);
+
+        property <float> est-pitch-val: Math.sqrt((self.avail-w / 1px) * (self.avail-h / 1px) / self.total-n);
+        property <length> auto-pitch: max(2.5px, min(24px, self.est-pitch-val * 0.95px));
+
+        property <length> pitch: root.density_mode_idx == 1 ? 3px : (
+            root.density_mode_idx == 2 ? 5px : (
+            root.density_mode_idx == 3 ? 9px : (
+            root.density_mode_idx == 4 ? 16px : self.auto-pitch)));
+
+        property <int> cols: max(1, Math.floor(self.avail-w / self.pitch));
+
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow) {
+                if (root.selected_block_idx > 0) {
+                    root.selected_block_idx -= 1;
+                    root.block_clicked(root.selected_block_idx);
+                }
+                return accept;
+            }
+            if (event.text == Key.RightArrow) {
+                if (root.selected_block_idx < root.blocks.length - 1) {
+                    root.selected_block_idx += 1;
+                    root.block_clicked(root.selected_block_idx);
+                }
+                return accept;
+            }
+            if (event.text == Key.UpArrow) {
+                if (root.selected_block_idx >= self.cols) {
+                    root.selected_block_idx -= self.cols;
+                    root.block_clicked(root.selected_block_idx);
+                }
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                if (root.selected_block_idx + self.cols < root.blocks.length) {
+                    root.selected_block_idx += self.cols;
+                    root.block_clicked(root.selected_block_idx);
+                }
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            spacing: 8px;
+
+            // Legend Bar
+            HorizontalLayout {
+                spacing: 12px;
+                alignment: start;
+
+                Text {
+                    text: "Storage Topology (" + root.blocks.length + " chunks):";
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: Theme.accent-cyan;
+                    vertical-alignment: center;
+                }
+
+                LegendBadge {
+                    badge-color: Theme.accent-blue;
+                    label: "Drive 1 (Primary)";
+                }
+
+                LegendBadge {
+                    badge-color: Theme.accent-purple;
+                    label: "Drive 2 (Secondary)";
+                }
+
+                LegendBadge {
+                    badge-color: Theme.accent-amber;
+                    label: "Drive 3+";
+                }
+
+                LegendBadge {
+                    badge-color: Theme.accent-emerald;
+                    label: "★ RAM Accelerated";
+                }
+            }
+
+            // Interactive Canvas Matrix
+            Rectangle {
+                background: Theme.surface-nested;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: #24242C;
+                vertical-stretch: 1;
+
+                ScrollView {
+                    map-container := Rectangle {
+                        width: 100%;
+                        property <length> pitch: map-focus-scope.pitch;
+                        property <int> cols: map-focus-scope.cols;
+                        property <length> block-size: max(1.5px, self.pitch - (self.pitch >= 9px ? 2px : (self.pitch >= 4px ? 1px : 0px)));
+
+                        height: max(parent.height, 20px + Math.ceil(root.blocks.length / self.cols) * self.pitch);
+
+                        for blk[b-idx] in root.blocks: Rectangle {
+                            x: 10px + Math.mod(b-idx, map-container.cols) * map-container.pitch;
+                            y: 10px + Math.floor(b-idx / map-container.cols) * map-container.pitch;
+                            width: map-container.block-size;
+                            height: map-container.block-size;
+                            border-radius: map-container.pitch >= 8px ? 2px : 0px;
+                            background: blk.color_drive;
+                            border-width: root.selected_block_idx == b-idx ? (map-container.pitch >= 6px ? 2px : 1px) : (b-touch.has-hover ? 1px : 0px);
+                            border-color: root.selected_block_idx == b-idx ? #00E5FF : #FFFFFF;
+
+                            if blk.is_cached && map-container.pitch >= 8px: Rectangle {
+                                x: 1px;
+                                y: 1px;
+                                width: max(2px, map-container.block-size * 0.35);
+                                height: max(2px, map-container.block-size * 0.35);
+                                border-radius: 1px;
+                                background: #10B981;
+                            }
+
+                            b-touch := TouchArea {
+                                clicked => {
+                                    map-focus-scope.focus();
+                                    root.selected_block_idx = b-idx;
+                                    root.block_clicked(b-idx);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Telemetry Inspector Card
+            Rectangle {
+                height: 64px;
+                background: Theme.surface-card;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: Theme.border-card;
+
+                if root.selected_block_idx >= 0: HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 16px;
+                    alignment: space-between;
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        Text {
+                            text: "Chunk #" + (root.selected_block_idx + 1) + ": " + root.blocks[root.selected_block_idx].file_name;
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: Theme.accent-cyan;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: "Physical Offset: " + root.blocks[root.selected_block_idx].offset_str;
+                            font-family: "Consolas";
+                            font-size: 10px;
+                            color: #A7F3D0;
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        Text {
+                            text: "Allocation: " + root.blocks[root.selected_block_idx].drive_name;
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: root.blocks[root.selected_block_idx].color_drive;
+                        }
+
+                        Text {
+                            text: "Block Size: " + root.blocks[root.selected_block_idx].size_str;
+                            font-size: 10px;
+                            color: Theme.text-muted;
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        Text {
+                            text: "Status: " + root.blocks[root.selected_block_idx].status_str;
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: root.blocks[root.selected_block_idx].is_cached ? #34D399 : Theme.text-main;
+                        }
+
+                        Text {
+                            text: root.blocks[root.selected_block_idx].is_cached ? "★ Hot in RAM Cache (Sub-microsecond)" : "Direct NVMe Storage Layer";
+                            font-size: 10px;
+                            color: Theme.text-dim;
+                        }
+                    }
+                }
+
+                if root.selected_block_idx < 0: VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "Click any block above to inspect physical drive allocation, chunk offset, and RAM cache residency.";
+                        font-size: 11px;
+                        color: Theme.text-dim;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}
