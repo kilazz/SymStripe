@@ -13,7 +13,7 @@ fn default_zero() -> i32 {
     0
 }
 fn default_pool_policy() -> i32 {
-    1
+    1 // 0 = JBOD, 1 = RAID-0 (Striped), 2 = RAID-1 (Mirror)
 }
 fn default_stripe_mb() -> u32 {
     64 // Optimal 64 MB default stripe size for HDDs and large container archives

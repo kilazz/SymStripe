@@ -141,7 +141,7 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
             d2_max, d2_lat
         ));
 
-        // Natively invoke Windows clipboard utility
+        // Natively invoke Windows clipboard utility (Collapsed IF for Clippy)
         use std::io::Write;
         use std::process::{Command, Stdio};
         if let Ok(mut child) = Command::new("clip").stdin(Stdio::piped()).spawn()
@@ -844,10 +844,10 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
             prof.pool_policy = policy_idx;
             save_config(&st.config);
         }
-        let policy_name = if policy_idx == 0 {
-            "Capacity (JBOD Merge Free Space)"
-        } else {
-            "Speed (RAID-0 Block Striping)"
+        let policy_name = match policy_idx {
+            0 => "Capacity (JBOD Merge Free Space)",
+            1 => "Speed (RAID-0 Block Striping)",
+            _ => "Performance Mirror (RAID-1 Read Load Balancing)",
         };
         append_log(
             &weak,
@@ -926,7 +926,7 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
         };
 
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            ui.set_pool_custom_size_gb_text("0".into());
+            ui.set_pool_custom_size_gb_text(calculated_gb.to_string().into());
         });
 
         let policy_str = if policy == 1 {
