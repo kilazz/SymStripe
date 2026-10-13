@@ -282,6 +282,20 @@ impl SymStripePoolFs {
         fs
     }
 
+    #[inline]
+    fn add_used_bytes(&self, val: u64) {
+        self.pool_used_bytes.fetch_add(val, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn sub_used_bytes(&self, val: u64) {
+        let _ = self
+            .pool_used_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+                Some(x.saturating_sub(val))
+            });
+    }
+
     fn log(&self, msg: String) {
         if let Some(cb) = &self.logger {
             cb(msg);
@@ -486,12 +500,11 @@ impl SymStripePoolFs {
 
         let new_len = compressed.len() as u64;
         let diff = new_len as i64 - old_len as i64;
+
         if diff > 0 {
-            self.pool_used_bytes
-                .fetch_add(diff as u64, Ordering::Relaxed);
+            self.add_used_bytes(diff as u64);
         } else if diff < 0 {
-            self.pool_used_bytes
-                .fetch_sub((-diff) as u64, Ordering::Relaxed);
+            self.sub_used_bytes((-diff) as u64);
         }
 
         self.raw_bytes_written
@@ -1107,9 +1120,11 @@ impl FileSystemContext for SymStripePoolFs {
 
             let new_len = fs::metadata(&p_first).map(|m| m.len()).unwrap_or(old_len);
             let diff = new_len as i64 - old_len as i64;
+
             if diff > 0 {
-                self.pool_used_bytes
-                    .fetch_add(diff as u64, Ordering::Relaxed);
+                self.add_used_bytes((diff as u64) * (node.present_on.len() as u64));
+            } else if diff < 0 {
+                self.sub_used_bytes(((-diff) as u64) * (node.present_on.len() as u64));
             }
         } else {
             let buffer_len = buffer.len();
@@ -1430,7 +1445,7 @@ impl FileSystemContext for SymStripePoolFs {
                                 if let Ok(m) = entry.metadata()
                                     && m.is_file()
                                 {
-                                    self.pool_used_bytes.fetch_sub(m.len(), Ordering::Relaxed);
+                                    self.sub_used_bytes(m.len());
                                 }
                             }
                             let _ = fs::remove_dir_all(dir);
@@ -1450,7 +1465,7 @@ impl FileSystemContext for SymStripePoolFs {
                 if node.is_striped {
                     let meta_p = self.meta_path(&rel);
                     if let Ok(m) = fs::metadata(&meta_p) {
-                        self.pool_used_bytes.fetch_sub(m.len(), Ordering::Relaxed);
+                        self.sub_used_bytes(m.len());
                     }
                     let _ = fs::remove_file(meta_p);
 
@@ -1481,8 +1496,7 @@ impl FileSystemContext for SymStripePoolFs {
                                     let n = entry.file_name().to_string_lossy().to_string();
                                     if n.starts_with(&prefix) {
                                         if let Ok(m) = entry.metadata() {
-                                            self.pool_used_bytes
-                                                .fetch_sub(m.len(), Ordering::Relaxed);
+                                            self.sub_used_bytes(m.len());
                                         }
                                         let _ = fs::remove_file(entry.path());
                                     }
@@ -1491,15 +1505,16 @@ impl FileSystemContext for SymStripePoolFs {
                         }
                     }
                 } else {
+                    let mut total_del = 0;
                     for &member_idx in &node.present_on {
                         let target_p = self.members[member_idx].join(&rel);
+                        if let Ok(m) = fs::metadata(&target_p) {
+                            total_del += m.len();
+                        }
                         let _ = fs::remove_file(&target_p);
                     }
-                    if let Some(&first_idx) = node.present_on.first()
-                        && let Ok(m) = fs::metadata(self.members[first_idx].join(&rel))
-                    {
-                        self.pool_used_bytes.fetch_sub(m.len(), Ordering::Relaxed);
-                    }
+                    self.sub_used_bytes(total_del);
+
                     if node.present_on.len() == 1 && node.present_on[0] != 0 {
                         self.jbod_map.write().remove(&rel.to_lowercase());
                         self.save_jbod_catalog();
@@ -1619,13 +1634,17 @@ impl FileSystemContext for SymStripePoolFs {
         let rel = node.rel_path();
 
         if !node.is_striped {
+            let mut size_diff = 0i64;
             for &member_idx in &node.present_on {
+                let p = self.members[member_idx].join(&rel);
+                let old_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+
                 let _spindle_guard = self.spindle_locks[member_idx].lock();
-                let _ = OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(self.members[member_idx].join(&rel));
+                let _ = OpenOptions::new().write(true).truncate(true).open(&p);
+
+                size_diff -= old_len as i64;
             }
+            self.sub_used_bytes((-size_diff) as u64);
         } else {
             self.save_meta_size(&rel, 0);
         }
@@ -1663,14 +1682,22 @@ impl FileSystemContext for SymStripePoolFs {
         let rel = node.rel_path();
 
         if !node.is_striped {
+            let mut size_diff = 0i64;
             for &member_idx in &node.present_on {
+                let p = self.members[member_idx].join(&rel);
+                let old_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+
                 let _spindle_guard = self.spindle_locks[member_idx].lock();
-                if let Ok(f) = OpenOptions::new()
-                    .write(true)
-                    .open(self.members[member_idx].join(&rel))
-                {
+                if let Ok(f) = OpenOptions::new().write(true).open(&p) {
                     let _ = f.set_len(new_size);
+                    let new_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(new_size);
+                    size_diff += (new_len as i64) - (old_len as i64);
                 }
+            }
+            if size_diff > 0 {
+                self.add_used_bytes(size_diff as u64);
+            } else if size_diff < 0 {
+                self.sub_used_bytes((-size_diff) as u64);
             }
         } else {
             self.save_meta_size(&rel, new_size);
@@ -1904,9 +1931,9 @@ pub fn mount_storage_pool(
     vp.flush_and_purge_on_cleanup(true);
 
     // Deep kernel metadata caching to slash user-mode context switching CPU overhead
-    vp.file_info_timeout(30000);
-    vp.dir_info_timeout(30000);
-    vp.volume_info_timeout(30000);
+    vp.file_info_timeout(1000);
+    vp.dir_info_timeout(1000);
+    vp.volume_info_timeout(1000);
     vp.post_cleanup_when_modified_only(true);
 
     let mut host =
