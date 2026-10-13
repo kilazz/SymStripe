@@ -43,18 +43,28 @@ impl StripeConfig {
     /// Decomposes an arbitrary linear file I/O request (offset + length)
     /// into discrete sub-requests aligned across the storage array drives.
     ///
-    /// If a request spans across stripe boundaries or drive transitions,
-    /// it is automatically split into consecutive per-drive slices.
-    pub fn map_io_slices(&self, global_offset: u64, len: usize) -> Vec<StripeSlice> {
+    /// The `file_hash` parameter shifts the starting drive index, ensuring perfect
+    /// 50/50 spindle load balancing even for thousands of tiny files (< stripe_size).
+    pub fn map_io_slices(
+        &self,
+        file_hash: u64,
+        global_offset: u64,
+        len: usize,
+    ) -> Vec<StripeSlice> {
         let mut slices = Vec::new();
         let mut curr_offset = global_offset;
         let mut remaining = len;
 
+        // The hash acts as a permanent deterministic shift for this specific file
+        let drive_shift = (file_hash % (self.num_drives as u64)) as usize;
+
         while remaining > 0 {
             // Global sequential stripe index across the file
             let stripe_idx = curr_offset / self.stripe_size_bytes;
-            // Target drive determined by round-robin distribution
-            let target_drive_idx = (stripe_idx as usize) % self.num_drives;
+
+            // Target drive determined by round-robin distribution WITH initial file hash shift
+            let target_drive_idx = ((stripe_idx as usize) + drive_shift) % self.num_drives;
+
             // Offset within the current stripe block
             let offset_in_stripe = curr_offset % self.stripe_size_bytes;
 
@@ -83,8 +93,9 @@ mod tests {
 
     #[test]
     fn test_single_drive_slice() {
-        let config = StripeConfig::new(4 * 1024 * 1024, 2); // 4 MB stripe, 2 drives
-        let slices = config.map_io_slices(0, 1024 * 1024); // 1 MB read at offset 0
+        let config = StripeConfig::new(4 * 1024 * 1024, 2);
+        // file_hash = 0 (Starts on Drive 0)
+        let slices = config.map_io_slices(0, 0, 1024 * 1024);
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].target_drive_idx, 0);
         assert_eq!(slices[0].part_index, 0);
@@ -93,10 +104,20 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_shifted_start() {
+        let config = StripeConfig::new(4 * 1024 * 1024, 2);
+        // file_hash = 1 (Starts shifted to Drive 1)
+        let slices = config.map_io_slices(1, 0, 1024 * 1024);
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].target_drive_idx, 1);
+        assert_eq!(slices[0].part_index, 0);
+    }
+
+    #[test]
     fn test_cross_boundary_stripe_split() {
-        let config = StripeConfig::new(4 * 1024 * 1024, 2); // 4 MB stripe, 2 drives
-        // 2 MB read starting at offset 3 MB (crosses 4 MB boundary into Drive 1)
-        let slices = config.map_io_slices(3 * 1024 * 1024, 2 * 1024 * 1024);
+        let config = StripeConfig::new(4 * 1024 * 1024, 2);
+        // file_hash = 0
+        let slices = config.map_io_slices(0, 3 * 1024 * 1024, 2 * 1024 * 1024);
         assert_eq!(slices.len(), 2);
 
         // First slice: 1 MB on Drive 0
@@ -114,9 +135,9 @@ mod tests {
 
     #[test]
     fn test_multi_drive_wraparound() {
-        let config = StripeConfig::new(1024, 3); // 1 KB stripe, 3 drives
-        // 4 KB read starting at offset 512 (spans across 4 stripes over 3 drives)
-        let slices = config.map_io_slices(512, 4096);
+        let config = StripeConfig::new(1024, 3);
+        // file_hash = 0
+        let slices = config.map_io_slices(0, 512, 4096);
         assert_eq!(slices.len(), 5);
         assert_eq!(slices[0].target_drive_idx, 0); // 512..1024 (512 bytes)
         assert_eq!(slices[1].target_drive_idx, 1); // 1024..2048 (1024 bytes)

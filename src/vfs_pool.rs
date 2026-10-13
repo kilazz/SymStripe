@@ -49,7 +49,7 @@ impl VfsCodec {
     }
 }
 
-fn hash_path_id(rel_path: &str) -> u64 {
+pub fn hash_path_id(rel_path: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     rel_path.to_lowercase().hash(&mut hasher);
     hasher.finish()
@@ -131,6 +131,7 @@ pub struct CachedPart {
 /// File Control Block (FCB) — global file node shared across all open handles
 pub struct FileNode {
     pub rel_path: RwLock<String>,
+    pub file_hash: u64,
     pub is_striped: bool,
     pub member_idx: usize,
     pub file_codec: VfsCodec,
@@ -165,18 +166,20 @@ impl FileNode {
 
         let rel = self.rel_path();
         let p = member_root.join(&rel);
+
         let mut opts = OpenOptions::new();
         opts.read(true);
         if for_write {
             opts.write(true).create(true);
         } else {
-            opts.write(true);
+            opts.write(true); // Attempt write, fallback below if locked
         }
 
         let file = opts
             .open(&p)
             .or_else(|_| OpenOptions::new().read(true).open(&p))
             .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+
         let arc_file = Arc::new(file);
         *guard = Some(arc_file.clone());
         Ok(arc_file)
@@ -399,6 +402,7 @@ impl SymStripePoolFs {
         let node = map.entry(key).or_insert_with(|| {
             Arc::new(FileNode {
                 rel_path: RwLock::new(rel_path.to_string()),
+                file_hash: hash_path_id(rel_path),
                 is_striped,
                 member_idx,
                 file_codec,
@@ -434,12 +438,17 @@ impl SymStripePoolFs {
     fn evict_part_to_disk(
         &self,
         rel_path: &str,
+        file_hash: u64,
         part_index: u64,
         part_arc: Arc<RwLock<CachedPart>>,
     ) {
         let mut part = part_arc.write();
         if part.dirty {
-            let target_drive_idx = (part_index as usize) % self.members.len();
+            // Apply Hash-Shift for 50/50 Multi-Disk Balancing
+            let num_drives = self.members.len() as u64;
+            let drive_shift = file_hash % num_drives;
+            let target_drive_idx = ((part_index + drive_shift) % num_drives) as usize;
+
             let ext = match part.codec {
                 VfsCodec::Lz4 => "lz4",
                 VfsCodec::Zstd => "zst",
@@ -470,6 +479,8 @@ impl SymStripePoolFs {
 
     pub fn flush_node_dirty_parts(&self, node: &FileNode) {
         let rel = node.rel_path();
+        let f_hash = node.file_hash;
+
         let parts: Vec<(u64, Arc<RwLock<CachedPart>>)> = node
             .cached_parts
             .lock()
@@ -478,7 +489,7 @@ impl SymStripePoolFs {
             .collect();
 
         for (part_index, part_arc) in parts {
-            self.evict_part_to_disk(&rel, part_index, part_arc);
+            self.evict_part_to_disk(&rel, f_hash, part_index, part_arc);
         }
     }
 
@@ -522,7 +533,7 @@ impl SymStripePoolFs {
                 }
             }
             if let Some(evicted) = cache.remove(&lru_key) {
-                self.evict_part_to_disk(&node.rel_path(), lru_key, evicted);
+                self.evict_part_to_disk(&node.rel_path(), node.file_hash, lru_key, evicted);
             }
         }
 
@@ -906,7 +917,9 @@ impl FileSystemContext for SymStripePoolFs {
             }
         } else {
             let buffer_len = buffer.len();
-            let slices = self.stripe_config.map_io_slices(write_offset, buffer_len);
+            let slices = self
+                .stripe_config
+                .map_io_slices(node.file_hash, write_offset, buffer_len);
             let mut tasks = Vec::with_capacity(slices.len());
             let mut remaining_buf = buffer;
 
@@ -996,7 +1009,8 @@ impl FileSystemContext for SymStripePoolFs {
 
             if new_size < old_size {
                 let stripe_size = self.stripe_config.stripe_size_bytes;
-                let num_drives = self.members.len();
+                let num_drives = self.members.len() as u64;
+                let f_hash = node.file_hash;
 
                 let old_max_part = old_size.saturating_sub(1) / stripe_size;
                 let new_max_part = if new_size == 0 {
@@ -1014,7 +1028,9 @@ impl FileSystemContext for SymStripePoolFs {
 
                 for part_idx in start_del_part..=old_max_part {
                     part_cache.remove(&part_idx);
-                    let target_drive_idx = (part_idx as usize) % num_drives;
+                    let drive_shift = f_hash % num_drives;
+                    let target_drive_idx = ((part_idx + drive_shift) % num_drives) as usize;
+
                     for ext in ["lz4", "zst", "raw"] {
                         let part_filename = format!("{}.part{}.{}", rel, part_idx, ext);
                         let part_path = self.members[target_drive_idx].join(part_filename);
@@ -1028,7 +1044,9 @@ impl FileSystemContext for SymStripePoolFs {
                         part_arc.write().data.truncate(rem_len as usize);
                         part_arc.write().dirty = true;
                     } else {
-                        let target_drive_idx = (boundary_idx as usize) % num_drives;
+                        let drive_shift = f_hash % num_drives;
+                        let target_drive_idx = ((boundary_idx + drive_shift) % num_drives) as usize;
+
                         let lz4_path = self.members[target_drive_idx]
                             .join(format!("{}.part{}.lz4", rel, boundary_idx));
                         let zst_path = self.members[target_drive_idx]
@@ -1383,7 +1401,9 @@ impl FileSystemContext for SymStripePoolFs {
             return Ok(bytes_read as u32);
         }
 
-        let slices = self.stripe_config.map_io_slices(offset, bytes_to_read);
+        let slices = self
+            .stripe_config
+            .map_io_slices(node.file_hash, offset, bytes_to_read);
         let mut tasks = Vec::with_capacity(slices.len());
         let mut remaining_dest = target_slice;
 
