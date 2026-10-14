@@ -14,10 +14,14 @@ pub const FILE_SHARE_WRITE: u32 = 0x00000002;
 pub const OPEN_EXISTING: u32 = 3;
 pub const CREATE_ALWAYS: u32 = 2;
 pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
+pub const GENERIC_READ: u32 = 0x80000000;
 pub const GENERIC_WRITE: u32 = 0x40000000;
 
 pub const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
 pub const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
+pub const FILE_FLAG_OVERLAPPED: u32 = 0x40000000;
+
+pub const ERROR_IO_PENDING: u32 = 997;
 
 pub const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
 pub const IOCTL_STORAGE_PREDICT_FAILURE: u32 = 0x002D1100;
@@ -34,6 +38,16 @@ pub const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
 pub const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x00008000;
 
 pub type PVectoredExceptionHandler = unsafe extern "system" fn(pointers: *mut c_void) -> i32;
+
+#[repr(C)]
+#[allow(clippy::upper_case_acronyms)]
+pub struct OVERLAPPED {
+    pub internal: usize,
+    pub internal_high: usize,
+    pub offset: u32,
+    pub offset_high: u32,
+    pub h_event: Handle,
+}
 
 #[allow(non_camel_case_types)]
 pub type LPPROGRESS_ROUTINE = Option<
@@ -104,6 +118,27 @@ unsafe extern "system" {
         nNumberOfBytesToWrite: u32,
         lpNumberOfBytesWritten: *mut u32,
         lpOverlapped: *mut c_void,
+    ) -> i32;
+    pub fn ReadFile(
+        hFile: Handle,
+        lpBuffer: *mut c_void,
+        nNumberOfBytesToRead: u32,
+        lpNumberOfBytesRead: *mut u32,
+        lpOverlapped: *mut OVERLAPPED,
+    ) -> i32;
+    pub fn GetFileSizeEx(hFile: Handle, lpFileSize: *mut i64) -> i32;
+    pub fn CreateIoCompletionPort(
+        FileHandle: Handle,
+        ExistingCompletionPort: Handle,
+        CompletionKey: usize,
+        NumberOfConcurrentThreads: u32,
+    ) -> Handle;
+    pub fn GetQueuedCompletionStatus(
+        CompletionPort: Handle,
+        lpNumberOfBytesTransferred: *mut u32,
+        lpCompletionKey: *mut usize,
+        lpOverlapped: *mut *mut OVERLAPPED,
+        dwMilliseconds: u32,
     ) -> i32;
     pub fn CloseHandle(hObject: Handle) -> i32;
     pub fn DeviceIoControl(
@@ -465,6 +500,7 @@ where
 {
     let src_wide = to_wide_null(&src.to_string_lossy());
     let dst_wide = to_wide_null(&dst.to_string_lossy());
+
     let data_ptr = &mut progress_fn as *mut F as *mut c_void;
 
     let res = unsafe {
@@ -519,8 +555,8 @@ pub fn check_winfsp_available() -> Result<(), String> {
     }
 
     Err("WinFsp runtime is not detected on this system!\n\n\
-        Virtual Storage Pool requires WinFsp.\n\
-        Please download and install WinFsp from https://winfsp.dev/\n\
+        Virtual Storage Pool (VFS RAID-0) requires WinFsp.\n\
+        Please download and install WinFsp from https://winfsp.dev/ \n\
         (or via Windows Terminal: 'winget install WinFsp.WinFsp') and restart SymStripe."
         .to_string())
 }
@@ -586,7 +622,7 @@ fn map_bus_type(bus_type: u32) -> &'static str {
         14 => "Virtual Disk",
         16 => "Storage Space",
         17 => "NVMe",
-        _ => "Storage",
+        _ => "Disk",
     }
 }
 

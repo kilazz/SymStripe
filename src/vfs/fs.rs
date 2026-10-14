@@ -1,6 +1,7 @@
 use super::cache::{CacheInner, CachedPart, GlobalStripeCache};
 use super::calibration::VfsLogCallback;
-use super::node::{FileNode, PartKey, PoolFileHandle, VfsCodec, hash_path_id};
+use super::iocp::IocpDispatcher;
+use super::node::{DirectBuffer, FileNode, PartKey, PoolFileHandle, VfsCodec, hash_path_id};
 use crate::stripe_math::StripeConfig;
 use crate::win32::{get_default_security_descriptor, get_system_ram_mb};
 use crate::zstd_atg::ZstdAtgCompressor;
@@ -31,6 +32,8 @@ const STATUS_BUFFER_TOO_SMALL: i32 = 0xC0000023_u32 as i32;
 
 type CachedPartTuple = (u64, Arc<RwLock<CachedPart>>);
 
+/// RAII Guard ensuring that threads waiting for a disk read are properly woken up
+/// once the leading thread finishes fetching the chunk (Single-Flight Pattern).
 struct LoadingLeaderGuard {
     table: Arc<Mutex<HashMap<PartKey, Arc<Condvar>>>>,
     key: PartKey,
@@ -63,6 +66,8 @@ pub struct SymStripePoolFs {
     pub pool_used_bytes: Arc<AtomicU64>,
     pub spindle_locks: Arc<Vec<Mutex<()>>>,
     pub rr_counter: Arc<AtomicUsize>,
+    pub iocp: Arc<IocpDispatcher>,
+
     pub io_bytes: Arc<Vec<AtomicU64>>,
     pub io_max_latency_ms: Arc<Vec<AtomicU64>>,
     pub cache_hits: Arc<AtomicU64>,
@@ -185,6 +190,9 @@ impl SymStripePoolFs {
             }
         }
 
+        let iocp = IocpDispatcher::new();
+        iocp.start_workers(4.min(num_drives * 2));
+
         let fs = Self {
             members: Arc::new(members),
             policy,
@@ -209,6 +217,7 @@ impl SymStripePoolFs {
             pool_used_bytes: Arc::new(AtomicU64::new(initial_used)),
             spindle_locks,
             rr_counter: Arc::new(AtomicUsize::new(0)),
+            iocp,
             io_bytes,
             io_max_latency_ms,
             cache_hits: Arc::new(AtomicU64::new(0)),
@@ -289,12 +298,14 @@ impl SymStripePoolFs {
     fn catalog_path(&self) -> PathBuf {
         self.master().join(".symstripe_jbod_catalog.json")
     }
+
     fn load_jbod_catalog(&self) -> HashMap<String, usize> {
         fs::read_to_string(self.catalog_path())
             .ok()
             .and_then(|c| serde_json::from_str(&c).ok())
             .unwrap_or_default()
     }
+
     fn save_jbod_catalog(&self) {
         let tmp = self.master().join(".symstripe_jbod_catalog.json.tmp");
         if let Ok(json) = serde_json::to_string(&*self.jbod_map.read())
@@ -366,13 +377,15 @@ impl SymStripePoolFs {
                 direct_cache: Mutex::new(None),
                 is_modified: Mutex::new(false),
                 open_handles: AtomicUsize::new(0),
+                last_accessed_part: AtomicU64::new(u64::MAX),
+                predictive_transitions: Mutex::new(HashMap::new()),
             })
         });
         node.open_handles.fetch_add(1, Ordering::Relaxed);
         node.clone()
     }
 
-    fn resolve_part_paths(
+    pub fn resolve_part_paths(
         &self,
         member_idx: usize,
         rel_path: &str,
@@ -438,6 +451,73 @@ impl SymStripePoolFs {
             let _ = fs::remove_file(legacy_path);
         }
         part.dirty = false;
+    }
+
+    pub fn insert_into_cache(&self, key: PartKey, new_part: Arc<RwLock<CachedPart>>) {
+        let evicted_part = {
+            let mut inner = self.global_cache.inner.lock();
+
+            let mut evicted = None;
+            if inner.entries.len() >= self.global_cache.max_parts && !inner.clock_ring.is_empty() {
+                let ring_len = inner.clock_ring.len();
+                let mut loops = 0;
+
+                while loops < ring_len * 2 {
+                    let hand = inner.clock_hand;
+                    let candidate_key = inner.clock_ring[hand];
+                    let candidate_part = inner.entries.get(&candidate_key).cloned();
+
+                    if let Some(part_arc) = candidate_part {
+                        let is_pinned = {
+                            let guard = part_arc.read();
+                            Self::is_pinned_metadata(&guard.rel_path)
+                        };
+
+                        if is_pinned {
+                            inner.clock_hand = (hand + 1) % ring_len;
+                            loops += 1;
+                            continue;
+                        }
+
+                        let was_referenced = {
+                            let guard = part_arc.read();
+                            guard.referenced.swap(false, Ordering::Relaxed)
+                        };
+
+                        if was_referenced {
+                            inner.clock_hand = (hand + 1) % ring_len;
+                            loops += 1;
+                            continue;
+                        }
+
+                        evicted = inner.entries.remove(&candidate_key);
+                        inner.clock_ring[hand] = key;
+                        inner.clock_hand = (hand + 1) % ring_len;
+                        break;
+                    } else {
+                        inner.clock_ring[hand] = key;
+                        inner.clock_hand = (hand + 1) % ring_len;
+                        break;
+                    }
+                }
+            }
+
+            if evicted.is_none() && !inner.clock_ring.contains(&key) {
+                inner.clock_ring.push(key);
+            }
+            inner.entries.insert(key, new_part);
+            evicted
+        };
+
+        if let Some(ev) = evicted_part {
+            self.evict_part_to_disk(&ev);
+        }
+
+        self.prefetch_in_flight.lock().remove(&key);
+        let mut inflight = self.in_flight_loads.lock();
+        if let Some(cv) = inflight.remove(&key) {
+            cv.notify_all();
+        }
     }
 
     pub fn flush_node_dirty_parts(&self, node: &FileNode) {
@@ -511,6 +591,7 @@ impl SymStripePoolFs {
                     return Ok(part.clone());
                 }
             }
+
             let mut inflight = self.in_flight_loads.lock();
             if let Some(cv) = inflight.get(&key).cloned() {
                 cv.wait(&mut inflight);
@@ -586,119 +667,67 @@ impl SymStripePoolFs {
             part_index,
         }));
 
-        let evicted_part = {
-            let mut inner = self.global_cache.inner.lock();
-            if let Some(existing) = inner.entries.get(&key) {
-                return Ok(existing.clone());
-            }
-
-            let mut evicted = None;
-
-            if inner.entries.len() >= self.global_cache.max_parts && !inner.clock_ring.is_empty() {
-                let ring_len = inner.clock_ring.len();
-                let mut loops = 0;
-
-                while loops < ring_len * 2 {
-                    let hand = inner.clock_hand;
-                    let candidate_key = inner.clock_ring[hand];
-                    let candidate_part = inner.entries.get(&candidate_key).cloned();
-
-                    if let Some(part_arc) = candidate_part {
-                        let is_pinned = {
-                            let guard = part_arc.read();
-                            Self::is_pinned_metadata(&guard.rel_path)
-                        };
-
-                        if is_pinned {
-                            inner.clock_hand = (hand + 1) % ring_len;
-                            loops += 1;
-                            continue;
-                        }
-
-                        let was_referenced = {
-                            let guard = part_arc.read();
-                            guard.referenced.swap(false, Ordering::Relaxed)
-                        };
-
-                        if was_referenced {
-                            inner.clock_hand = (hand + 1) % ring_len;
-                            loops += 1;
-                            continue;
-                        }
-
-                        evicted = inner.entries.remove(&candidate_key);
-                        inner.clock_ring[hand] = key;
-                        inner.clock_hand = (hand + 1) % ring_len;
-                        break;
-                    } else {
-                        inner.clock_ring[hand] = key;
-                        inner.clock_hand = (hand + 1) % ring_len;
-                        break;
-                    }
-                }
-            }
-
-            if evicted.is_none() && !inner.clock_ring.contains(&key) {
-                inner.clock_ring.push(key);
-            }
-            inner.entries.insert(key, new_part.clone());
-            evicted
-        };
-
-        if let Some(evicted) = evicted_part {
-            self.evict_part_to_disk(&evicted);
-        }
+        self.insert_into_cache(key, new_part.clone());
 
         if allow_prefetch {
+            let last = node.last_accessed_part.swap(part_index, Ordering::Relaxed);
+            if last != part_index && last != u64::MAX {
+                node.predictive_transitions.lock().insert(last, part_index);
+            }
+
             let file_size = *node.file_size.lock();
             let stripe_size = self.stripe_config.stripe_size_bytes;
             let mut candidates = Vec::new();
-            let lookahead_depth = if self.members.len() > 1 { 4 } else { 2 };
 
+            if let Some(&predicted) = node.predictive_transitions.lock().get(&part_index) {
+                candidates.push(predicted);
+            }
+
+            let lookahead_depth = if self.members.len() > 1 { 4 } else { 2 };
+            for step in 1..=lookahead_depth {
+                candidates.push(part_index + step);
+            }
+
+            let mut final_candidates = Vec::new();
             {
                 let inner = self.global_cache.inner.lock();
                 let mut in_flight = self.prefetch_in_flight.lock();
 
-                for step in 1..=lookahead_depth {
-                    let next_p = part_index + step;
+                for p_idx in candidates {
                     let next_key = PartKey {
                         file_hash: current_hash,
-                        part_index: next_p,
+                        part_index: p_idx,
                     };
-                    if next_p.saturating_mul(stripe_size) < file_size
+                    if p_idx.saturating_mul(stripe_size) < file_size
                         && !inner.entries.contains_key(&next_key)
                         && !in_flight.contains(&next_key)
                     {
                         in_flight.insert(next_key);
-                        candidates.push(next_p);
+                        final_candidates.push(p_idx);
                     }
                 }
             }
 
-            if !candidates.is_empty() {
-                let fs_clone = self.clone();
-                let node_clone = Arc::clone(node);
-                rayon::spawn(move || {
-                    let c_hash = node_clone.file_hash.load(Ordering::Relaxed);
-                    candidates.sort_by_key(|&p_idx| {
-                        let d = fs_clone.stripe_config.map_part_to_drive(c_hash, p_idx);
-                        let lat = fs_clone
-                            .io_max_latency_ms
-                            .get(d)
-                            .map(|a| a.load(Ordering::Relaxed))
-                            .unwrap_or(0);
-                        std::cmp::Reverse(lat)
-                    });
-
-                    for p_idx in candidates {
-                        let target_d = fs_clone.stripe_config.map_part_to_drive(c_hash, p_idx);
-                        let _ = fs_clone.fetch_cached_part(&node_clone, p_idx, target_d, false);
-                        fs_clone.prefetch_in_flight.lock().remove(&PartKey {
-                            file_hash: c_hash,
-                            part_index: p_idx,
-                        });
-                    }
+            if !final_candidates.is_empty() {
+                final_candidates.sort_by_key(|&p_idx| {
+                    let d = self.stripe_config.map_part_to_drive(current_hash, p_idx);
+                    let drive_lat = self
+                        .io_max_latency_ms
+                        .get(d)
+                        .map(|a| a.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    std::cmp::Reverse(drive_lat)
                 });
+
+                for p_idx in final_candidates {
+                    let target_d = self.stripe_config.map_part_to_drive(current_hash, p_idx);
+                    let p_key = PartKey {
+                        file_hash: current_hash,
+                        part_index: p_idx,
+                    };
+                    self.iocp
+                        .submit_prefetch(self.clone(), Arc::clone(node), p_key, target_d);
+                }
             }
         }
 
@@ -771,6 +800,7 @@ impl FileSystemContext for SymStripePoolFs {
         _rp: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
         let rel_path = Self::normalize_path(file_name);
+
         let is_dir = if rel_path.is_empty() {
             true
         } else {
@@ -794,6 +824,7 @@ impl FileSystemContext for SymStripePoolFs {
                         break;
                     }
                 }
+
                 if found_as_dir {
                     true
                 } else if found_as_file {
@@ -853,6 +884,7 @@ impl FileSystemContext for SymStripePoolFs {
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
         let rel_path = Self::normalize_path(file_name);
+
         let (is_dir, is_striped, present_on, file_size) =
             if rel_path.is_empty() || self.members.iter().any(|m| m.join(&rel_path).is_dir()) {
                 (true, false, vec![], 0)
@@ -907,6 +939,7 @@ impl FileSystemContext for SymStripePoolFs {
             } else {
                 PathBuf::new()
             };
+
             if check_p.exists()
                 && let Ok(m) = fs::metadata(&check_p)
             {
@@ -951,6 +984,7 @@ impl FileSystemContext for SymStripePoolFs {
             || lower_rel.ends_with(".dll")
             || lower_rel.ends_with(".ini")
             || lower_rel.ends_with(".cfg");
+
         let is_bulk_stream = lower_rel.ends_with(".ucas")
             || lower_rel.ends_with(".bk2")
             || lower_rel.ends_with(".mp4")
@@ -1031,6 +1065,7 @@ impl FileSystemContext for SymStripePoolFs {
             if is_dir { "DIR" } else { "FILE" },
             rel_path
         ));
+
         Ok(PoolFileHandle {
             is_dir,
             rel_path: RwLock::new(rel_path),
@@ -1053,6 +1088,7 @@ impl FileSystemContext for SymStripePoolFs {
             .node
             .as_ref()
             .ok_or(FspError::NTSTATUS(STATUS_INVALID_DEVICE_REQUEST))?;
+
         *node.is_modified.lock() = true;
         node.direct_cache.lock().take();
 
@@ -1070,9 +1106,11 @@ impl FileSystemContext for SymStripePoolFs {
                 .map(|&member_idx| {
                     let _spindle_guard = self.spindle_locks[member_idx].lock();
                     let p = self.members[member_idx].join(node.rel_path());
+
                     if let Some(parent) = p.parent() {
                         let _ = fs::create_dir_all(parent);
                     }
+
                     let file = OpenOptions::new()
                         .read(true)
                         .write(true)
@@ -1080,8 +1118,10 @@ impl FileSystemContext for SymStripePoolFs {
                         .truncate(false)
                         .open(&p)
                         .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+
                     file.seek_write(buffer, write_offset)
                         .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+
                     if let Some(counter) = self.io_bytes.get(member_idx) {
                         counter.fetch_add(buffer.len() as u64, Ordering::Relaxed);
                     }
@@ -1095,6 +1135,7 @@ impl FileSystemContext for SymStripePoolFs {
 
             let new_len = fs::metadata(&p_first).map(|m| m.len()).unwrap_or(old_len);
             let diff = new_len as i64 - old_len as i64;
+
             if diff > 0 {
                 self.add_used_bytes((diff as u64) * (node.present_on.len() as u64));
             } else if diff < 0 {
@@ -1130,6 +1171,7 @@ impl FileSystemContext for SymStripePoolFs {
                 if part.data.len() < end_pos {
                     part.data.resize(end_pos, 0);
                 }
+
                 part.data[start_idx..end_pos].copy_from_slice(src_slice);
                 part.dirty = true;
                 part.codec = codec;
@@ -1151,11 +1193,13 @@ impl FileSystemContext for SymStripePoolFs {
         file_info.file_attributes = 0x80;
         file_info.hard_links = 1;
         file_info.index_number = hash_path_id(&node.rel_path());
+
         Ok(buffer.len() as u32)
     }
 
     fn read(&self, ctx: &Self::FileContext, buffer: &mut [u8], offset: u64) -> winfsp::Result<u32> {
         let node = context_node(ctx)?;
+
         let current_file_size = *node.file_size.lock();
         if offset >= current_file_size {
             return Ok(0);
@@ -1166,11 +1210,13 @@ impl FileSystemContext for SymStripePoolFs {
         if bytes_to_read == 0 {
             return Ok(0);
         }
+
         let target_slice = &mut buffer[..bytes_to_read];
 
         if !node.is_striped {
             let member_idx = node.present_on
                 [self.rr_counter.fetch_add(1, Ordering::Relaxed) % node.present_on.len()];
+
             let hit_cache = {
                 let cache_guard = node.direct_cache.lock();
                 if let Some(buf) = cache_guard.as_ref() {
@@ -1198,8 +1244,10 @@ impl FileSystemContext for SymStripePoolFs {
             }
 
             self.cache_misses.fetch_add(1, Ordering::Relaxed);
+
             let _spindle_guard = self.spindle_locks[member_idx].lock();
             let p = self.members[member_idx].join(node.rel_path());
+
             let file = File::open(&p).map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
 
             let window_len = DIRECT_READ_WINDOW_BYTES
@@ -1211,13 +1259,16 @@ impl FileSystemContext for SymStripePoolFs {
             let actual_read = file
                 .seek_read(&mut window_buf, offset)
                 .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+
             let lat = t0.elapsed().as_millis() as u64;
             self.io_max_latency_ms[member_idx].fetch_max(lat, Ordering::Relaxed);
 
             window_buf.truncate(actual_read);
+
             let copy_len = bytes_to_read.min(window_buf.len());
             target_slice[..copy_len].copy_from_slice(&window_buf[..copy_len]);
-            *node.direct_cache.lock() = Some(crate::vfs::node::DirectBuffer {
+
+            *node.direct_cache.lock() = Some(DirectBuffer {
                 offset,
                 data: window_buf,
             });
@@ -1232,7 +1283,6 @@ impl FileSystemContext for SymStripePoolFs {
         let slices = self
             .stripe_config
             .map_io_slices(current_hash, offset, bytes_to_read);
-        let num_slices = slices.len();
 
         let mut tasks = Vec::with_capacity(slices.len());
         let mut remaining_dest = target_slice;
@@ -1241,8 +1291,8 @@ impl FileSystemContext for SymStripePoolFs {
         let offset_in_stripe = offset % stripe_size;
         let trigger_lookahead = offset_in_stripe > (stripe_size / 2);
 
-        for (i, slice) in slices.into_iter().enumerate() {
-            let is_last = (i + 1 == num_slices) && trigger_lookahead;
+        for (i, slice) in slices.iter().enumerate() {
+            let is_last = (i + 1 == slices.len()) && trigger_lookahead;
             let part_arc =
                 self.fetch_cached_part(node, slice.part_index, slice.target_drive_idx, is_last)?;
             let len = slice.length.min(remaining_dest.len());
@@ -1288,6 +1338,7 @@ impl FileSystemContext for SymStripePoolFs {
         if !ctx.is_dir {
             return Err(FspError::NTSTATUS(STATUS_INVALID_DEVICE_REQUEST));
         }
+
         let dir_buf = ctx.dir_buffer.lock();
 
         if marker.is_none()
@@ -1323,6 +1374,7 @@ impl FileSystemContext for SymStripePoolFs {
                         if name.starts_with(".symstripe") || name.contains(".part") {
                             continue;
                         }
+
                         if name.ends_with(".symstripe_meta") {
                             let clean = name
                                 .strip_suffix(".symstripe_meta")
@@ -1373,11 +1425,13 @@ impl FileSystemContext for SymStripePoolFs {
                 let _ = dir_lock.write(&mut dir_info);
             }
         }
+
         Ok(dir_buf.read(marker, buffer))
     }
 
     fn cleanup(&self, ctx: &Self::FileContext, _name: Option<&U16CStr>, flags: u32) {
         let should_delete = (flags & 0x01 != 0) || *ctx.delete_on_close.lock();
+
         if should_delete {
             *ctx.delete_on_close.lock() = true;
             let rel = ctx.rel_path();
@@ -1416,12 +1470,14 @@ impl FileSystemContext for SymStripePoolFs {
 
                 if node.is_striped {
                     let meta_p = self.meta_path(&rel);
+
                     let mut file_size = *node.file_size.lock();
                     if file_size == 0
                         && let Ok(s) = fs::read_to_string(&meta_p)
                     {
                         file_size = s.trim().parse::<u64>().unwrap_or(0);
                     }
+
                     if let Ok(m) = fs::metadata(&meta_p) {
                         self.sub_used_bytes(m.len());
                     }
@@ -1438,6 +1494,7 @@ impl FileSystemContext for SymStripePoolFs {
                         for ext in ["lz4", "zst", "raw"] {
                             let (store_p, legacy_p) =
                                 self.resolve_part_paths(target_drive_idx, &rel, part_index, ext);
+
                             for p in [store_p, legacy_p] {
                                 if let Ok(m) = fs::metadata(&p) {
                                     self.sub_used_bytes(m.len());
@@ -1456,6 +1513,7 @@ impl FileSystemContext for SymStripePoolFs {
                         let _ = fs::remove_file(&target_p);
                     }
                     self.sub_used_bytes(total_del);
+
                     if node.present_on.len() == 1 && node.present_on[0] != 0 {
                         self.jbod_map.write().remove(&rel.to_lowercase());
                         self.save_jbod_catalog();
@@ -1498,6 +1556,7 @@ impl FileSystemContext for SymStripePoolFs {
         if *ctx.delete_on_close.lock() {
             return;
         }
+
         if let Some(node) = &ctx.node {
             let remaining = node.open_handles.fetch_sub(1, Ordering::Relaxed) - 1;
             if *node.is_modified.lock() {
@@ -1542,6 +1601,7 @@ impl FileSystemContext for SymStripePoolFs {
         } else {
             PathBuf::new()
         };
+
         if check_p.exists()
             && let Ok(m) = fs::metadata(&check_p)
         {
@@ -1580,8 +1640,10 @@ impl FileSystemContext for SymStripePoolFs {
                     let _ = fs::create_dir_all(parent);
                 }
                 let old_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+
                 let _spindle_guard = self.spindle_locks[member_idx].lock();
                 let _ = OpenOptions::new().write(true).truncate(true).open(&p);
+
                 size_diff -= old_len as i64;
             }
             self.sub_used_bytes((-size_diff) as u64);
@@ -1629,6 +1691,7 @@ impl FileSystemContext for SymStripePoolFs {
                     let _ = fs::create_dir_all(parent);
                 }
                 let old_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+
                 let _spindle_guard = self.spindle_locks[member_idx].lock();
                 if let Ok(f) = OpenOptions::new().write(true).open(&p) {
                     let _ = f.set_len(new_size);
@@ -1692,6 +1755,7 @@ impl FileSystemContext for SymStripePoolFs {
 
         if let Some(node) = &ctx.node {
             node.direct_cache.lock().take();
+
             if *node.is_modified.lock() {
                 self.flush_node_dirty_parts(node);
                 let size = *node.file_size.lock();
@@ -1722,6 +1786,7 @@ impl FileSystemContext for SymStripePoolFs {
                 {
                     file_size = s.trim().parse::<u64>().unwrap_or(0);
                 }
+
                 if old_m.exists() {
                     let _ = fs::rename(&old_m, &new_m);
                 }
@@ -1775,9 +1840,11 @@ impl FileSystemContext for SymStripePoolFs {
             *node.rel_path.write() = new_rel.clone();
             node.file_hash.store(new_hash, Ordering::Relaxed);
 
-            let mut map = self.file_nodes.write();
-            if let Some(existing_node) = map.remove(&old_rel.to_lowercase()) {
-                map.insert(new_rel.to_lowercase(), existing_node);
+            {
+                let mut map = self.file_nodes.write();
+                if let Some(existing_node) = map.remove(&old_rel.to_lowercase()) {
+                    map.insert(new_rel.to_lowercase(), existing_node);
+                }
             }
         }
         *ctx.rel_path.write() = new_rel;

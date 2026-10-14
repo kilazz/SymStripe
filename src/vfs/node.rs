@@ -1,5 +1,5 @@
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use winfsp::filesystem::DirBuffer;
@@ -49,6 +49,10 @@ pub struct FileNode {
     pub direct_cache: Mutex<Option<DirectBuffer>>,
     pub is_modified: Mutex<bool>,
     pub open_handles: AtomicUsize,
+
+    // Markov Chain Prefetch Predictor Fields
+    pub last_accessed_part: AtomicU64,
+    pub predictive_transitions: Mutex<HashMap<u64, u64>>,
 }
 
 impl FileNode {
