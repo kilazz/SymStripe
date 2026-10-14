@@ -5,7 +5,7 @@ use crate::striping::{
     auto_detect_threshold, calculate_allocation_plan, execute_consolidate, execute_revert,
     execute_striping, parse_ext_list, verify_and_repair_integrity,
 };
-use crate::vfs_pool::{VfsLogCallback, mount_storage_pool};
+use crate::vfs::{VfsLogCallback, mount_storage_pool};
 use crate::win32::{get_logical_volumes, query_smart_disks};
 use crate::{AppState, AppWindow, StripeBlockUI};
 
@@ -14,7 +14,41 @@ use rfd::FileDialog;
 use slint::{ComponentHandle, ModelRc, SharedString, StandardListViewItem, VecModel};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+
+static IS_BACKGROUND_TASK_BUSY: AtomicBool = AtomicBool::new(false);
+
+struct TaskGuard;
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        IS_BACKGROUND_TASK_BUSY.store(false, Ordering::SeqCst);
+    }
+}
+
+fn try_start_task<F>(ui_weak: slint::Weak<AppWindow>, task_name: &str, task: F)
+where
+    F: FnOnce(slint::Weak<AppWindow>) + Send + 'static,
+{
+    if IS_BACKGROUND_TASK_BUSY
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        append_log(
+            &ui_weak,
+            &format!(
+                "⚠️ Operation '{}' ignored: another background task is currently active.",
+                task_name
+            ),
+        );
+        return;
+    }
+
+    thread::spawn(move || {
+        let _guard = TaskGuard;
+        task(ui_weak);
+    });
+}
 
 pub fn append_log(ui_handle: &slint::Weak<AppWindow>, msg: &str) {
     let msg_string = msg.to_string();
@@ -108,7 +142,6 @@ pub fn init_ui_state(app: &AppWindow, state: Arc<Mutex<AppState>>) {
 pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
     let ui_weak = app.as_weak();
 
-    // AI Diagnostics Report Copy Handler using native Windows clip.exe
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_copy_ai_report(move || {
@@ -119,29 +152,21 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
 
         let mut d1_max = 0.0_f32;
         let mut d2_max = 0.0_f32;
-        let mut d1_lat = 0;
-        let mut d2_lat = 0;
+        let mut max_lat = 0u64;
         let mut count = 0;
 
         for pt in st.metrics.iter().skip(skip) {
-            d1_max = d1_max.max(pt.d1_mbs);
-            d2_max = d2_max.max(pt.d2_mbs);
-            d1_lat = d1_lat.max(pt.d1_lat);
-            d2_lat = d2_lat.max(pt.d2_lat);
+            d1_max = d1_max.max(pt.drive_speeds_mbs.first().copied().unwrap_or(0.0));
+            d2_max = d2_max.max(pt.drive_speeds_mbs.get(1).copied().unwrap_or(0.0));
+            max_lat = max_lat.max(pt.max_lat_ms);
             count += 1;
         }
 
         report.push_str(&format!("Window Analyzed: {} seconds\n", count));
-        report.push_str(&format!(
-            "Drive 1: Peak Read: {:.1} MB/s | Max Latency: {} ms\n",
-            d1_max, d1_lat
-        ));
-        report.push_str(&format!(
-            "Drive 2: Peak Read: {:.1} MB/s | Max Latency: {} ms\n",
-            d2_max, d2_lat
-        ));
+        report.push_str(&format!("Drive 1: Peak Read: {:.1} MB/s\n", d1_max));
+        report.push_str(&format!("Drive 2: Peak Read: {:.1} MB/s\n", d2_max));
+        report.push_str(&format!("Max Array Latency: {} ms\n", max_lat));
 
-        // Natively invoke Windows clipboard utility (Collapsed IF for Clippy)
         use std::io::Write;
         use std::process::{Command, Stdio};
         if let Ok(mut child) = Command::new("clip").stdin(Stdio::piped()).spawn()
@@ -220,7 +245,6 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
         );
     });
 
-    // PARADIGM 1: IN-PLACE GAME OPTIMIZER HANDLERS
     let state_arc = state.clone();
     let weak = ui_weak.clone();
     app.on_browse_primary_folder(move || {
@@ -300,10 +324,9 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_consolidate_target_drive(move || {
-        let w = weak.clone();
         let st_lock = state_arc.clone();
 
-        thread::spawn(move || {
+        try_start_task(weak.clone(), "Consolidate Target Drive", move |w| {
             let (src_dir, targets) = {
                 let st = st_lock.lock();
                 let idx = st.config.active_profile_index;
@@ -379,9 +402,8 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
     app.on_auto_detect_threshold(move |src_dir, exclusions_str| {
         let src = src_dir.to_string();
         let excl = exclusions_str.to_string();
-        let w = weak.clone();
 
-        thread::spawn(move || {
+        try_start_task(weak.clone(), "Auto Detect Threshold", move |w| {
             let src_path = PathBuf::from(&src);
             if !src_path.exists() {
                 append_log(&w, "Error: Primary directory does not exist!");
@@ -412,19 +434,15 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
     let weak = ui_weak.clone();
     app.on_verify_integrity(move |src_dir| {
         let src = src_dir.to_string();
-        let w = weak.clone();
 
-        thread::spawn(move || {
+        try_start_task(weak.clone(), "Verify Storage Integrity", move |w| {
             let src_path = PathBuf::from(&src);
             append_log(&w, "--- VERIFYING STORAGE INTEGRITY ---");
             update_status(&w, "Verifying manifest and target files...");
 
             match verify_and_repair_integrity(&src_path) {
                 Ok((intact, repaired)) => {
-                    append_log(
-                        &w,
-                        &format!("Integrity check complete: {} file(s) intact.", intact),
-                    );
+                    append_log(&w, &format!("Integrity check complete: {} file(s) intact.", intact));
                     if repaired > 0 {
                         append_log(
                             &w,
@@ -459,10 +477,9 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
             let excl = exclusions_str.to_string();
             let media = media_exts_str.to_string();
             let threshold = (min_mb as u64) * 1024 * 1024;
-            let w = weak.clone();
             let st_lock = state_arc.clone();
 
-            thread::spawn(move || {
+            try_start_task(weak.clone(), "Preview Striping", move |w| {
                 let targets: Vec<PathBuf> = {
                     let st = st_lock.lock();
                     let idx = st.config.active_profile_index;
@@ -628,10 +645,9 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
             let excl = exclusions_str.to_string();
             let media = media_exts_str.to_string();
             let threshold = (min_mb as u64) * 1024 * 1024;
-            let w = weak.clone();
             let st_lock = state_arc.clone();
 
-            thread::spawn(move || {
+            try_start_task(weak.clone(), "Apply Striping", move |w| {
                 {
                     let mut st = st_lock.lock();
                     let idx = st.config.active_profile_index;
@@ -736,9 +752,8 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
     let weak = ui_weak.clone();
     app.on_revert_striping(move |src_dir| {
         let src = src_dir.to_string();
-        let w = weak.clone();
 
-        thread::spawn(move || {
+        try_start_task(weak.clone(), "Revert Striping", move |w| {
             append_log(&w, &format!("Reverting all files to primary: {}", src));
             update_status(&w, "Reverting files...");
             let src_path = PathBuf::from(&src);
@@ -774,7 +789,6 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
         });
     });
 
-    // PARADIGM 2: VIRTUAL STORAGE POOL (VFS) HANDLERS
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_add_pool_member(move || {
@@ -889,13 +903,7 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
             let st = state_arc.lock();
             let idx = st.config.active_profile_index;
             let prof = &st.config.profiles[idx];
-            (
-                prof.pool_members
-                    .iter()
-                    .map(PathBuf::from)
-                    .collect::<Vec<_>>(),
-                prof.pool_policy,
-            )
+            (prof.pool_members.iter().map(PathBuf::from).collect::<Vec<_>>(), prof.pool_policy)
         };
 
         if members.is_empty() {
@@ -910,9 +918,7 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
         for member in &members {
             if let Some((free, _)) = crate::win32::get_disk_space(member) {
                 total_free_bytes += free;
-                if free < min_free_bytes {
-                    min_free_bytes = free;
-                }
+                if free < min_free_bytes { min_free_bytes = free; }
                 valid_drives += 1;
             }
         }
@@ -929,11 +935,7 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
             ui.set_pool_custom_size_gb_text(calculated_gb.to_string().into());
         });
 
-        let policy_str = if policy == 1 {
-            "Speed (RAID-0)"
-        } else {
-            "Capacity (JBOD)"
-        };
+        let policy_str = if policy == 1 { "Speed (RAID-0)" } else { "Capacity (JBOD)" };
         append_log(
             &weak,
             &format!(
@@ -971,13 +973,12 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
     let state_arc = state.clone();
     app.on_mount_pool(
         move |drive_letter, custom_size_str, codec_idx, tiered_storage, ram_cache_mb_f32| {
-            let w = weak.clone();
             let st_lock = state_arc.clone();
             let drive = drive_letter.to_string();
             let size_str = custom_size_str.to_string();
             let ram_cache_mb = ram_cache_mb_f32.max(0.0) as u32;
 
-            thread::spawn(move || {
+            try_start_task(weak.clone(), "Mount Pool", move |w| {
                 let (members, policy, stripe_mb, custom_gb) = {
                     let mut st = st_lock.lock();
                     let idx = st.config.active_profile_index;
@@ -1012,7 +1013,6 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
                 } else {
                     "Auto (Calculated from physical drives)".to_string()
                 };
-
                 let cache_msg = if ram_cache_mb > 0 {
                     format!("{} MB RAM Cache", ram_cache_mb)
                 } else {
@@ -1058,11 +1058,10 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
                         });
 
                         inspect_pool_storage(&members, stripe_mb, &w);
-
                         append_log(
                             &w,
                             &format!(
-                                "🚀 SUCCESS: Virtual Storage Pool mounted at '{}' ({}, {})! Transparent Zstd ATG on-the-fly striping is active.",
+                                "🚀 SUCCESS: Virtual Storage Pool mounted at '{}' ({}, {})!",
                                 drive, quota_msg, cache_msg
                             ),
                         );
@@ -1113,7 +1112,6 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
         update_status(&weak, "Pool index refreshed.");
     });
 
-    // PROFILE MANAGEMENT HANDLERS
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_profile_selected(move |idx| {
@@ -1260,7 +1258,6 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
                 .enumerate()
                 .map(|(i, p)| format!("[Drive {}] {}", i + 2, p))
                 .collect();
-
             let items: Vec<StandardListViewItem> = target_rows
                 .into_iter()
                 .map(|s| StandardListViewItem::from(SharedString::from(s)))
@@ -1273,7 +1270,6 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
                 .enumerate()
                 .map(|(i, p)| format!("[Member {}] {}", i + 1, p))
                 .collect();
-
             let pool_items: Vec<StandardListViewItem> = pool_rows
                 .into_iter()
                 .map(|s| StandardListViewItem::from(SharedString::from(s)))
@@ -1297,14 +1293,12 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
         append_log(&weak, &format!("Deleted profile '{}'.", deleted_name));
     });
 
-    // HARDWARE BENCHMARK HANDLER
     let weak = ui_weak.clone();
     let state_arc = state.clone();
     app.on_run_benchmark(move || {
-        let w = weak.clone();
         let st_lock = state_arc.clone();
 
-        thread::spawn(move || {
+        try_start_task(weak.clone(), "Hardware Benchmark", move |w| {
             let (src_dir, targets, mode_str) = {
                 let st = st_lock.lock();
                 let idx = st.config.active_profile_index;
@@ -1322,7 +1316,10 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
                 } else {
                     let members: Vec<PathBuf> =
                         prof.pool_members.iter().map(PathBuf::from).collect();
-                    let src = members.first().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                    let src = members
+                        .first()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
                     let tgts = if members.len() > 1 {
                         members[1..].to_vec()
                     } else {
@@ -1336,7 +1333,7 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
                 append_log(
                     &w,
                     &format!(
-                        "Error: [{}] requires at least 2 distinct drive locations to benchmark multi-spindle speed.",
+                        "Error: [{}] requires at least 2 distinct drive locations.",
                         mode_str
                     ),
                 );
@@ -1469,11 +1466,9 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
         });
     });
 
-    // S.M.A.R.T. PHYSICAL DISK HEALTH HANDLER
     let weak = ui_weak.clone();
     app.on_scan_drives(move || {
-        let w = weak.clone();
-        thread::spawn(move || {
+        try_start_task(weak.clone(), "Scan Drives", move |w| {
             append_log(&w, "--- QUERYING S.M.A.R.T. PHYSICAL DISK HEALTH ---");
             update_status(&w, "Querying hardware S.M.A.R.T. status...");
 

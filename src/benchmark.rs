@@ -1,5 +1,6 @@
+use crate::aligned_buf::AlignedBuffer;
+use crate::win32::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH, get_path_bus_type};
 use rayon::prelude::*;
-use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
@@ -7,11 +8,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
-const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
-
-const BENCH_DURATION: Duration = Duration::from_millis(2500); // 2.5 seconds sustained continuous streaming
-const BENCH_CHUNK_BYTES: usize = 4 * 1024 * 1024; // 4 MB aligned chunk per transfer
+const BENCH_DURATION: Duration = Duration::from_millis(2500);
+const BENCH_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct BenchmarkResult {
     pub single_speed_mbs: f64,
@@ -29,36 +27,6 @@ pub struct BenchmarkResult {
     pub streaming_stalls: usize,
 }
 
-pub struct AlignedBuffer {
-    ptr: *mut u8,
-    layout: Layout,
-}
-
-impl AlignedBuffer {
-    pub fn new(size: usize, align: usize) -> Self {
-        let layout = Layout::from_size_align(size, align).expect("Invalid memory layout");
-        let ptr = unsafe { alloc(layout) };
-        if ptr.is_null() {
-            handle_alloc_error(layout);
-        }
-        Self { ptr, layout }
-    }
-
-    pub fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.layout.size()) }
-    }
-}
-
-impl Drop for AlignedBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            dealloc(self.ptr, self.layout);
-        }
-    }
-}
-
-unsafe impl Send for AlignedBuffer {}
-
 fn open_unbuffered_file(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -73,9 +41,8 @@ fn cleanup_bench_files(paths: &[PathBuf]) {
     }
 }
 
-/// Measures multi-threaded Host RAM memory bandwidth (parallel memcpy limit across CPU cores via Rayon).
 pub fn measure_host_memory_bandwidth() -> f64 {
-    let size = 128 * 1024 * 1024; // 128 MB
+    let size = 128 * 1024 * 1024;
     let src = vec![0xABu8; size];
     let mut dst = vec![0x00u8; size];
 
@@ -95,17 +62,15 @@ pub fn measure_host_memory_bandwidth() -> f64 {
     (size as f64 / 1_073_741_824.0) / elapsed.max(0.0001)
 }
 
-/// Measures direct unbuffered Cold I/O throughput versus Windows OS Cache Warm I/O throughput.
 pub fn measure_disk_cold_vs_warm_io(dir: &Path) -> (f64, f64) {
     let probe_file = dir.join(".symstripe_cold_warm.tmp");
-    let test_size = 32 * 1024 * 1024; // 32 MB
+    let test_size = 32 * 1024 * 1024;
     let payload = vec![0x77u8; test_size];
 
     if fs::write(&probe_file, &payload).is_err() {
         return (0.0, 0.0);
     }
 
-    // Warm Read (served directly from Windows Standby List / File System Cache)
     let start_warm = Instant::now();
     let mut warm_buf = vec![0u8; test_size];
     let warm_read_ok = File::open(&probe_file)
@@ -118,7 +83,6 @@ pub fn measure_disk_cold_vs_warm_io(dir: &Path) -> (f64, f64) {
         0.0
     };
 
-    // Cold Read (bypassing Windows file system cache via FILE_FLAG_NO_BUFFERING)
     let mut aligned_buf = AlignedBuffer::new(test_size, 4096);
     let start_cold = Instant::now();
     let cold_read_ok = open_unbuffered_file(&probe_file)
@@ -135,10 +99,9 @@ pub fn measure_disk_cold_vs_warm_io(dir: &Path) -> (f64, f64) {
     (cold_mbs, warm_mbs)
 }
 
-/// Simulates a game engine (UE5 / Open-World Asset Streaming) reading random/sequential chunk sizes concurrently.
 pub fn run_asset_streaming_simulation(dir: &Path) -> Result<(f64, f64, f64, usize), String> {
     let test_file = dir.join(".symstripe_streaming_sim.tmp");
-    let file_size = 128 * 1024 * 1024; // 128 MB asset container
+    let file_size = 128 * 1024 * 1024;
     let seed_payload = vec![0x55u8; 4 * 1024 * 1024];
 
     let mut f = OpenOptions::new()
@@ -183,10 +146,7 @@ pub fn run_asset_streaming_simulation(dir: &Path) -> Result<(f64, f64, f64, usiz
                 rng_seed
             };
 
-            // Typical game asset chunk sizes (from 16KB metadata headers to 4MB texture/audio streams)
             let chunk_sizes = [16384_u64, 65536, 262144, 1048576, 4194304];
-
-            // Pre-allocate 4096-byte aligned buffer (max 4MB) to satisfy FILE_FLAG_NO_BUFFERING pointer alignment requirements
             let mut thread_aligned_buf = AlignedBuffer::new(4194304, 4096);
 
             for _ in 0..iterations_per_thread {
@@ -199,7 +159,7 @@ pub fn run_asset_streaming_simulation(dir: &Path) -> Result<(f64, f64, f64, usiz
                 let max_offset = file_size_u64.saturating_sub(req_len);
                 let max_blocks = max_offset / 4096;
                 let block_offset = if max_blocks > 0 { r2 % max_blocks } else { 0 };
-                let offset = block_offset * 4096; // Strictly a multiple of 4096 bytes (disk sector)
+                let offset = block_offset * 4096;
 
                 let buf_slice = &mut thread_aligned_buf.as_slice_mut()[..req_len as usize];
                 let read_start = Instant::now();
@@ -212,7 +172,7 @@ pub fn run_asset_streaming_simulation(dir: &Path) -> Result<(f64, f64, f64, usiz
                     local_bytes += req_len;
                     local_latency_sum += lat_ms;
                     if lat_ms > 250 {
-                        local_stalls += 1; // Micro-stall threshold (>250ms)
+                        local_stalls += 1;
                     }
                 }
             }
@@ -242,8 +202,6 @@ pub fn run_asset_streaming_simulation(dir: &Path) -> Result<(f64, f64, f64, usiz
     Ok((iops, throughput_mbs, avg_latency_ms, total_stalls))
 }
 
-/// Continuous time-based streaming reader. Runs sustained unbuffered reads
-/// for the specified duration, wrapping around the test file to avoid any disk idle time.
 fn run_timed_read_loop(
     path: &Path,
     drive_idx: usize,
@@ -259,7 +217,7 @@ fn run_timed_read_loop(
     let start = Instant::now();
     while start.elapsed() < duration {
         if offset + (chunk_size as u64) > file_size {
-            offset = 0; // Seamless wraparound
+            offset = 0;
         }
         let t_read = Instant::now();
         file.seek_read(buf.as_slice_mut(), offset)
@@ -281,9 +239,7 @@ pub fn run_benchmark_test(src_dir: &Path, targets: &[PathBuf]) -> Result<Benchma
         return Err("No target drives configured for benchmark.".into());
     }
 
-    // Dynamic hardware bus detection (e.g. SATA, NVMe, USB)
-    let bus_label = crate::win32::get_path_bus_type(src_dir);
-
+    let bus_label = get_path_bus_type(src_dir);
     let ram_bandwidth_gbs = measure_host_memory_bandwidth();
     let (disk_cold_mbs, disk_warm_mbs) = measure_disk_cold_vs_warm_io(src_dir);
     let (streaming_iops, streaming_throughput_mbs, avg_latency_ms, streaming_stalls) =
@@ -294,12 +250,10 @@ pub fn run_benchmark_test(src_dir: &Path, targets: &[PathBuf]) -> Result<Benchma
         all_paths.push(target.join(format!(".bench_test_{}.tmp", idx + 1)));
     }
 
-    let payload_bytes = 96 * 1024 * 1024; // 96 MB per drive to comfortably exceed on-disk DRAM caches
-
+    let payload_bytes = 96 * 1024 * 1024;
     let mut write_buffer = AlignedBuffer::new(payload_bytes, 4096);
     write_buffer.as_slice_mut().fill(0xAA);
 
-    // Create unbuffered test files on all drives in the array
     for (i, path) in all_paths.iter().enumerate() {
         let write_opt = OpenOptions::new()
             .write(true)
@@ -324,7 +278,6 @@ pub fn run_benchmark_test(src_dir: &Path, targets: &[PathBuf]) -> Result<Benchma
 
     drop(write_buffer);
 
-    // Single-Drive Baseline (Drive 1)
     let (_, single_speed_mbs) = run_timed_read_loop(
         &all_paths[0],
         0,
@@ -337,7 +290,6 @@ pub fn run_benchmark_test(src_dir: &Path, targets: &[PathBuf]) -> Result<Benchma
         format!("Primary Drive benchmark failed: {e}")
     })?;
 
-    // 2. Parallel Multi-Drive Concurrent Read (indices 0, 1, ...)
     let start_parallel = Instant::now();
     let mut handles = Vec::new();
 
@@ -371,10 +323,8 @@ pub fn run_benchmark_test(src_dir: &Path, targets: &[PathBuf]) -> Result<Benchma
         }
     }
 
-    // Always clean up test files
     cleanup_bench_files(&all_paths);
 
-    // If any thread failed, abort with exact details instead of distorted metrics
     if !errors.is_empty() {
         return Err(format!(
             "Parallel benchmark failed on {} drive(s): {}",

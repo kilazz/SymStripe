@@ -1,4 +1,8 @@
 use crate::config::get_config_dir;
+use crate::win32::{
+    CREATE_ALWAYS, CloseHandle, CreateFileW, FILE_ATTRIBUTE_NORMAL, GENERIC_WRITE,
+    INVALID_HANDLE_VALUE, SetUnhandledExceptionFilter, WriteFile,
+};
 use std::ffi::c_void;
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
@@ -6,10 +10,6 @@ use std::panic;
 use std::sync::OnceLock;
 
 const EXCEPTION_EXECUTE_HANDLER: i32 = 1;
-const INVALID_HANDLE_VALUE: *mut c_void = -1isize as *mut c_void;
-const GENERIC_WRITE: u32 = 0x40000000;
-const CREATE_ALWAYS: u32 = 2;
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
 
 #[repr(C)]
 struct ExceptionRecord {
@@ -27,32 +27,6 @@ struct ExceptionPointers {
     context_record: *mut c_void,
 }
 
-type PVectoredExceptionHandler = unsafe extern "system" fn(pointers: *mut ExceptionPointers) -> i32;
-
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn SetUnhandledExceptionFilter(
-        lpTopLevelExceptionFilter: Option<PVectoredExceptionHandler>,
-    ) -> *mut c_void;
-    fn CreateFileW(
-        lpFileName: *const u16,
-        dwDesiredAccess: u32,
-        dwShareMode: u32,
-        lpSecurityAttributes: *mut c_void,
-        dwCreationDisposition: u32,
-        dwFlagsAndAttributes: u32,
-        hTemplateFile: *mut c_void,
-    ) -> *mut c_void;
-    fn WriteFile(
-        hFile: *mut c_void,
-        lpBuffer: *const c_void,
-        nNumberOfBytesToWrite: u32,
-        lpNumberOfBytesWritten: *mut u32,
-        lpOverlapped: *mut c_void,
-    ) -> i32;
-    fn CloseHandle(hObject: *mut c_void) -> i32;
-}
-
 // Pre-allocated static UTF-16 wide path to prevent any heap allocations during SEH handling
 static PREALLOCATED_CRASH_LOG_PATH: OnceLock<Vec<u16>> = OnceLock::new();
 
@@ -66,7 +40,7 @@ pub fn setup_crash_handler() {
     wide_path.push(0);
     let _ = PREALLOCATED_CRASH_LOG_PATH.set(wide_path);
 
-    // 1. Rust Standard Panic Hook
+    // Rust Standard Panic Hook
     panic::set_hook(Box::new(|info| {
         let backtrace = std::backtrace::Backtrace::force_capture();
         let panic_msg = format!(
@@ -76,7 +50,7 @@ pub fn setup_crash_handler() {
         write_crash_report_fallback(&panic_msg);
     }));
 
-    // 2. Windows Native Structured Exception Handling (SEH)
+    // Windows Native Structured Exception Handling (SEH)
     unsafe {
         SetUnhandledExceptionFilter(Some(unhandled_exception_filter));
     }
@@ -114,9 +88,14 @@ impl<'a> StackWriter<'a> {
 }
 
 /// Fully zero-allocation SEH top-level exception filter
-unsafe extern "system" fn unhandled_exception_filter(pointers: *mut ExceptionPointers) -> i32 {
+unsafe extern "system" fn unhandled_exception_filter(raw_pointers: *mut c_void) -> i32 {
     unsafe {
-        if pointers.is_null() || (*pointers).exception_record.is_null() {
+        if raw_pointers.is_null() {
+            return EXCEPTION_EXECUTE_HANDLER;
+        }
+
+        let pointers = raw_pointers as *mut ExceptionPointers;
+        if (*pointers).exception_record.is_null() {
             return EXCEPTION_EXECUTE_HANDLER;
         }
 

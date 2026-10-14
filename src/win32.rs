@@ -2,36 +2,41 @@ use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use winreg::RegKey;
 use winreg::enums::*;
 
-type Handle = *mut c_void;
-const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+pub type Handle = *mut c_void;
+pub const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 
-const FILE_SHARE_READ: u32 = 0x00000001;
-const FILE_SHARE_WRITE: u32 = 0x00000002;
-const OPEN_EXISTING: u32 = 3;
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
+pub const FILE_SHARE_READ: u32 = 0x00000001;
+pub const FILE_SHARE_WRITE: u32 = 0x00000002;
+pub const OPEN_EXISTING: u32 = 3;
+pub const CREATE_ALWAYS: u32 = 2;
+pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
+pub const GENERIC_WRITE: u32 = 0x40000000;
 
-const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
-const IOCTL_STORAGE_PREDICT_FAILURE: u32 = 0x002D1100;
+pub const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
+pub const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
 
-// HKEY_LOCAL_MACHINE: ((HKEY)(ULONG_PTR)((LONG)0x80000002))
-const HKEY_LOCAL_MACHINE: *mut c_void = (0x80000002_u32 as i32 as isize) as *mut c_void;
-const KEY_READ: u32 = 0x20019;
+pub const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
+pub const IOCTL_STORAGE_PREDICT_FAILURE: u32 = 0x002D1100;
 
-// CopyFileExW progress routine return codes
-const PROGRESS_CONTINUE: u32 = 0;
-const PROGRESS_CANCEL: u32 = 1;
+pub const HKEY_LOCAL_MACHINE: *mut c_void = (0x80000002_u32 as i32 as isize) as *mut c_void;
+pub const KEY_READ: u32 = 0x20019;
 
-// Process Information and Priority constants
-const PROCESS_POWER_THROTTLING: u32 = 4;
-const PROCESS_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
-const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
-const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x00008000;
+pub const PROGRESS_CONTINUE: u32 = 0;
+pub const PROGRESS_CANCEL: u32 = 1;
+
+pub const PROCESS_POWER_THROTTLING: u32 = 4;
+pub const PROCESS_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
+pub const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
+pub const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x00008000;
+
+pub type PVectoredExceptionHandler = unsafe extern "system" fn(pointers: *mut c_void) -> i32;
 
 #[allow(non_camel_case_types)]
-type LPPROGRESS_ROUTINE = Option<
+pub type LPPROGRESS_ROUTINE = Option<
     unsafe extern "system" fn(
         total_file_size: i64,
         total_bytes_transferred: i64,
@@ -67,24 +72,24 @@ struct ProcessPowerThrottlingState {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    fn GetLogicalDrives() -> u32;
-    fn GetDiskFreeSpaceExW(
+    pub fn GetLogicalDrives() -> u32;
+    pub fn GetDiskFreeSpaceExW(
         lpDirectoryName: *const u16,
         lpFreeBytesAvailableToCaller: *mut u64,
         lpTotalNumberOfBytes: *mut u64,
         lpTotalNumberOfFreeBytes: *mut u64,
     ) -> i32;
-    fn GetVolumePathNameW(
+    pub fn GetVolumePathNameW(
         lpszFileName: *const u16,
         lpszVolumePathName: *mut u16,
         cchBufferLength: u32,
     ) -> i32;
-    fn GetVolumeNameForVolumeMountPointW(
+    pub fn GetVolumeNameForVolumeMountPointW(
         lpszVolumeMountPoint: *const u16,
         lpszVolumeName: *mut u16,
         cchBufferLength: u32,
     ) -> i32;
-    fn CreateFileW(
+    pub fn CreateFileW(
         lpFileName: *const u16,
         dwDesiredAccess: u32,
         dwShareMode: u32,
@@ -93,8 +98,15 @@ unsafe extern "system" {
         dwFlagsAndAttributes: u32,
         hTemplateFile: *mut c_void,
     ) -> Handle;
-    fn CloseHandle(hObject: Handle) -> i32;
-    fn DeviceIoControl(
+    pub fn WriteFile(
+        hFile: Handle,
+        lpBuffer: *const c_void,
+        nNumberOfBytesToWrite: u32,
+        lpNumberOfBytesWritten: *mut u32,
+        lpOverlapped: *mut c_void,
+    ) -> i32;
+    pub fn CloseHandle(hObject: Handle) -> i32;
+    pub fn DeviceIoControl(
         hDevice: Handle,
         dwIoControlCode: u32,
         lpInBuffer: *const c_void,
@@ -104,13 +116,16 @@ unsafe extern "system" {
         lpBytesReturned: *mut u32,
         lpOverlapped: *mut c_void,
     ) -> i32;
-    fn CreateSymbolicLinkW(
+    pub fn CreateSymbolicLinkW(
         lpSymlinkFileName: *const u16,
         lpTargetFileName: *const u16,
         dwFlags: u32,
     ) -> u8;
-    fn DeleteFileW(lpFileName: *const u16) -> i32;
-    fn GetLastError() -> u32;
+    pub fn DeleteFileW(lpFileName: *const u16) -> i32;
+    pub fn GetLastError() -> u32;
+    pub fn SetUnhandledExceptionFilter(
+        lpTopLevelExceptionFilter: Option<PVectoredExceptionHandler>,
+    ) -> *mut c_void;
     fn GlobalMemoryStatusEx(lpBuffer: *mut MemoryStatusEx) -> i32;
     fn CopyFileExW(
         lpExistingFileName: *const u16,
@@ -132,6 +147,13 @@ unsafe extern "system" {
 
 #[link(name = "advapi32")]
 unsafe extern "system" {
+    pub fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sd_str: *const u16,
+        rev: u32,
+        sd: *mut *mut c_void,
+        sz: *mut u32,
+    ) -> i32;
+    pub fn LocalFree(mem: *mut c_void) -> *mut c_void;
     fn RegOpenKeyExW(
         hKey: *mut c_void,
         lpSubKey: *const u16,
@@ -157,8 +179,33 @@ pub fn to_wide_null(s: &str) -> Vec<u16> {
         .collect()
 }
 
-/// Resolves an absolute path to a stable Windows Volume GUID path (`\\?\Volume{GUID}\...`),
-/// immunizing NTFS symbolic links from drive letter re-assignments.
+pub fn get_default_security_descriptor() -> &'static [u8] {
+    static SD: OnceLock<Vec<u8>> = OnceLock::new();
+    SD.get_or_init(|| {
+        let sddl = to_wide_null("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)");
+        let mut p_sd = std::ptr::null_mut();
+        let mut size = 0u32;
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut p_sd,
+                &mut size,
+            )
+        };
+        if ok != 0 && !p_sd.is_null() && size > 0 {
+            let bytes =
+                unsafe { std::slice::from_raw_parts(p_sd as *const u8, size as usize).to_vec() };
+            unsafe { LocalFree(p_sd) };
+            bytes
+        } else {
+            vec![
+                1, 0, 0x04, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]
+        }
+    })
+}
+
 pub fn get_volume_guid_path(path: &Path) -> Option<PathBuf> {
     let path_str = path.to_str()?;
     if path_str.starts_with(r"\\?\Volume{") {
@@ -211,7 +258,6 @@ pub fn get_volume_guid_path(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(full_guid_path))
 }
 
-/// Dynamically queries the hardware bus type (NVMe, SATA, USB, etc.) for a given path.
 pub fn get_path_bus_type(path: &Path) -> String {
     let path_str = path.to_string_lossy();
     let letter = path_str.chars().next().filter(|c| c.is_ascii_alphabetic());
@@ -274,15 +320,12 @@ pub fn get_path_bus_type(path: &Path) -> String {
 pub fn boost_process_priority() {
     unsafe {
         let process = GetCurrentProcess();
-
-        // Elevate process priority to prevent thread starvation and audio DPC latency
         SetPriorityClass(process, ABOVE_NORMAL_PRIORITY_CLASS);
 
-        // Explicitly disable Windows 11 Power Throttling (Efficiency / EcoQoS Mode)
         let throttling = ProcessPowerThrottlingState {
             version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
             control_mask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-            state_mask: 0, // StateMask = 0 turns off throttling
+            state_mask: 0,
         };
 
         SetProcessInformation(
@@ -373,7 +416,6 @@ pub fn test_symlink_privilege() -> Result<(), (u32, bool)> {
     let wide_target = to_wide_null(&target.to_string_lossy());
     let wide_link = to_wide_null(&link.to_string_lossy());
 
-    // 0x2 = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
     let success = unsafe { CreateSymbolicLinkW(wide_link.as_ptr(), wide_target.as_ptr(), 0x2) };
 
     let _ = fs::remove_file(&target);
@@ -417,14 +459,12 @@ where
     }
 }
 
-/// Copies a file with granular byte-by-byte progress feedback and cancellation support via Win32 CopyFileExW.
 pub fn copy_file_with_progress<F>(src: &Path, dst: &Path, mut progress_fn: F) -> Result<u64, String>
 where
     F: FnMut(u64, u64) -> bool,
 {
     let src_wide = to_wide_null(&src.to_string_lossy());
     let dst_wide = to_wide_null(&dst.to_string_lossy());
-
     let data_ptr = &mut progress_fn as *mut F as *mut c_void;
 
     let res = unsafe {
@@ -447,7 +487,6 @@ where
     }
 }
 
-/// Verifies whether the WinFsp runtime is installed before invoking delay-loaded Fsp APIs.
 pub fn check_winfsp_available() -> Result<(), String> {
     for key_path in [r"SOFTWARE\WinFsp", r"SOFTWARE\WOW6432Node\WinFsp"] {
         let wide_key = to_wide_null(key_path);
@@ -480,8 +519,8 @@ pub fn check_winfsp_available() -> Result<(), String> {
     }
 
     Err("WinFsp runtime is not detected on this system!\n\n\
-        Virtual Storage Pool (VFS RAID-0) requires WinFsp.\n\
-        Please download and install WinFsp from https://winfsp.dev/ \n\
+        Virtual Storage Pool requires WinFsp.\n\
+        Please download and install WinFsp from https://winfsp.dev/\n\
         (or via Windows Terminal: 'winget install WinFsp.WinFsp') and restart SymStripe."
         .to_string())
 }
@@ -547,7 +586,7 @@ fn map_bus_type(bus_type: u32) -> &'static str {
         14 => "Virtual Disk",
         16 => "Storage Space",
         17 => "NVMe",
-        _ => "Disk",
+        _ => "Storage",
     }
 }
 

@@ -10,20 +10,35 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
-pub static BENCH_BYTES_D1: AtomicU64 = AtomicU64::new(0);
-pub static BENCH_BYTES_D2: AtomicU64 = AtomicU64::new(0);
-pub static BENCH_LAT_D1: AtomicU64 = AtomicU64::new(0);
-pub static BENCH_LAT_D2: AtomicU64 = AtomicU64::new(0);
+pub const MAX_TRACKED_DRIVES: usize = 8;
 
-/// Feeds real-time benchmark streaming metrics directly into the telemetry pipeline.
+pub static BENCH_BYTES: [AtomicU64; MAX_TRACKED_DRIVES] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+pub static BENCH_LATS: [AtomicU64; MAX_TRACKED_DRIVES] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
 #[inline]
 pub fn report_benchmark_io(drive_idx: usize, bytes: usize, latency_ms: u64) {
-    if drive_idx == 0 {
-        BENCH_BYTES_D1.fetch_add(bytes as u64, Ordering::Relaxed);
-        BENCH_LAT_D1.fetch_max(latency_ms, Ordering::Relaxed);
-    } else {
-        BENCH_BYTES_D2.fetch_add(bytes as u64, Ordering::Relaxed);
-        BENCH_LAT_D2.fetch_max(latency_ms, Ordering::Relaxed);
+    if drive_idx < MAX_TRACKED_DRIVES {
+        BENCH_BYTES[drive_idx].fetch_add(bytes as u64, Ordering::Relaxed);
+        BENCH_LATS[drive_idx].fetch_max(latency_ms, Ordering::Relaxed);
     }
 }
 
@@ -54,7 +69,7 @@ pub fn init_tray_and_telemetry(
 
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
-        .with_tooltip("SymStripe RAM-Accelerated RAID-0")
+        .with_tooltip("SymStripe Multi-Spindle Accelerator")
         .with_icon(icon)
         .build()
         .unwrap();
@@ -66,17 +81,14 @@ pub fn init_tray_and_telemetry(
         let mut last_tick = Instant::now();
         let mut last_sec_tick = Instant::now();
 
-        let mut accum_d1_bytes = 0u64;
-        let mut accum_d2_bytes = 0u64;
-        let mut max_lat1 = 0u64;
-        let mut max_lat2 = 0u64;
+        let mut accum_bytes: [u64; MAX_TRACKED_DRIVES] = [0; MAX_TRACKED_DRIVES];
+        let mut max_lats: [u64; MAX_TRACKED_DRIVES] = [0; MAX_TRACKED_DRIVES];
 
         loop {
             thread::sleep(Duration::from_millis(250));
             let elapsed = last_tick.elapsed().as_secs_f64();
             last_tick = Instant::now();
 
-            // Tray Event Polling
             if let Ok(event) = MenuEvent::receiver().try_recv() {
                 if event.id == quit_id {
                     std::process::exit(0);
@@ -110,82 +122,83 @@ pub fn init_tray_and_telemetry(
                 });
             }
 
-            // Real-Time I/O: Merge VFS Pool activity AND Hardware Benchmark streaming
             let (stats_io, stats_graph) = {
                 let mut st = state_telemetry.lock();
 
-                // 1. Drain benchmark metrics
-                let bench_b1 = BENCH_BYTES_D1.swap(0, Ordering::Relaxed);
-                let bench_b2 = BENCH_BYTES_D2.swap(0, Ordering::Relaxed);
-                let bench_l1 = BENCH_LAT_D1.swap(0, Ordering::Relaxed);
-                let bench_l2 = BENCH_LAT_D2.swap(0, Ordering::Relaxed);
+                let mut current_bytes = [0u64; MAX_TRACKED_DRIVES];
+                let mut current_lats = [0u64; MAX_TRACKED_DRIVES];
 
-                // 2. Drain VFS session metrics if active
-                let (vfs_b1, vfs_b2, vfs_l1, vfs_l2, names, hit_rate, saved_gb) =
-                    if let Some(session) = &st.pool_session {
-                        let (deltas, lats) = session.sample_and_reset_io();
-                        let d1 = deltas.first().copied().unwrap_or(0);
-                        let d2 = deltas.get(1).copied().unwrap_or(0);
-                        let l1 = lats.first().copied().unwrap_or(0);
-                        let l2 = lats.get(1).copied().unwrap_or(0);
-                        let n: Vec<String> = session
-                            .member_paths
-                            .iter()
-                            .enumerate()
-                            .map(|(i, p)| format!("Drive {} ({})", i + 1, p.to_string_lossy()))
-                            .collect();
+                for i in 0..MAX_TRACKED_DRIVES {
+                    current_bytes[i] += BENCH_BYTES[i].swap(0, Ordering::Relaxed);
+                    current_lats[i] = current_lats[i].max(BENCH_LATS[i].swap(0, Ordering::Relaxed));
+                }
 
-                        let hits = session.cache_hits.load(Ordering::Relaxed);
-                        let misses = session.cache_misses.load(Ordering::Relaxed);
-                        let total_cache = hits + misses;
-                        let hr = if total_cache > 0 {
-                            (hits as f64 / total_cache as f64) * 100.0
-                        } else {
-                            0.0
-                        };
-                        let raw = session.raw_bytes.load(Ordering::Relaxed);
-                        let comp = session.compressed_bytes.load(Ordering::Relaxed);
-                        let sgb = raw.saturating_sub(comp) as f64 / 1_073_741_824.0;
+                let (names, hit_rate, saved_gb) = if let Some(session) = &st.pool_session {
+                    let (deltas, lats) = session.sample_and_reset_io();
+                    for (i, &d) in deltas.iter().enumerate().take(MAX_TRACKED_DRIVES) {
+                        current_bytes[i] += d;
+                    }
+                    for (i, &l) in lats.iter().enumerate().take(MAX_TRACKED_DRIVES) {
+                        current_lats[i] = current_lats[i].max(l);
+                    }
 
-                        (d1, d2, l1, l2, n, hr, sgb)
+                    let n: Vec<String> = session
+                        .member_paths
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| format!("Drive {} ({})", i + 1, p.to_string_lossy()))
+                        .collect();
+
+                    let hits = session.cache_hits.load(Ordering::Relaxed);
+                    let misses = session.cache_misses.load(Ordering::Relaxed);
+                    let total_cache = hits + misses;
+                    let hr = if total_cache > 0 {
+                        (hits as f64 / total_cache as f64) * 100.0
                     } else {
-                        (
-                            0,
-                            0,
-                            0,
-                            0,
-                            vec![
-                                "Drive 1 (Primary)".to_string(),
-                                "Drive 2 (Secondary)".to_string(),
-                            ],
-                            0.0,
-                            0.0,
-                        )
+                        0.0
                     };
+                    let raw = session.raw_bytes.load(Ordering::Relaxed);
+                    let comp = session.compressed_bytes.load(Ordering::Relaxed);
+                    let sgb = raw.saturating_sub(comp) as f64 / 1_073_741_824.0;
+                    (n, hr, sgb)
+                } else {
+                    (
+                        vec![
+                            "Drive 1 (Primary)".to_string(),
+                            "Drive 2 (Secondary)".to_string(),
+                        ],
+                        0.0,
+                        0.0,
+                    )
+                };
 
-                let cur_d1 = vfs_b1 + bench_b1;
-                let cur_d2 = vfs_b2 + bench_b2;
-                let cur_lat1 = vfs_l1.max(bench_l1);
-                let cur_lat2 = vfs_l2.max(bench_l2);
-
-                accum_d1_bytes += cur_d1;
-                accum_d2_bytes += cur_d2;
-                max_lat1 = max_lat1.max(cur_lat1);
-                max_lat2 = max_lat2.max(cur_lat2);
+                for i in 0..MAX_TRACKED_DRIVES {
+                    accum_bytes[i] += current_bytes[i];
+                    max_lats[i] = max_lats[i].max(current_lats[i]);
+                }
 
                 let mut g_update = None;
                 let sec_elapsed = last_sec_tick.elapsed().as_secs_f64();
 
-                // Generate graph point every 1.0 second
                 if sec_elapsed >= 1.0 {
-                    let d1_mbs = (accum_d1_bytes as f32 / 1_048_576.0) / sec_elapsed as f32;
-                    let d2_mbs = (accum_d2_bytes as f32 / 1_048_576.0) / sec_elapsed as f32;
+                    let mut speeds = Vec::with_capacity(MAX_TRACKED_DRIVES);
+                    let mut total_sec_bytes = 0u64;
+                    let mut overall_max_lat = 0u64;
+
+                    for i in 0..MAX_TRACKED_DRIVES {
+                        let spd = (accum_bytes[i] as f32 / 1_048_576.0) / sec_elapsed as f32;
+                        speeds.push(spd);
+                        total_sec_bytes += accum_bytes[i];
+                        overall_max_lat = overall_max_lat.max(max_lats[i]);
+                    }
+
+                    let total_mbs = (total_sec_bytes as f32 / 1_048_576.0) / sec_elapsed as f32;
 
                     st.metrics.push_back(MetricPoint {
-                        d1_mbs,
-                        d2_mbs,
-                        d1_lat: max_lat1,
-                        d2_lat: max_lat2,
+                        drive_speeds_mbs: speeds,
+                        drive_lats_ms: max_lats.to_vec(),
+                        total_mbs,
+                        max_lat_ms: overall_max_lat,
                     });
 
                     if st.metrics.len() > 300 {
@@ -196,38 +209,52 @@ pub fn init_tray_and_telemetry(
                     let skip = st.metrics.len().saturating_sub(win);
                     let mut dynamic_max = 50.0_f32;
                     for pt in st.metrics.iter().skip(skip) {
-                        dynamic_max = dynamic_max.max(pt.d1_mbs).max(pt.d2_mbs);
+                        for &spd in &pt.drive_speeds_mbs {
+                            dynamic_max = dynamic_max.max(spd);
+                        }
                     }
 
                     let mut graph_data = Vec::new();
                     for pt in st.metrics.iter().skip(skip) {
+                        let d1 = pt.drive_speeds_mbs.first().copied().unwrap_or(0.0);
+                        let d2 = pt.drive_speeds_mbs.get(1).copied().unwrap_or(0.0);
                         graph_data.push(crate::GraphPoint {
-                            d1_val: (pt.d1_mbs / dynamic_max).clamp(0.0, 1.0),
-                            d2_val: (pt.d2_mbs / dynamic_max).clamp(0.0, 1.0),
-                            is_stall: pt.d1_lat > 250 || pt.d2_lat > 250,
+                            d1_val: (d1 / dynamic_max).clamp(0.0, 1.0),
+                            d2_val: (d2 / dynamic_max).clamp(0.0, 1.0),
+                            is_stall: pt.max_lat_ms > 250,
                         });
                     }
 
-                    let insights = if max_lat1 > 250 || max_lat2 > 250 {
+                    let d1_sec = (accum_bytes[0] as f32 / 1_048_576.0) / sec_elapsed as f32;
+                    let d2_sec = (accum_bytes[1] as f32 / 1_048_576.0) / sec_elapsed as f32;
+
+                    let insights = if overall_max_lat > 250 {
                         "🔴 Spindle Bottleneck: High latency (>250ms) detected. Micro-stalls likely."
-                    } else if d1_mbs > 15.0 && d2_mbs > 15.0 {
-                        "🟢 Optimal Spindle Parallelism: Both drives streaming concurrently."
-                    } else if (d1_mbs > 15.0 && d2_mbs < 2.0) || (d2_mbs > 15.0 && d1_mbs < 2.0) {
-                        "🟡 Single-Drive / Asymmetric Load Detected."
+                    } else if d1_sec > 15.0 && d2_sec > 15.0 {
+                        "🟢 Optimal Spindle Parallelism: Multi-drive concurrent streaming active."
+                    } else if (d1_sec > 15.0 && d2_sec < 2.0) || (d2_sec > 15.0 && d1_sec < 2.0) {
+                        "🟡 Asymmetric Spindle Load Detected."
                     } else {
                         "⚪ System Idle or Low Activity."
                     };
 
                     g_update = Some((graph_data, insights.to_string()));
 
-                    accum_d1_bytes = 0;
-                    accum_d2_bytes = 0;
-                    max_lat1 = 0;
-                    max_lat2 = 0;
+                    accum_bytes = [0; MAX_TRACKED_DRIVES];
+                    max_lats = [0; MAX_TRACKED_DRIVES];
                     last_sec_tick = Instant::now();
                 }
 
-                (Some((cur_d1, cur_d2, names, hit_rate, saved_gb)), g_update)
+                (
+                    Some((
+                        current_bytes[0],
+                        current_bytes[1],
+                        names,
+                        hit_rate,
+                        saved_gb,
+                    )),
+                    g_update,
+                )
             };
 
             let _ = ui_weak_telemetry.upgrade_in_event_loop(move |ui| {

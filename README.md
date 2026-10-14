@@ -6,14 +6,14 @@ High-throughput storage accelerator and user-mode virtual filesystem (WinFsp) fo
 
 ## Operating Modes
 
-### 1. In-Place Game Optimizer (Symlinks)
+### In-Place Game Optimizer (Symlinks)
 Offloads large game archives (`.ucas`, `.pak`, media) to secondary drives while maintaining transparent links in the original game directory.
 - **Volume GUID Anchoring:** Links target `\\?\Volume{GUID}\...` — immune to drive letter changes.
 - **UE5 IoStore Guard:** Retains critical bootstrap packages (`pakchunk0`, `global.*`) on the primary drive; keeps companions (`.utoc`, `.sig`) co-located with `.ucas`.
 - **LPT Balancing:** Balances file distribution across drives based on container size and available space.
 - **Safety & Rollback:** Atomic `.striping_manifest.json`, local `.backup` safety net, and target consolidation.
 
-### 2. Virtual Storage Pool (VFS Z:)
+### Virtual Storage Pool (VFS Z:)
 Aggregates folders across multiple physical disks into a unified virtual drive `Z:` via WinFsp.
 - **Policies:** RAID-0 (Striped), JBOD (Capacity Merge), RAID-1 (Mirror).
 - **Asymmetric Weighted Striping (RAID-0):** Auto-calibrates drive speed ratios (e.g., 2:1 schedule `[D1, D1, D2]`) so faster drives never stall on slower spindles.
@@ -37,7 +37,7 @@ Aggregates folders across multiple physical disks into a unified virtual drive `
 
 ## Requirements & Build
 
-- Windows 10 / 11 (x64)
+- Windows 10/11 (x64)
 - [WinFsp Runtime](https://winfsp.dev/) installed
 - Rust 1.80+ (Edition 2024)
 - Slint UI 1.18

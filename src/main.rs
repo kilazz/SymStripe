@@ -1,3 +1,4 @@
+mod aligned_buf;
 mod benchmark;
 mod config;
 mod crash_handler;
@@ -8,7 +9,7 @@ mod stripe_math;
 mod striping;
 mod telemetry;
 mod ui_controller;
-mod vfs_pool;
+mod vfs;
 mod win32;
 mod zstd_atg;
 
@@ -17,16 +18,16 @@ use parking_lot::Mutex;
 use slint::CloseRequestResponse;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use vfs_pool::VfsPoolSession;
+use vfs::VfsPoolSession;
 
 slint::include_modules!();
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct MetricPoint {
-    pub d1_mbs: f32,
-    pub d2_mbs: f32,
-    pub d1_lat: u64,
-    pub d2_lat: u64,
+    pub drive_speeds_mbs: Vec<f32>,
+    pub drive_lats_ms: Vec<u64>,
+    pub total_mbs: f32,
+    pub max_lat_ms: u64,
 }
 
 pub struct AppState {

@@ -1,127 +1,35 @@
-use crate::benchmark::AlignedBuffer;
+use super::cache::{CacheInner, CachedPart, GlobalStripeCache};
+use super::calibration::VfsLogCallback;
+use super::node::{FileNode, PartKey, PoolFileHandle, VfsCodec, hash_path_id};
 use crate::stripe_math::StripeConfig;
-use crate::win32::{check_winfsp_available, get_system_ram_mb};
+use crate::win32::{get_default_security_descriptor, get_system_ram_mb};
 use crate::zstd_atg::ZstdAtgCompressor;
 use parking_lot::{Condvar, Mutex, RwLock};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
-use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
-use std::os::windows::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::os::windows::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Instant;
-
 use widestring::U16CStr;
 use winfsp::FspError;
 use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
     VolumeInfo, WideNameInfo,
 };
-use winfsp::host::{FileSystemHost, VolumeParams};
 use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
+pub const MIN_HDD_OPTIMAL_STRIPE_BYTES: u64 = 64 * 1024 * 1024;
+const DIRECT_READ_WINDOW_BYTES: u64 = 1024 * 1024;
 const STATUS_INVALID_DEVICE_REQUEST: i32 = 0xC0000010_u32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC0000034_u32 as i32;
 const STATUS_IO_DEVICE_ERROR: i32 = 0xC0000185_u32 as i32;
 const STATUS_BUFFER_TOO_SMALL: i32 = 0xC0000023_u32 as i32;
 
-pub const MIN_HDD_OPTIMAL_STRIPE_BYTES: u64 = 64 * 1024 * 1024;
-const DIRECT_READ_WINDOW_BYTES: u64 = 1024 * 1024;
-
-pub type VfsLogCallback = Arc<dyn Fn(String) + Send + Sync>;
 type CachedPartTuple = (u64, Arc<RwLock<CachedPart>>);
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum VfsCodec {
-    Lz4 = 0,
-    Zstd = 1,
-    Store = 2,
-}
-
-impl VfsCodec {
-    pub fn from_i32(v: i32) -> Self {
-        match v {
-            1 => Self::Zstd,
-            2 => Self::Store,
-            _ => Self::Lz4,
-        }
-    }
-}
-
-pub fn hash_path_id(rel_path: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    rel_path.to_lowercase().hash(&mut hasher);
-    hasher.finish()
-}
-
-#[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
-pub struct PartKey {
-    pub file_hash: u64,
-    pub part_index: u64,
-}
-
-pub struct CachedPart {
-    pub data: Vec<u8>,
-    pub dirty: bool,
-    pub referenced: AtomicBool, // CLOCK algorithm second-chance access bit
-    pub codec: VfsCodec,
-    pub rel_path: String,
-    pub file_hash: u64,
-    pub part_index: u64,
-}
-
-pub struct CacheInner {
-    pub entries: HashMap<PartKey, Arc<RwLock<CachedPart>>>,
-    pub clock_ring: Vec<PartKey>,
-    pub clock_hand: usize,
-}
-
-pub struct GlobalStripeCache {
-    pub inner: Mutex<CacheInner>,
-    pub max_parts: usize,
-}
-
-pub struct DirectBuffer {
-    pub offset: u64,
-    pub data: Vec<u8>,
-}
-
-pub struct FileNode {
-    pub rel_path: RwLock<String>,
-    pub file_hash: AtomicU64,
-    pub is_striped: bool,
-    pub present_on: Vec<usize>,
-    pub file_codec: VfsCodec,
-    pub file_size: Mutex<u64>,
-    pub dirty_parts: Mutex<HashSet<u64>>,
-    pub direct_cache: Mutex<Option<DirectBuffer>>,
-    pub is_modified: Mutex<bool>,
-    pub open_handles: AtomicUsize,
-}
-
-impl FileNode {
-    pub fn rel_path(&self) -> String {
-        self.rel_path.read().clone()
-    }
-}
-
-pub struct PoolFileHandle {
-    pub is_dir: bool,
-    pub rel_path: RwLock<String>,
-    pub node: Option<Arc<FileNode>>,
-    pub dir_buffer: Mutex<DirBuffer>,
-    pub delete_on_close: Mutex<bool>,
-}
-
-impl PoolFileHandle {
-    pub fn rel_path(&self) -> String {
-        self.rel_path.read().clone()
-    }
-}
 
 struct LoadingLeaderGuard {
     table: Arc<Mutex<HashMap<PartKey, Arc<Condvar>>>>,
@@ -155,7 +63,6 @@ pub struct SymStripePoolFs {
     pub pool_used_bytes: Arc<AtomicU64>,
     pub spindle_locks: Arc<Vec<Mutex<()>>>,
     pub rr_counter: Arc<AtomicUsize>,
-
     pub io_bytes: Arc<Vec<AtomicU64>>,
     pub io_max_latency_ms: Arc<Vec<AtomicU64>>,
     pub cache_hits: Arc<AtomicU64>,
@@ -183,13 +90,11 @@ impl SymStripePoolFs {
                 .map(|_| AtomicU64::new(0))
                 .collect::<Vec<_>>(),
         );
-
         let io_max_latency_ms = Arc::new(
             (0..num_drives)
                 .map(|_| AtomicU64::new(0))
                 .collect::<Vec<_>>(),
         );
-
         let spindle_locks = Arc::new((0..num_drives).map(|_| Mutex::new(())).collect::<Vec<_>>());
         let effective_stripe = stripe_size_bytes.max(MIN_HDD_OPTIMAL_STRIPE_BYTES);
 
@@ -207,7 +112,6 @@ impl SymStripePoolFs {
         let calculated_parts = (cache_budget_bytes / effective_stripe).max(1);
         let max_parts = (calculated_parts.min(2048)) as usize;
 
-        // Initialize weighted or symmetric StripeConfig
         let stripe_config = if let Some(weights) = drive_weights {
             StripeConfig::new_weighted(effective_stripe, weights)
         } else {
@@ -321,7 +225,6 @@ impl SymStripePoolFs {
     fn add_used_bytes(&self, val: u64) {
         self.pool_used_bytes.fetch_add(val, Ordering::Relaxed);
     }
-
     #[inline]
     fn sub_used_bytes(&self, val: u64) {
         let _ = self
@@ -330,24 +233,20 @@ impl SymStripePoolFs {
                 Some(x.saturating_sub(val))
             });
     }
-
     fn log(&self, msg: String) {
         if let Some(cb) = &self.logger {
             cb(msg);
         }
     }
-
     fn normalize_path(raw_path: &U16CStr) -> String {
         raw_path
             .to_string_lossy()
             .trim_start_matches('\\')
             .to_string()
     }
-
     fn master(&self) -> &Path {
         &self.members[0]
     }
-
     fn meta_path(&self, rel_path: &str) -> PathBuf {
         self.master().join(format!("{}.symstripe_meta", rel_path))
     }
@@ -390,17 +289,12 @@ impl SymStripePoolFs {
     fn catalog_path(&self) -> PathBuf {
         self.master().join(".symstripe_jbod_catalog.json")
     }
-
     fn load_jbod_catalog(&self) -> HashMap<String, usize> {
-        if let Ok(c) = fs::read_to_string(self.catalog_path())
-            && let Ok(map) = serde_json::from_str(&c)
-        {
-            map
-        } else {
-            HashMap::new()
-        }
+        fs::read_to_string(self.catalog_path())
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
     }
-
     fn save_jbod_catalog(&self) {
         let tmp = self.master().join(".symstripe_jbod_catalog.json.tmp");
         if let Ok(json) = serde_json::to_string(&*self.jbod_map.read())
@@ -459,7 +353,6 @@ impl SymStripePoolFs {
                 return node.clone();
             }
         }
-
         let mut map = self.file_nodes.write();
         let node = map.entry(key).or_insert_with(|| {
             Arc::new(FileNode {
@@ -475,7 +368,6 @@ impl SymStripePoolFs {
                 open_handles: AtomicUsize::new(0),
             })
         });
-
         node.open_handles.fetch_add(1, Ordering::Relaxed);
         node.clone()
     }
@@ -501,31 +393,26 @@ impl SymStripePoolFs {
             return;
         }
 
-        // Unified weighted part-to-drive mapping
         let target_drive_idx = self
             .stripe_config
             .map_part_to_drive(part.file_hash, part.part_index);
-
         let ext = match part.codec {
             VfsCodec::Lz4 => "lz4",
             VfsCodec::Zstd => "zst",
             VfsCodec::Store => "raw",
         };
-
         let (base_path, legacy_path) =
             self.resolve_part_paths(target_drive_idx, &part.rel_path, part.part_index, ext);
 
         if let Some(parent) = base_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-
         let _spindle_guard = self.spindle_locks[target_drive_idx].lock();
 
         let old_len = fs::metadata(&base_path)
             .or_else(|_| fs::metadata(&legacy_path))
             .map(|m| m.len())
             .unwrap_or(0);
-
         let compressed = match part.codec {
             VfsCodec::Lz4 => lz4_flex::compress_prepend_size(&part.data),
             VfsCodec::Zstd => {
@@ -536,7 +423,6 @@ impl SymStripePoolFs {
 
         let new_len = compressed.len() as u64;
         let diff = new_len as i64 - old_len as i64;
-
         if diff > 0 {
             self.add_used_bytes(diff as u64);
         } else if diff < 0 {
@@ -547,13 +433,10 @@ impl SymStripePoolFs {
             .fetch_add(part.data.len() as u64, Ordering::Relaxed);
         self.compressed_bytes_written
             .fetch_add(new_len, Ordering::Relaxed);
-
         let _ = fs::write(&base_path, compressed);
-
         if legacy_path.exists() && legacy_path != base_path {
             let _ = fs::remove_file(legacy_path);
         }
-
         part.dirty = false;
     }
 
@@ -618,19 +501,16 @@ impl SymStripePoolFs {
             part_index,
         };
 
-        // 1. Fast path: O(1) cache check with atomic second-chance bit
         let _loading_guard = loop {
             {
                 let inner = self.global_cache.inner.lock();
                 if let Some(part) = inner.entries.get(&key) {
                     self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    // Lock-free reference update for CLOCK algorithm
                     let guard = part.read();
                     guard.referenced.store(true, Ordering::Relaxed);
                     return Ok(part.clone());
                 }
             }
-
             let mut inflight = self.in_flight_loads.lock();
             if let Some(cv) = inflight.get(&key).cloned() {
                 cv.wait(&mut inflight);
@@ -699,17 +579,15 @@ impl SymStripePoolFs {
         let new_part = Arc::new(RwLock::new(CachedPart {
             data,
             dirty: false,
-            referenced: AtomicBool::new(true), // Initial second chance granted
+            referenced: AtomicBool::new(true),
             codec: loaded_codec,
             rel_path: rel,
             file_hash: current_hash,
             part_index,
         }));
 
-        // 2. O(1) CLOCK (Second Chance) Eviction Algorithm without O(N) linear scanning
         let evicted_part = {
             let mut inner = self.global_cache.inner.lock();
-
             if let Some(existing) = inner.entries.get(&key) {
                 return Ok(existing.clone());
             }
@@ -737,7 +615,6 @@ impl SymStripePoolFs {
                             continue;
                         }
 
-                        // Check second-chance bit
                         let was_referenced = {
                             let guard = part_arc.read();
                             guard.referenced.swap(false, Ordering::Relaxed)
@@ -749,13 +626,11 @@ impl SymStripePoolFs {
                             continue;
                         }
 
-                        // Victim found: evict in O(1)
                         evicted = inner.entries.remove(&candidate_key);
                         inner.clock_ring[hand] = key;
                         inner.clock_hand = (hand + 1) % ring_len;
                         break;
                     } else {
-                        // Stale entry in ring (e.g., deleted or renamed) -> reuse slot immediately
                         inner.clock_ring[hand] = key;
                         inner.clock_hand = (hand + 1) % ring_len;
                         break;
@@ -774,7 +649,6 @@ impl SymStripePoolFs {
             self.evict_part_to_disk(&evicted);
         }
 
-        // 3. Asymmetric Adaptive Lookahead Prefetching
         if allow_prefetch {
             let file_size = *node.file_size.lock();
             let stripe_size = self.stripe_config.stripe_size_bytes;
@@ -806,8 +680,6 @@ impl SymStripePoolFs {
                 let node_clone = Arc::clone(node);
                 rayon::spawn(move || {
                     let c_hash = node_clone.file_hash.load(Ordering::Relaxed);
-
-                    // Priority scheduling: fetch from drives with higher recorded latency first
                     candidates.sort_by_key(|&p_idx| {
                         let d = fs_clone.stripe_config.map_part_to_drive(c_hash, p_idx);
                         let lat = fs_clone
@@ -821,12 +693,10 @@ impl SymStripePoolFs {
                     for p_idx in candidates {
                         let target_d = fs_clone.stripe_config.map_part_to_drive(c_hash, p_idx);
                         let _ = fs_clone.fetch_cached_part(&node_clone, p_idx, target_d, false);
-
-                        let key = PartKey {
+                        fs_clone.prefetch_in_flight.lock().remove(&PartKey {
                             file_hash: c_hash,
                             part_index: p_idx,
-                        };
-                        fs_clone.prefetch_in_flight.lock().remove(&key);
+                        });
                     }
                 });
             }
@@ -844,7 +714,6 @@ impl FileSystemContext for SymStripePoolFs {
         let mut total_size = 0u64;
 
         if self.policy == 1 {
-            // Weighted RAID-0 capacity calculation: Sum(w_i) * Min(Free_i / w_i)
             let weights = &self.stripe_config.drive_weights;
             let mut min_unit_free = u64::MAX;
             let mut min_unit_total = u64::MAX;
@@ -902,7 +771,6 @@ impl FileSystemContext for SymStripePoolFs {
         _rp: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
         let rel_path = Self::normalize_path(file_name);
-
         let is_dir = if rel_path.is_empty() {
             true
         } else {
@@ -926,7 +794,6 @@ impl FileSystemContext for SymStripePoolFs {
                         break;
                     }
                 }
-
                 if found_as_dir {
                     true
                 } else if found_as_file {
@@ -986,7 +853,6 @@ impl FileSystemContext for SymStripePoolFs {
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
         let rel_path = Self::normalize_path(file_name);
-
         let (is_dir, is_striped, present_on, file_size) =
             if rel_path.is_empty() || self.members.iter().any(|m| m.join(&rel_path).is_dir()) {
                 (true, false, vec![], 0)
@@ -1041,7 +907,6 @@ impl FileSystemContext for SymStripePoolFs {
             } else {
                 PathBuf::new()
             };
-
             if check_p.exists()
                 && let Ok(m) = fs::metadata(&check_p)
             {
@@ -1086,7 +951,6 @@ impl FileSystemContext for SymStripePoolFs {
             || lower_rel.ends_with(".dll")
             || lower_rel.ends_with(".ini")
             || lower_rel.ends_with(".cfg");
-
         let is_bulk_stream = lower_rel.ends_with(".ucas")
             || lower_rel.ends_with(".bk2")
             || lower_rel.ends_with(".mp4")
@@ -1167,7 +1031,6 @@ impl FileSystemContext for SymStripePoolFs {
             if is_dir { "DIR" } else { "FILE" },
             rel_path
         ));
-
         Ok(PoolFileHandle {
             is_dir,
             rel_path: RwLock::new(rel_path),
@@ -1190,7 +1053,6 @@ impl FileSystemContext for SymStripePoolFs {
             .node
             .as_ref()
             .ok_or(FspError::NTSTATUS(STATUS_INVALID_DEVICE_REQUEST))?;
-
         *node.is_modified.lock() = true;
         node.direct_cache.lock().take();
 
@@ -1208,11 +1070,9 @@ impl FileSystemContext for SymStripePoolFs {
                 .map(|&member_idx| {
                     let _spindle_guard = self.spindle_locks[member_idx].lock();
                     let p = self.members[member_idx].join(node.rel_path());
-
                     if let Some(parent) = p.parent() {
                         let _ = fs::create_dir_all(parent);
                     }
-
                     let file = OpenOptions::new()
                         .read(true)
                         .write(true)
@@ -1220,10 +1080,8 @@ impl FileSystemContext for SymStripePoolFs {
                         .truncate(false)
                         .open(&p)
                         .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-
                     file.seek_write(buffer, write_offset)
                         .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-
                     if let Some(counter) = self.io_bytes.get(member_idx) {
                         counter.fetch_add(buffer.len() as u64, Ordering::Relaxed);
                     }
@@ -1237,7 +1095,6 @@ impl FileSystemContext for SymStripePoolFs {
 
             let new_len = fs::metadata(&p_first).map(|m| m.len()).unwrap_or(old_len);
             let diff = new_len as i64 - old_len as i64;
-
             if diff > 0 {
                 self.add_used_bytes((diff as u64) * (node.present_on.len() as u64));
             } else if diff < 0 {
@@ -1264,9 +1121,8 @@ impl FileSystemContext for SymStripePoolFs {
             let io_bytes = self.io_bytes.clone();
             let codec = node.file_codec;
 
-            let write_action = |slice: &crate::stripe_math::StripeSlice,
-                                part_arc: &Arc<RwLock<CachedPart>>,
-                                src_slice: &[u8]| {
+            for (slice, part_arc, src_slice) in tasks {
+                node.dirty_parts.lock().insert(slice.part_index);
                 let mut part = part_arc.write();
                 let start_idx = slice.offset_in_part as usize;
                 let end_pos = start_idx + src_slice.len();
@@ -1274,7 +1130,6 @@ impl FileSystemContext for SymStripePoolFs {
                 if part.data.len() < end_pos {
                     part.data.resize(end_pos, 0);
                 }
-
                 part.data[start_idx..end_pos].copy_from_slice(src_slice);
                 part.dirty = true;
                 part.codec = codec;
@@ -1283,11 +1138,6 @@ impl FileSystemContext for SymStripePoolFs {
                 if let Some(counter) = io_bytes.get(slice.target_drive_idx) {
                     counter.fetch_add(src_slice.len() as u64, Ordering::Relaxed);
                 }
-            };
-
-            for (slice, part_arc, src_slice) in tasks {
-                node.dirty_parts.lock().insert(slice.part_index);
-                write_action(&slice, &part_arc, src_slice);
             }
         }
 
@@ -1301,13 +1151,11 @@ impl FileSystemContext for SymStripePoolFs {
         file_info.file_attributes = 0x80;
         file_info.hard_links = 1;
         file_info.index_number = hash_path_id(&node.rel_path());
-
         Ok(buffer.len() as u32)
     }
 
     fn read(&self, ctx: &Self::FileContext, buffer: &mut [u8], offset: u64) -> winfsp::Result<u32> {
         let node = context_node(ctx)?;
-
         let current_file_size = *node.file_size.lock();
         if offset >= current_file_size {
             return Ok(0);
@@ -1318,14 +1166,11 @@ impl FileSystemContext for SymStripePoolFs {
         if bytes_to_read == 0 {
             return Ok(0);
         }
-
         let target_slice = &mut buffer[..bytes_to_read];
 
         if !node.is_striped {
             let member_idx = node.present_on
                 [self.rr_counter.fetch_add(1, Ordering::Relaxed) % node.present_on.len()];
-            let file_size = current_file_size;
-
             let hit_cache = {
                 let cache_guard = node.direct_cache.lock();
                 if let Some(buf) = cache_guard.as_ref() {
@@ -1353,13 +1198,12 @@ impl FileSystemContext for SymStripePoolFs {
             }
 
             self.cache_misses.fetch_add(1, Ordering::Relaxed);
-
             let _spindle_guard = self.spindle_locks[member_idx].lock();
             let p = self.members[member_idx].join(node.rel_path());
             let file = File::open(&p).map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
 
             let window_len = DIRECT_READ_WINDOW_BYTES
-                .min(file_size.saturating_sub(offset))
+                .min(current_file_size.saturating_sub(offset))
                 .max(bytes_to_read as u64) as usize;
             let mut window_buf = vec![0u8; window_len];
 
@@ -1367,16 +1211,13 @@ impl FileSystemContext for SymStripePoolFs {
             let actual_read = file
                 .seek_read(&mut window_buf, offset)
                 .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-
             let lat = t0.elapsed().as_millis() as u64;
             self.io_max_latency_ms[member_idx].fetch_max(lat, Ordering::Relaxed);
 
             window_buf.truncate(actual_read);
-
             let copy_len = bytes_to_read.min(window_buf.len());
             target_slice[..copy_len].copy_from_slice(&window_buf[..copy_len]);
-
-            *node.direct_cache.lock() = Some(DirectBuffer {
+            *node.direct_cache.lock() = Some(crate::vfs::node::DirectBuffer {
                 offset,
                 data: window_buf,
             });
@@ -1398,8 +1239,6 @@ impl FileSystemContext for SymStripePoolFs {
 
         let stripe_size = self.stripe_config.stripe_size_bytes;
         let offset_in_stripe = offset % stripe_size;
-
-        // POINT 2: Earlier prefetch trigger at 50% through the chunk to give slower drives head start
         let trigger_lookahead = offset_in_stripe > (stripe_size / 2);
 
         for (i, slice) in slices.into_iter().enumerate() {
@@ -1413,10 +1252,9 @@ impl FileSystemContext for SymStripePoolFs {
         }
 
         let io_bytes = self.io_bytes.clone();
-        let read_action = |slice: &crate::stripe_math::StripeSlice,
-                           part_arc: &Arc<RwLock<CachedPart>>,
-                           dest: &mut [u8]|
-         -> usize {
+        let mut total = 0;
+
+        for (slice, part_arc, dest) in tasks {
             let part = part_arc.read();
             part.referenced.store(true, Ordering::Relaxed);
             let src_len = part.data.len();
@@ -1431,16 +1269,10 @@ impl FileSystemContext for SymStripePoolFs {
                 if let Some(counter) = io_bytes.get(slice.target_drive_idx) {
                     counter.fetch_add(copy_len as u64, Ordering::Relaxed);
                 }
-                copy_len
+                total += copy_len;
             } else {
                 dest.fill(0);
-                0
             }
-        };
-
-        let mut total = 0;
-        for (slice, part_arc, dest) in tasks {
-            total += read_action(&slice, &part_arc, dest);
         }
 
         Ok(total as u32)
@@ -1456,7 +1288,6 @@ impl FileSystemContext for SymStripePoolFs {
         if !ctx.is_dir {
             return Err(FspError::NTSTATUS(STATUS_INVALID_DEVICE_REQUEST));
         }
-
         let dir_buf = ctx.dir_buffer.lock();
 
         if marker.is_none()
@@ -1492,7 +1323,6 @@ impl FileSystemContext for SymStripePoolFs {
                         if name.starts_with(".symstripe") || name.contains(".part") {
                             continue;
                         }
-
                         if name.ends_with(".symstripe_meta") {
                             let clean = name
                                 .strip_suffix(".symstripe_meta")
@@ -1543,13 +1373,11 @@ impl FileSystemContext for SymStripePoolFs {
                 let _ = dir_lock.write(&mut dir_info);
             }
         }
-
         Ok(dir_buf.read(marker, buffer))
     }
 
     fn cleanup(&self, ctx: &Self::FileContext, _name: Option<&U16CStr>, flags: u32) {
         let should_delete = (flags & 0x01 != 0) || *ctx.delete_on_close.lock();
-
         if should_delete {
             *ctx.delete_on_close.lock() = true;
             let rel = ctx.rel_path();
@@ -1588,14 +1416,12 @@ impl FileSystemContext for SymStripePoolFs {
 
                 if node.is_striped {
                     let meta_p = self.meta_path(&rel);
-
                     let mut file_size = *node.file_size.lock();
                     if file_size == 0
                         && let Ok(s) = fs::read_to_string(&meta_p)
                     {
                         file_size = s.trim().parse::<u64>().unwrap_or(0);
                     }
-
                     if let Ok(m) = fs::metadata(&meta_p) {
                         self.sub_used_bytes(m.len());
                     }
@@ -1612,7 +1438,6 @@ impl FileSystemContext for SymStripePoolFs {
                         for ext in ["lz4", "zst", "raw"] {
                             let (store_p, legacy_p) =
                                 self.resolve_part_paths(target_drive_idx, &rel, part_index, ext);
-
                             for p in [store_p, legacy_p] {
                                 if let Ok(m) = fs::metadata(&p) {
                                     self.sub_used_bytes(m.len());
@@ -1631,7 +1456,6 @@ impl FileSystemContext for SymStripePoolFs {
                         let _ = fs::remove_file(&target_p);
                     }
                     self.sub_used_bytes(total_del);
-
                     if node.present_on.len() == 1 && node.present_on[0] != 0 {
                         self.jbod_map.write().remove(&rel.to_lowercase());
                         self.save_jbod_catalog();
@@ -1674,7 +1498,6 @@ impl FileSystemContext for SymStripePoolFs {
         if *ctx.delete_on_close.lock() {
             return;
         }
-
         if let Some(node) = &ctx.node {
             let remaining = node.open_handles.fetch_sub(1, Ordering::Relaxed) - 1;
             if *node.is_modified.lock() {
@@ -1719,7 +1542,6 @@ impl FileSystemContext for SymStripePoolFs {
         } else {
             PathBuf::new()
         };
-
         if check_p.exists()
             && let Ok(m) = fs::metadata(&check_p)
         {
@@ -1758,10 +1580,8 @@ impl FileSystemContext for SymStripePoolFs {
                     let _ = fs::create_dir_all(parent);
                 }
                 let old_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-
                 let _spindle_guard = self.spindle_locks[member_idx].lock();
                 let _ = OpenOptions::new().write(true).truncate(true).open(&p);
-
                 size_diff -= old_len as i64;
             }
             self.sub_used_bytes((-size_diff) as u64);
@@ -1809,7 +1629,6 @@ impl FileSystemContext for SymStripePoolFs {
                     let _ = fs::create_dir_all(parent);
                 }
                 let old_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-
                 let _spindle_guard = self.spindle_locks[member_idx].lock();
                 if let Ok(f) = OpenOptions::new().write(true).open(&p) {
                     let _ = f.set_len(new_size);
@@ -1873,7 +1692,6 @@ impl FileSystemContext for SymStripePoolFs {
 
         if let Some(node) = &ctx.node {
             node.direct_cache.lock().take();
-
             if *node.is_modified.lock() {
                 self.flush_node_dirty_parts(node);
                 let size = *node.file_size.lock();
@@ -1904,7 +1722,6 @@ impl FileSystemContext for SymStripePoolFs {
                 {
                     file_size = s.trim().parse::<u64>().unwrap_or(0);
                 }
-
                 if old_m.exists() {
                     let _ = fs::rename(&old_m, &new_m);
                 }
@@ -1958,11 +1775,9 @@ impl FileSystemContext for SymStripePoolFs {
             *node.rel_path.write() = new_rel.clone();
             node.file_hash.store(new_hash, Ordering::Relaxed);
 
-            {
-                let mut map = self.file_nodes.write();
-                if let Some(existing_node) = map.remove(&old_rel.to_lowercase()) {
-                    map.insert(new_rel.to_lowercase(), existing_node);
-                }
+            let mut map = self.file_nodes.write();
+            if let Some(existing_node) = map.remove(&old_rel.to_lowercase()) {
+                map.insert(new_rel.to_lowercase(), existing_node);
             }
         }
         *ctx.rel_path.write() = new_rel;
@@ -1998,257 +1813,4 @@ fn get_current_filetime() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     (dur.as_secs() + 11644473600) * 10_000_000 + (dur.subsec_nanos() as u64 / 100)
-}
-
-#[link(name = "advapi32")]
-unsafe extern "system" {
-    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        sd_str: *const u16,
-        rev: u32,
-        sd: *mut *mut c_void,
-        sz: *mut u32,
-    ) -> i32;
-    fn LocalFree(mem: *mut c_void) -> *mut c_void;
-}
-
-pub fn get_default_security_descriptor() -> &'static [u8] {
-    static SD: OnceLock<Vec<u8>> = OnceLock::new();
-    SD.get_or_init(|| {
-        let sddl = crate::win32::to_wide_null("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)");
-        let mut p_sd = std::ptr::null_mut();
-        let mut size = 0u32;
-        let ok = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                1,
-                &mut p_sd,
-                &mut size,
-            )
-        };
-        if ok != 0 && !p_sd.is_null() && size > 0 {
-            let bytes =
-                unsafe { std::slice::from_raw_parts(p_sd as *const u8, size as usize).to_vec() };
-            unsafe { LocalFree(p_sd) };
-            bytes
-        } else {
-            vec![
-                1, 0, 0x04, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            ]
-        }
-    })
-}
-
-pub struct VfsPoolSession {
-    _host: FileSystemHost<SymStripePoolFs>,
-    pub io_bytes: Arc<Vec<AtomicU64>>,
-    pub member_paths: Vec<PathBuf>,
-    pub io_max_latency_ms: Arc<Vec<AtomicU64>>,
-    pub cache_hits: Arc<AtomicU64>,
-    pub cache_misses: Arc<AtomicU64>,
-    pub raw_bytes: Arc<AtomicU64>,
-    pub compressed_bytes: Arc<AtomicU64>,
-    stop_flusher: Arc<AtomicBool>,
-    flusher_handle: Option<std::thread::JoinHandle<()>>,
-    fs_ref: SymStripePoolFs,
-}
-
-impl VfsPoolSession {
-    pub fn sample_and_reset_io(&self) -> (Vec<u64>, Vec<u64>) {
-        let bytes = self
-            .io_bytes
-            .iter()
-            .map(|c| c.swap(0, Ordering::Relaxed))
-            .collect();
-        let lats = self
-            .io_max_latency_ms
-            .iter()
-            .map(|c| c.swap(0, Ordering::Relaxed))
-            .collect();
-        (bytes, lats)
-    }
-}
-
-impl Drop for VfsPoolSession {
-    fn drop(&mut self) {
-        self.stop_flusher.store(true, Ordering::Relaxed);
-        if let Some(h) = self.flusher_handle.take() {
-            let _ = h.join();
-        }
-        self.fs_ref.flush_all_dirty_nodes();
-    }
-}
-
-/// Quick 0.1-second unbuffered read probe on each member to auto-calibrate drive weights.
-fn auto_calibrate_drive_weights(
-    members: &[PathBuf],
-    logger: &Option<VfsLogCallback>,
-) -> Vec<usize> {
-    if members.len() <= 1 {
-        return vec![1; members.len()];
-    }
-
-    let mut measured_speeds = Vec::new();
-    let probe_bytes = 8 * 1024 * 1024; // 8 MB quick test payload
-    let mut write_buf = AlignedBuffer::new(probe_bytes, 4096);
-    write_buf.as_slice_mut().fill(0x33);
-    let mut read_buf = AlignedBuffer::new(probe_bytes, 4096);
-
-    for (idx, member) in members.iter().enumerate() {
-        let probe_file = member.join(format!(".symstripe_calib_{}.tmp", idx));
-
-        let speed_mbs = (|| -> Option<f64> {
-            let mut wf = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .custom_flags(0x80000000) // FILE_FLAG_WRITE_THROUGH
-                .open(&probe_file)
-                .ok()?;
-            wf.write_all(write_buf.as_slice_mut()).ok()?;
-            wf.sync_all().ok()?;
-            drop(wf);
-
-            let t0 = Instant::now();
-            let mut f = OpenOptions::new()
-                .read(true)
-                .custom_flags(0x20000000) // FILE_FLAG_NO_BUFFERING
-                .open(&probe_file)
-                .or_else(|_| File::open(&probe_file))
-                .ok()?;
-
-            f.read_exact(read_buf.as_slice_mut()).ok()?;
-            let elapsed = t0.elapsed().as_secs_f64();
-            let _ = fs::remove_file(&probe_file);
-            Some((probe_bytes as f64 / 1_048_576.0) / elapsed.max(0.0001))
-        })()
-        .unwrap_or(100.0);
-
-        measured_speeds.push(speed_mbs);
-    }
-
-    let min_speed = measured_speeds
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min)
-        .max(1.0);
-
-    let weights: Vec<usize> = measured_speeds
-        .iter()
-        .map(|&spd| ((spd / min_speed).round() as usize).clamp(1, 4))
-        .collect();
-
-    if let Some(cb) = logger {
-        let details: Vec<String> = members
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                format!(
-                    "Drive {}: {}x ({:.0} MB/s)",
-                    i + 1,
-                    weights[i],
-                    measured_speeds[i]
-                )
-            })
-            .collect();
-        cb(format!(
-            "⚖️ [AUTO-CALIBRATION] RAID-0 Asymmetric Weights: {} -> Schedule pattern calibrated.",
-            details.join(", ")
-        ));
-    }
-
-    weights
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn mount_storage_pool(
-    mount_target: &str,
-    members: &[PathBuf],
-    policy: i32,
-    stripe_size_bytes: u64,
-    custom_size_gb: u64,
-    codec_idx: i32,
-    tiered_storage: bool,
-    ram_cache_mb: u32,
-    logger: Option<VfsLogCallback>,
-) -> Result<VfsPoolSession, String> {
-    if members.is_empty() {
-        return Err("Cannot mount pool: no storage members specified.".into());
-    }
-
-    check_winfsp_available()?;
-    let _init = winfsp::winfsp_init().map_err(|e| format!("WinFsp init failed: {:?}", e))?;
-
-    // Auto-detect speed ratio and assign weights if in RAID-0 (Policy 1)
-    let drive_weights = if policy == 1 && members.len() > 1 {
-        Some(auto_calibrate_drive_weights(members, &logger))
-    } else {
-        None
-    };
-
-    let pool_fs = SymStripePoolFs::new(
-        members.to_vec(),
-        policy,
-        stripe_size_bytes,
-        custom_size_gb,
-        codec_idx,
-        tiered_storage,
-        ram_cache_mb,
-        drive_weights,
-        logger,
-    );
-
-    let io_bytes = pool_fs.io_bytes.clone();
-    let io_max_latency_ms = pool_fs.io_max_latency_ms.clone();
-    let cache_hits = pool_fs.cache_hits.clone();
-    let cache_misses = pool_fs.cache_misses.clone();
-    let raw_bytes = pool_fs.raw_bytes_written.clone();
-    let compressed_bytes = pool_fs.compressed_bytes_written.clone();
-
-    let mut vp = VolumeParams::new();
-    vp.filesystem_name("NTFS");
-    vp.volume_serial_number(0x594D5354);
-    vp.case_preserved_names(true);
-    vp.case_sensitive_search(false);
-    vp.unicode_on_disk(true);
-    vp.flush_and_purge_on_cleanup(true);
-
-    vp.file_info_timeout(1000);
-    vp.dir_info_timeout(1000);
-    vp.volume_info_timeout(1000);
-    vp.post_cleanup_when_modified_only(true);
-
-    let mut host =
-        FileSystemHost::new(vp, pool_fs.clone()).map_err(|e| format!("Host error: {:?}", e))?;
-    host.mount(mount_target)
-        .map_err(|e| format!("Mount error '{}': {:?}", mount_target, e))?;
-    FileSystemHost::<SymStripePoolFs>::start(&mut host)
-        .map_err(|e| format!("Dispatcher error: {:?}", e))?;
-
-    let stop_flusher = Arc::new(AtomicBool::new(false));
-    let stop_clone = stop_flusher.clone();
-    let fs_bg = pool_fs.clone();
-
-    let flusher_handle = std::thread::spawn(move || {
-        while !stop_clone.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(2500));
-            if stop_clone.load(Ordering::Relaxed) {
-                break;
-            }
-            fs_bg.flush_all_dirty_nodes();
-        }
-    });
-
-    Ok(VfsPoolSession {
-        _host: host,
-        io_bytes,
-        member_paths: members.to_vec(),
-        io_max_latency_ms,
-        cache_hits,
-        cache_misses,
-        raw_bytes,
-        compressed_bytes,
-        stop_flusher,
-        flusher_handle: Some(flusher_handle),
-        fs_ref: pool_fs,
-    })
 }

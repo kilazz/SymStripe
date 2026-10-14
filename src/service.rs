@@ -1,5 +1,5 @@
 use crate::config::load_config;
-use crate::vfs_pool::mount_storage_pool;
+use crate::vfs::mount_storage_pool;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
