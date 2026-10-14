@@ -1,37 +1,43 @@
 # SymStripe
 
-Dual-paradigm multi-drive storage accelerator and virtual filesystem for Windows. Multiplies sequential read throughput by distributing I/O across multiple physical drives without RAID formatting.
+High-throughput storage accelerator and user-mode virtual filesystem (WinFsp) for Windows. Combines the throughput of mixed physical drives without repartitioning or hardware RAID.
 
 ---
 
-## Architecture & Paradigms
+## Operating Modes
 
-### 1. In-Place Game Optimizer
-Relocates heavy asset archives (e.g., Unreal Engine `.ucas`, `.pak`, `.vfs`) from a primary game directory across secondary physical drives.
-- **LPT Bin-Packing:** Distributes files using a Longest Processing Time size-balancing algorithm across $N$ target drives.
-- **UE5 Safe Mode:** Uses NTFS Directory Junctions (`mklink /J`) to bypass symlink admin privilege requirements.
-- **`.backup` Safety:** Retains local backup copies on the primary drive and maintains `.striping_manifest.json` for integrity verification and auto-repair.
-- **Target Consolidation:** Moves data from a secondary target drive back to the primary volume and cleans up empty trees.
+### 1. In-Place Game Optimizer (Symlinks)
+Offloads large game archives (`.ucas`, `.pak`, media) to secondary drives while maintaining transparent links in the original game directory.
+- **Volume GUID Anchoring:** Links target `\\?\Volume{GUID}\...` — immune to drive letter changes.
+- **UE5 IoStore Guard:** Retains critical bootstrap packages (`pakchunk0`, `global.*`) on the primary drive; keeps companions (`.utoc`, `.sig`) co-located with `.ucas`.
+- **LPT Balancing:** Balances file distribution across drives based on container size and available space.
+- **Safety & Rollback:** Atomic `.striping_manifest.json`, local `.backup` safety net, and target consolidation.
 
 ### 2. Virtual Storage Pool (VFS Z:)
-A user-mode virtual filesystem powered by **WinFsp** that aggregates multiple folders across physical disks into a single mountable drive (`Z:`).
-- **Transparent On-The-Fly Striping:** Intercepts writes to `Z:` and dynamically chunks/stripes data across member drives (RAID-0 block extent striping).
-- **JBOD Capacity Mode:** Merges free space across disparate drives transparently.
-- **Master-Drive Passthrough:** Uses the master drive for directory structure while streaming heavy payloads directly to array members.
+Aggregates folders across multiple physical disks into a unified virtual drive `Z:` via WinFsp.
+- **Policies:** RAID-0 (Striped), JBOD (Capacity Merge), RAID-1 (Mirror).
+- **Asymmetric Weighted Striping (RAID-0):** Auto-calibrates drive speed ratios (e.g., 2:1 schedule `[D1, D1, D2]`) so faster drives never stall on slower spindles.
+- **$O(1)$ CLOCK RAM Cache:** Low-overhead second-chance eviction via an atomic `referenced` bit, eliminating $O(N)$ traversal latency.
+- **Asymmetric Prefetch:** Triggers at 50% chunk read, looks ahead up to 4 blocks, and prioritizes higher-latency drives.
+- **Single-Flight:** Deduplicates concurrent chunk reads during asset streaming spikes (anti-stampede).
+- **Zstd ATG & LZ4:** DirectStorage-grade compression with a 256 KB window log (`WindowLog = 18`) to prevent CPU L3 cache thrashing.
 
 ---
 
-## Additional Features
+## Diagnostics & System Features
 
-- **Direct I/O Hardware Benchmark:** Tests raw physical drive throughput by bypassing Windows RAM cache (`FILE_FLAG_NO_BUFFERING` with 4KB-aligned memory buffers).
-- **S.M.A.R.T. Health Monitor:** Native Win32 device querying (`DeviceIoControl`) for physical disk health status.
-- **Portable Profiles:** Stores multi-game configurations in `config.json` next to the executable. No registry or `%APPDATA%` writes.
+- **Time-Based Benchmark:** Measures sustained throughput over a fixed time window using unbuffered 4KB-aligned I/O (`FILE_FLAG_NO_BUFFERING`) with per-drive speed breakdowns.
+- **Bus Detection:** Queries real hardware bus interfaces (NVMe, SATA, USB) via Win32 `IOCTL_STORAGE_QUERY_PROPERTY`.
+- **S.M.A.R.T. Monitor:** Polls physical drive health via `IOCTL_STORAGE_PREDICT_FAILURE`.
+- **Zero-Alloc SEH:** Native emergency crash logger using pre-allocated paths and direct kernel handles to survive stack overflows and heap corruption.
+- **Windows Service Mode:** CLI flags (`--install-service`, `--service`) to auto-mount drive `Z:` at boot prior to user logon.
+- **Process Priority:** Disables Windows 11 EcoQoS (Power Throttling) and elevates process priority to Above Normal.
 
 ---
 
 ## Requirements & Build
 
-- Windows 10 / 11
-- [WinFsp Runtime](https://github.com/winfsp/winfsp) installed
+- Windows 10 / 11 (x64)
+- [WinFsp Runtime](https://winfsp.dev/) installed
 - Rust 1.80+ (Edition 2024)
-- Slint UI framework (compiled via `build.rs`)
+- Slint UI 1.18
