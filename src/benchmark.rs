@@ -27,6 +27,14 @@ pub struct BenchmarkResult {
     pub streaming_stalls: usize,
 }
 
+pub struct VfsBenchmarkResult {
+    pub seq_read_mbs: f64,
+    pub streaming_iops: f64,
+    pub streaming_throughput_mbs: f64,
+    pub avg_latency_ms: f64,
+    pub stalls: usize,
+}
+
 fn open_unbuffered_file(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -354,5 +362,53 @@ pub fn run_benchmark_test(src_dir: &Path, targets: &[PathBuf]) -> Result<Benchma
         streaming_throughput_mbs,
         avg_latency_ms,
         streaming_stalls,
+    })
+}
+
+/// Executes a full suite benchmark over the WinFsp Virtual Drive (Z:)
+/// to measure the software acceleration boost provided by the CLOCK cache and IOCP.
+pub fn run_vfs_benchmark(vfs_root: &Path) -> Result<VfsBenchmarkResult, String> {
+    // Run Asset Streaming Simulator on VFS
+    let (iops, tput, lat, stalls) = run_asset_streaming_simulation(vfs_root)?;
+
+    // Run Sequential Read Speed Test on VFS
+    let test_file = vfs_root.join(".symstripe_vfs_seq.tmp");
+    let file_size = 128 * 1024 * 1024;
+
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(FILE_FLAG_WRITE_THROUGH)
+        .open(&test_file)
+        .map_err(|e| format!("VFS write error: {}", e))?;
+
+    let mut write_buf = AlignedBuffer::new(4 * 1024 * 1024, 4096);
+    write_buf.as_slice_mut().fill(0x88);
+    for _ in 0..(file_size / (4 * 1024 * 1024)) {
+        f.write_all(write_buf.as_slice_mut())
+            .map_err(|e| e.to_string())?;
+    }
+    f.sync_all().unwrap_or(());
+    drop(f);
+
+    // Read through VFS with unbuffered flag (Bypasses Windows Cache, forces WinFsp and CLOCK cache processing)
+    let (_, seq_speed) = run_timed_read_loop(
+        &test_file,
+        0,
+        file_size as u64,
+        4 * 1024 * 1024,
+        Duration::from_millis(2500),
+    )
+    .unwrap_or((0, 0.0));
+
+    let _ = fs::remove_file(&test_file);
+
+    Ok(VfsBenchmarkResult {
+        seq_read_mbs: seq_speed,
+        streaming_iops: iops,
+        streaming_throughput_mbs: tput,
+        avg_latency_ms: lat,
+        stalls,
     })
 }

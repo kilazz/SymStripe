@@ -1,4 +1,4 @@
-use crate::benchmark::run_benchmark_test;
+use crate::benchmark::{run_benchmark_test, run_vfs_benchmark};
 use crate::config::{Profile, save_config};
 use crate::scanner::{get_drive_color, inspect_game_folder, inspect_pool_storage};
 use crate::striping::{
@@ -446,10 +446,7 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
                     if repaired > 0 {
                         append_log(
                             &w,
-                            &format!(
-                                "⚠️ [ALERT] {} missing file(s) detected! Auto-restored from .backup.",
-                                repaired
-                            ),
+                            &format!("⚠️ [ALERT] {} missing file(s) detected! Auto-restored from .backup.", repaired),
                         );
                     }
                     inspect_game_folder(&src_path, &w);
@@ -1299,55 +1296,39 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
         let st_lock = state_arc.clone();
 
         try_start_task(weak.clone(), "Hardware Benchmark", move |w| {
-            let (src_dir, targets, mode_str) = {
+            let (src_dir, targets, mode_str, vfs_mount) = {
                 let st = st_lock.lock();
                 let idx = st.config.active_profile_index;
                 let prof = &st.config.profiles[idx];
 
+                let mount = if prof.mode_idx == 1 && st.pool_session.is_some() {
+                    Some(prof.pool_mount_point.clone())
+                } else {
+                    None
+                };
+
                 if prof.mode_idx == 0 {
                     (
                         prof.primary_path.clone(),
-                        prof.secondary_targets
-                            .iter()
-                            .map(PathBuf::from)
-                            .collect::<Vec<_>>(),
+                        prof.secondary_targets.iter().map(PathBuf::from).collect::<Vec<_>>(),
                         "In-Place Optimizer".to_string(),
+                        mount,
                     )
                 } else {
-                    let members: Vec<PathBuf> =
-                        prof.pool_members.iter().map(PathBuf::from).collect();
-                    let src = members
-                        .first()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    let tgts = if members.len() > 1 {
-                        members[1..].to_vec()
-                    } else {
-                        Vec::new()
-                    };
-                    (src, tgts, "Virtual Storage Pool".to_string())
+                    let members: Vec<PathBuf> = prof.pool_members.iter().map(PathBuf::from).collect();
+                    let src = members.first().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                    let tgts = if members.len() > 1 { members[1..].to_vec() } else { Vec::new() };
+                    (src, tgts, "Virtual Storage Pool".to_string(), mount)
                 }
             };
 
             if src_dir.is_empty() || targets.is_empty() {
-                append_log(
-                    &w,
-                    &format!(
-                        "Error: [{}] requires at least 2 distinct drive locations.",
-                        mode_str
-                    ),
-                );
+                append_log(&w, &format!("Error: [{}] requires at least 2 distinct drive locations.", mode_str));
                 return;
             }
 
             let total_drives = 1 + targets.len();
-            append_log(
-                &w,
-                &format!(
-                    "=== STARTING ADVANCED HARDWARE BENCHMARK ({} DRIVES: {}) ===",
-                    total_drives, mode_str
-                ),
-            );
+            append_log(&w, &format!("=== STARTING ADVANCED HARDWARE BENCHMARK ({} DRIVES: {}) ===", total_drives, mode_str));
             update_status(&w, "Profiling RAM limits & Cold/Warm cache...");
 
             let _ = w.upgrade_in_event_loop(|ui| {
@@ -1357,109 +1338,62 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
 
             match run_benchmark_test(Path::new(&src_dir), &targets) {
                 Ok(res) => {
-                    append_log(&w, "--- HARDWARE BUS & MEMORY LIMITS ---");
-                    append_log(
-                        &w,
-                        &format!(
-                            "• Host RAM Bandwidth (memcpy):               {:.1} GB/s",
-                            res.ram_bandwidth_gbs
-                        ),
-                    );
-                    append_log(
-                        &w,
-                        &format!(
-                            "• {} Cold I/O (Bypass Cache):              {:.1} MB/s",
-                            res.bus_label, res.disk_cold_mbs
-                        ),
-                    );
-                    append_log(
-                        &w,
-                        &format!(
-                            "• {} Warm I/O (Windows Standby List):      {:.1} MB/s",
-                            res.bus_label, res.disk_warm_mbs
-                        ),
-                    );
-                    append_log(&w, "--- OPEN-WORLD ASSET STREAMING SIMULATOR ---");
-                    append_log(
-                        &w,
-                        &format!(
-                            "• Simulated Engine IOPS (Random Mix):        {:.1} ops/sec",
-                            res.streaming_iops
-                        ),
-                    );
-                    append_log(
-                        &w,
-                        &format!(
-                            "• Streaming Effective Throughput:            {:.1} MB/s",
-                            res.streaming_throughput_mbs
-                        ),
-                    );
-                    append_log(
-                        &w,
-                        &format!(
-                            "• Average Request Latency:                   {:.2} ms",
-                            res.avg_latency_ms
-                        ),
-                    );
-                    append_log(
-                        &w,
-                        &format!(
-                            "• Micro-Stalls Detected (>250ms spikes):     {} 🛑",
-                            res.streaming_stalls
-                        ),
-                    );
-                    append_log(&w, "--- MULTI-SPINDLE CONCURRENT READ RESULTS ---");
-                    append_log(
-                        &w,
-                        &format!(
-                            "• Single-Drive Read (Drive 1):               {:.1} MB/s",
-                            res.single_speed_mbs
-                        ),
-                    );
+                    append_log(&w, "--- RAW HARDWARE BUS & MEMORY LIMITS ---");
+                    append_log(&w, &format!("• Host RAM Bandwidth (memcpy):               {:.1} GB/s", res.ram_bandwidth_gbs));
+                    append_log(&w, &format!("• {} Cold I/O (Bypass Cache):              {:.1} MB/s", res.bus_label, res.disk_cold_mbs));
+                    append_log(&w, &format!("• {} Warm I/O (Windows Standby List):      {:.1} MB/s", res.bus_label, res.disk_warm_mbs));
+
+                    append_log(&w, "--- RAW MULTI-SPINDLE CONCURRENT READ ---");
+                    append_log(&w, &format!("• Single-Drive Read (Drive 1):               {:.1} MB/s", res.single_speed_mbs));
                     for (d_idx, spd) in res.per_drive_speeds_mbs.iter().enumerate() {
-                        append_log(
-                            &w,
-                            &format!(
-                                "  └─ Drive {}:                                {:.1} MB/s",
-                                d_idx + 1,
-                                spd
-                            ),
-                        );
+                        append_log(&w, &format!("  └─ Drive {}:                                {:.1} MB/s", d_idx + 1, spd));
                     }
-                    append_log(
-                        &w,
-                        &format!(
-                            "• Multi-Drive Concurrent Read ({} Drives):   {:.1} MB/s",
-                            res.drives_tested, res.parallel_speed_mbs
-                        ),
-                    );
-                    append_log(
-                        &w,
-                        &format!(
-                            "• Measured Hardware Boost:                   {:+.1}% 🚀",
-                            res.boost_percentage
-                        ),
-                    );
+                    append_log(&w, &format!("• Multi-Drive Concurrent Read ({} Drives):   {:.1} MB/s", res.drives_tested, res.parallel_speed_mbs));
+                    append_log(&w, &format!("• Measured Hardware Boost:                   {:+.1}% 🚀", res.boost_percentage));
+
+                    append_log(&w, "--- RAW OPEN-WORLD ASSET STREAMING SIMULATOR ---");
+                    append_log(&w, &format!("• Raw Engine IOPS (Random Mix):              {:.1} ops/sec", res.streaming_iops));
+                    append_log(&w, &format!("• Raw Streaming Effective Throughput:        {:.1} MB/s", res.streaming_throughput_mbs));
+                    append_log(&w, &format!("• Raw Average Request Latency:               {:.2} ms", res.avg_latency_ms));
+                    append_log(&w, &format!("• Raw Micro-Stalls Detected (>250ms):        {} 🛑", res.streaming_stalls));
+
+                    // PHASE 2: VIRTUAL STORAGE POOL (Z:) BENCHMARK
+                    if let Some(mount_path) = vfs_mount {
+                        append_log(&w, " ");
+                        append_log(&w, "=== STARTING VIRTUAL STORAGE POOL (VFS) BENCHMARK ===");
+                        update_status(&w, "Profiling VFS RAM Cache & IOCP Prefetcher...");
+
+                        let v_path = PathBuf::from(format!("{}\\", mount_path.trim_end_matches('\\')));
+
+                        match run_vfs_benchmark(&v_path) {
+                            Ok(vfs_res) => {
+                                append_log(&w, &format!("• VFS Sequential Read Throughput:            {:.1} MB/s", vfs_res.seq_read_mbs));
+                                append_log(&w, &format!("• VFS Engine IOPS (Random Mix):              {:.1} ops/sec", vfs_res.streaming_iops));
+                                append_log(&w, &format!("• VFS Streaming Effective Throughput:        {:.1} MB/s", vfs_res.streaming_throughput_mbs));
+                                append_log(&w, &format!("• VFS Average Request Latency:               {:.2} ms", vfs_res.avg_latency_ms));
+                                append_log(&w, &format!("• VFS Micro-Stalls Detected (>250ms):        {} 🛑", vfs_res.stalls));
+
+                                let hw_iops = res.streaming_iops.max(1.0);
+                                let vfs_boost = ((vfs_res.streaming_iops - hw_iops) / hw_iops) * 100.0;
+                                append_log(&w, &format!("• VFS Software Acceleration Boost:           {:+.1}% 🚀", vfs_boost));
+                            }
+                            Err(e) => {
+                                append_log(&w, &format!("VFS Benchmark error: {}", e));
+                            }
+                        }
+                    }
 
                     let _ = w.upgrade_in_event_loop(move |ui| {
                         ui.set_progress(1.0);
                         ui.set_is_processing(false);
-                        ui.set_status_msg(
-                            format!(
-                                "IOPS: {:.0} | Latency: {:.1}ms | Stalls: {} | Boost: {:+.0}%",
-                                res.streaming_iops,
-                                res.avg_latency_ms,
-                                res.streaming_stalls,
-                                res.boost_percentage
-                            )
-                            .into(),
-                        );
+                        ui.set_status_msg("Comprehensive Storage Benchmark Complete.".into());
                     });
                 }
                 Err(err) => {
-                    append_log(&w, &format!("Benchmark error: {}", err));
+                    append_log(&w, &format!("Hardware Benchmark error: {}", err));
                     let _ = w.upgrade_in_event_loop(|ui| {
                         ui.set_is_processing(false);
+                        ui.set_status_msg("Benchmark failed.".into());
                     });
                 }
             }
