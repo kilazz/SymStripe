@@ -94,43 +94,67 @@ impl Default for Profile {
     }
 }
 
-pub fn get_config_dir() -> PathBuf {
+pub fn get_user_config_dir() -> PathBuf {
     if let Some(appdata) = env::var_os("APPDATA") {
         PathBuf::from(appdata).join("SymStripe")
-    } else if let Ok(exe) = env::current_exe() {
-        exe.parent().unwrap_or(&PathBuf::from(".")).to_path_buf()
     } else {
         PathBuf::from(".")
     }
 }
 
-pub fn get_config_file_path() -> PathBuf {
-    get_config_dir().join("config.json")
+pub fn get_system_config_dir() -> PathBuf {
+    if let Some(programdata) = env::var_os("ProgramData") {
+        PathBuf::from(programdata).join("SymStripe")
+    } else {
+        PathBuf::from(r"C:\ProgramData\SymStripe")
+    }
+}
+
+pub fn get_config_dir() -> PathBuf {
+    // If running under LocalSystem account (Service), use ProgramData
+    let user_path = get_user_config_dir().join("config.json");
+    if user_path.exists() {
+        get_user_config_dir()
+    } else {
+        get_system_config_dir()
+    }
 }
 
 pub fn load_config() -> AppConfig {
-    let main_path = get_config_file_path();
-
-    if let Ok(content) = fs::read_to_string(&main_path)
-        && let Ok(cfg) = serde_json::from_str::<AppConfig>(&content)
-        && !cfg.profiles.is_empty()
-    {
-        return cfg;
+    // Check user appdata first, fallback to ProgramData for service mode
+    for path in [
+        get_user_config_dir().join("config.json"),
+        get_system_config_dir().join("config.json"),
+    ] {
+        if let Ok(content) = fs::read_to_string(&path)
+            && let Ok(cfg) = serde_json::from_str::<AppConfig>(&content)
+            && !cfg.profiles.is_empty()
+        {
+            return cfg;
+        }
     }
     AppConfig::default()
 }
 
 pub fn save_config(cfg: &AppConfig) {
-    let dir = get_config_dir();
-    let _ = fs::create_dir_all(&dir);
+    if let Ok(json) = serde_json::to_string_pretty(cfg) {
+        // Save to user AppData
+        let u_dir = get_user_config_dir();
+        let _ = fs::create_dir_all(&u_dir);
+        let u_path = u_dir.join("config.json");
+        let u_tmp = u_dir.join("config.json.tmp");
+        if fs::write(&u_tmp, &json).is_ok() {
+            let _ = fs::rename(&u_tmp, &u_path);
+        }
 
-    let path = get_config_file_path();
-    let tmp_path = dir.join("config.json.tmp");
-
-    if let Ok(json) = serde_json::to_string_pretty(cfg)
-        && fs::write(&tmp_path, json).is_ok()
-    {
-        let _ = fs::rename(&tmp_path, &path);
+        // Simultaneously sync to ProgramData so background Windows Service sees the latest config
+        let s_dir = get_system_config_dir();
+        let _ = fs::create_dir_all(&s_dir);
+        let s_path = s_dir.join("config.json");
+        let s_tmp = s_dir.join("config.json.tmp");
+        if fs::write(&s_tmp, &json).is_ok() {
+            let _ = fs::rename(&s_tmp, &s_path);
+        }
     }
 }
 

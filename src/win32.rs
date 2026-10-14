@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use winreg::RegKey;
 use winreg::enums::*;
 
@@ -73,6 +73,16 @@ unsafe extern "system" {
         lpFreeBytesAvailableToCaller: *mut u64,
         lpTotalNumberOfBytes: *mut u64,
         lpTotalNumberOfFreeBytes: *mut u64,
+    ) -> i32;
+    fn GetVolumePathNameW(
+        lpszFileName: *const u16,
+        lpszVolumePathName: *mut u16,
+        cchBufferLength: u32,
+    ) -> i32;
+    fn GetVolumeNameForVolumeMountPointW(
+        lpszVolumeMountPoint: *const u16,
+        lpszVolumeName: *mut u16,
+        cchBufferLength: u32,
     ) -> i32;
     fn CreateFileW(
         lpFileName: *const u16,
@@ -147,15 +157,128 @@ pub fn to_wide_null(s: &str) -> Vec<u16> {
         .collect()
 }
 
-/// Elevates process priority to Above Normal and disables Windows 11 EcoQoS / Efficiency Mode.
+/// Resolves an absolute path to a stable Windows Volume GUID path (`\\?\Volume{GUID}\...`),
+/// immunizing NTFS symbolic links from drive letter re-assignments.
+pub fn get_volume_guid_path(path: &Path) -> Option<PathBuf> {
+    let path_str = path.to_str()?;
+    if path_str.starts_with(r"\\?\Volume{") {
+        return Some(path.to_path_buf());
+    }
+
+    let wide_path = to_wide_null(path_str);
+    let mut mount_point = [0u16; 512];
+
+    let ok_path = unsafe {
+        GetVolumePathNameW(
+            wide_path.as_ptr(),
+            mount_point.as_mut_ptr(),
+            mount_point.len() as u32,
+        )
+    };
+    if ok_path == 0 {
+        return None;
+    }
+
+    let mut volume_guid = [0u16; 128];
+    let ok_guid = unsafe {
+        GetVolumeNameForVolumeMountPointW(
+            mount_point.as_ptr(),
+            volume_guid.as_mut_ptr(),
+            volume_guid.len() as u32,
+        )
+    };
+    if ok_guid == 0 {
+        return None;
+    }
+
+    let mount_point_len = mount_point.iter().position(|&c| c == 0)?;
+    let mount_point_str = String::from_utf16_lossy(&mount_point[..mount_point_len]);
+
+    let guid_len = volume_guid.iter().position(|&c| c == 0)?;
+    let guid_str = String::from_utf16_lossy(&volume_guid[..guid_len]);
+
+    let rel = path_str
+        .strip_prefix(&mount_point_str)
+        .or_else(|| path_str.strip_prefix(mount_point_str.trim_end_matches('\\')))?;
+
+    let clean_rel = rel.trim_start_matches('\\');
+    let full_guid_path = if clean_rel.is_empty() {
+        guid_str
+    } else {
+        format!("{}\\{}", guid_str.trim_end_matches('\\'), clean_rel)
+    };
+
+    Some(PathBuf::from(full_guid_path))
+}
+
+/// Dynamically queries the hardware bus type (NVMe, SATA, USB, etc.) for a given path.
+pub fn get_path_bus_type(path: &Path) -> String {
+    let path_str = path.to_string_lossy();
+    let letter = path_str.chars().next().filter(|c| c.is_ascii_alphabetic());
+
+    let Some(c) = letter else {
+        return "Storage".to_string();
+    };
+
+    let drive_root = format!(r"\\.\{}:", c);
+    let wide_path = to_wide_null(&drive_root);
+
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        return "Storage".to_string();
+    }
+
+    let query = StoragePropertyQuery {
+        property_id: 0,
+        query_type: 0,
+        additional_parameters: [0],
+    };
+
+    let mut out_buf = [0u8; 1024];
+    let mut bytes_returned = 0u32;
+
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            &query as *const _ as *const c_void,
+            std::mem::size_of::<StoragePropertyQuery>() as u32,
+            out_buf.as_mut_ptr() as *mut c_void,
+            out_buf.len() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+
+    unsafe { CloseHandle(handle) };
+
+    if ok != 0 && bytes_returned >= std::mem::size_of::<StorageDeviceDescriptorHeader>() as u32 {
+        let header = unsafe { &*(out_buf.as_ptr() as *const StorageDeviceDescriptorHeader) };
+        map_bus_type(header.bus_type).to_string()
+    } else {
+        "Storage".to_string()
+    }
+}
+
 pub fn boost_process_priority() {
     unsafe {
         let process = GetCurrentProcess();
 
-        // 1. Elevate process priority to prevent thread starvation and audio DPC latency
+        // Elevate process priority to prevent thread starvation and audio DPC latency
         SetPriorityClass(process, ABOVE_NORMAL_PRIORITY_CLASS);
 
-        // 2. Explicitly disable Windows 11 Power Throttling (Efficiency / EcoQoS Mode)
+        // Explicitly disable Windows 11 Power Throttling (Efficiency / EcoQoS Mode)
         let throttling = ProcessPowerThrottlingState {
             version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
             control_mask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,

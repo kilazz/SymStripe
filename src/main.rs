@@ -3,6 +3,7 @@ mod config;
 mod crash_handler;
 mod manifest;
 mod scanner;
+mod service;
 mod stripe_math;
 mod striping;
 mod telemetry;
@@ -36,13 +37,36 @@ pub struct AppState {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Disable Windows 11 EcoQoS / Efficiency Mode and elevate process priority
+    // Process Windows Service CLI commands before initializing GUI
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "--service" => {
+                service::run_service()?;
+                return Ok(());
+            }
+            "--install-service" => {
+                service::install_service()?;
+                println!("✅ SymStripe Windows Service successfully installed with Auto-Start!");
+                println!("Virtual Storage Pool will mount at boot prior to user login.");
+                return Ok(());
+            }
+            "--uninstall-service" => {
+                service::uninstall_service()?;
+                println!("✅ SymStripe Windows Service stopped and uninstalled successfully.");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    // Disable Windows 11 EcoQoS and elevate priority
     win32::boost_process_priority();
 
-    // Initialize native crash handler (Rust panic hook + Win32 SEH filter)
+    // Initialize crash handler
     crash_handler::setup_crash_handler();
 
-    // Initialize UI window and application state
+    // Initialize UI and application state
     let app = AppWindow::new()?;
     let initial_config = load_config();
 

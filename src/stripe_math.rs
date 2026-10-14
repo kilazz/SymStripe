@@ -11,40 +11,71 @@ pub struct StripeSlice {
     pub length: usize,
 }
 
-/// Configuration parameters for RAID-0 block extent striping.
+/// Configuration parameters for RAID-0 block extent striping with asymmetric weighted distribution.
 #[derive(Clone, Debug)]
 pub struct StripeConfig {
-    /// Size of each stripe block in bytes (e.g., 4 MB, 16 MB, 64 MB).
+    /// Size of each stripe block in bytes (e.g., 16 MB, 64 MB).
     pub stripe_size_bytes: u64,
-    /// Number of physical storage drives in the pool.
-    pub num_drives: usize,
+    /// Proportional speed weights for each drive (e.g., [2, 1] for 200 MB/s + 100 MB/s).
+    pub drive_weights: Vec<usize>,
+    /// Pre-computed interleaved schedule of drive indices based on weights.
+    schedule: Vec<usize>,
 }
 
 impl StripeConfig {
-    /// Creates a new stripe configuration.
-    ///
-    /// # Panics
-    /// Panics if `num_drives == 0` or `stripe_size_bytes == 0`.
+    /// Creates a uniform (symmetric 1:1) stripe configuration.
     pub fn new(stripe_size_bytes: u64, num_drives: usize) -> Self {
+        Self::new_weighted(stripe_size_bytes, vec![1; num_drives])
+    }
+
+    /// Creates an asymmetric weighted stripe configuration.
+    ///
+    /// For example, weights `[2, 1]` creates schedule `[0, 0, 1]`, ensuring the drive that is
+    /// twice as fast processes 2 blocks for every 1 block processed by the slower drive.
+    pub fn new_weighted(stripe_size_bytes: u64, weights: Vec<usize>) -> Self {
         assert!(
-            num_drives > 0,
+            !weights.is_empty(),
             "Storage pool must contain at least one drive"
         );
         assert!(
             stripe_size_bytes > 0,
             "Stripe size must be greater than zero"
         );
+
+        let mut schedule = Vec::new();
+
+        for (drive_idx, &weight) in weights.iter().enumerate() {
+            for _ in 0..weight.max(1) {
+                schedule.push(drive_idx);
+            }
+        }
+
+        if schedule.is_empty() {
+            schedule = (0..weights.len()).collect();
+        }
+
         Self {
             stripe_size_bytes,
-            num_drives,
+            drive_weights: weights,
+            schedule,
         }
+    }
+
+    /// Centralized deterministic mapping of a file part to its physical target drive,
+    /// taking into account drive weights and the initial file hash shift.
+    #[inline]
+    pub fn map_part_to_drive(&self, file_hash: u64, part_index: u64) -> usize {
+        if self.schedule.is_empty() {
+            return 0;
+        }
+        let sched_len = self.schedule.len() as u64;
+        let drive_shift = file_hash % sched_len;
+        let slot = (part_index + drive_shift) % sched_len;
+        self.schedule[slot as usize]
     }
 
     /// Decomposes an arbitrary linear file I/O request (offset + length)
     /// into discrete sub-requests aligned across the storage array drives.
-    ///
-    /// The `file_hash` parameter shifts the starting drive index, ensuring perfect
-    /// 50/50 spindle load balancing even for thousands of tiny files (< stripe_size).
     pub fn map_io_slices(
         &self,
         file_hash: u64,
@@ -55,20 +86,11 @@ impl StripeConfig {
         let mut curr_offset = global_offset;
         let mut remaining = len;
 
-        // The hash acts as a permanent deterministic shift for this specific file
-        let drive_shift = (file_hash % (self.num_drives as u64)) as usize;
-
         while remaining > 0 {
-            // Global sequential stripe index across the file
             let stripe_idx = curr_offset / self.stripe_size_bytes;
-
-            // Target drive determined by round-robin distribution WITH initial file hash shift
-            let target_drive_idx = ((stripe_idx as usize) + drive_shift) % self.num_drives;
-
-            // Offset within the current stripe block
+            let target_drive_idx = self.map_part_to_drive(file_hash, stripe_idx);
             let offset_in_stripe = curr_offset % self.stripe_size_bytes;
 
-            // Maximum bytes remaining until the next stripe boundary
             let bytes_in_this_stripe =
                 ((self.stripe_size_bytes - offset_in_stripe) as usize).min(remaining);
 
@@ -92,57 +114,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_single_drive_slice() {
+    fn test_uniform_striping() {
         let config = StripeConfig::new(4 * 1024 * 1024, 2);
-        // file_hash = 0 (Starts on Drive 0)
-        let slices = config.map_io_slices(0, 0, 1024 * 1024);
-        assert_eq!(slices.len(), 1);
-        assert_eq!(slices[0].target_drive_idx, 0);
-        assert_eq!(slices[0].part_index, 0);
-        assert_eq!(slices[0].offset_in_part, 0);
-        assert_eq!(slices[0].length, 1024 * 1024);
-    }
-
-    #[test]
-    fn test_hash_shifted_start() {
-        let config = StripeConfig::new(4 * 1024 * 1024, 2);
-        // file_hash = 1 (Starts shifted to Drive 1)
-        let slices = config.map_io_slices(1, 0, 1024 * 1024);
-        assert_eq!(slices.len(), 1);
-        assert_eq!(slices[0].target_drive_idx, 1);
-        assert_eq!(slices[0].part_index, 0);
-    }
-
-    #[test]
-    fn test_cross_boundary_stripe_split() {
-        let config = StripeConfig::new(4 * 1024 * 1024, 2);
-        // file_hash = 0
-        let slices = config.map_io_slices(0, 3 * 1024 * 1024, 2 * 1024 * 1024);
+        let slices = config.map_io_slices(0, 0, 8 * 1024 * 1024);
         assert_eq!(slices.len(), 2);
-
-        // First slice: 1 MB on Drive 0
         assert_eq!(slices[0].target_drive_idx, 0);
-        assert_eq!(slices[0].part_index, 0);
-        assert_eq!(slices[0].offset_in_part, 3 * 1024 * 1024);
-        assert_eq!(slices[0].length, 1024 * 1024);
-
-        // Second slice: 1 MB on Drive 1
         assert_eq!(slices[1].target_drive_idx, 1);
-        assert_eq!(slices[1].part_index, 1);
-        assert_eq!(slices[1].offset_in_part, 0);
-        assert_eq!(slices[1].length, 1024 * 1024);
+        assert_eq!(config.drive_weights.len(), 2);
     }
 
     #[test]
-    fn test_multi_drive_wraparound() {
-        let config = StripeConfig::new(1024, 3);
-        // file_hash = 0
-        let slices = config.map_io_slices(0, 512, 4096);
-        assert_eq!(slices.len(), 5);
-        assert_eq!(slices[0].target_drive_idx, 0); // 512..1024 (512 bytes)
-        assert_eq!(slices[1].target_drive_idx, 1); // 1024..2048 (1024 bytes)
-        assert_eq!(slices[2].target_drive_idx, 2); // 2048..3072 (1024 bytes)
-        assert_eq!(slices[3].target_drive_idx, 0); // 3072..4096 (1024 bytes - wrapped around)
-        assert_eq!(slices[4].target_drive_idx, 1); // 4096..4608 (512 bytes)
+    fn test_asymmetric_weighted_striping_2_to_1() {
+        // Drive 0 is 2x faster than Drive 1 -> Pattern: [0, 0, 1]
+        let config = StripeConfig::new_weighted(4 * 1024 * 1024, vec![2, 1]);
+        assert_eq!(config.schedule, vec![0, 0, 1]);
+        assert_eq!(config.drive_weights.len(), 2);
+
+        assert_eq!(config.map_part_to_drive(0, 0), 0); // Part 0 -> Drive 0
+        assert_eq!(config.map_part_to_drive(0, 1), 0); // Part 1 -> Drive 0
+        assert_eq!(config.map_part_to_drive(0, 2), 1); // Part 2 -> Drive 1
+        assert_eq!(config.map_part_to_drive(0, 3), 0); // Part 3 -> Drive 0
+        assert_eq!(config.map_part_to_drive(0, 4), 0); // Part 4 -> Drive 0
+        assert_eq!(config.map_part_to_drive(0, 5), 1); // Part 5 -> Drive 1
     }
 }

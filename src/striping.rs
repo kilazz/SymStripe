@@ -1,7 +1,10 @@
 use crate::manifest::{
     ManifestFileEntry, StripingManifest, delete_manifest, load_manifest, save_manifest,
 };
-use crate::win32::{copy_file_with_progress, get_free_disk_space_bytes, test_symlink_privilege};
+use crate::win32::{
+    copy_file_with_progress, get_free_disk_space_bytes, get_volume_guid_path,
+    test_symlink_privilege,
+};
 use std::fs;
 use std::os::windows::fs::symlink_file;
 use std::path::{Path, PathBuf};
@@ -378,7 +381,11 @@ pub fn execute_striping(
                             };
 
                             if fs::rename(&comp_src, comp_dest).is_ok() {
-                                if symlink_file(&comp_dst, &comp_src).is_ok() {
+                                // Use Volume GUID path to ensure drive letter changes don't invalidate companions
+                                let comp_sym_target = get_volume_guid_path(&comp_dst)
+                                    .unwrap_or_else(|| comp_dst.clone());
+
+                                if symlink_file(&comp_sym_target, &comp_src).is_ok() {
                                     if !keep_backup {
                                         let _ = fs::remove_file(&comp_stage);
                                     }
@@ -424,8 +431,11 @@ pub fn execute_striping(
                 ));
             }
 
-            // 4. Create transparent in-place symlink
-            if let Err(sym_err) = symlink_file(&target_file, &f_path) {
+            // 4. Create transparent in-place symlink targeting Volume GUID path
+            let symlink_target =
+                get_volume_guid_path(&target_file).unwrap_or_else(|| target_file.clone());
+
+            if let Err(sym_err) = symlink_file(&symlink_target, &f_path) {
                 let _ = fs::rename(stage_destination, &f_path);
                 let _ = fs::remove_file(&target_file);
                 clean_empty_parents(&target_file, target_root);
@@ -450,7 +460,7 @@ pub fn execute_striping(
             manifest.files.push(ManifestFileEntry {
                 rel_path: rel.to_string_lossy().to_string(),
                 target_drive_idx: target_idx,
-                target_file_path: target_file.to_string_lossy().to_string(),
+                target_file_path: symlink_target.to_string_lossy().to_string(),
                 size_bytes: size,
                 has_local_backup: keep_backup,
             });
@@ -555,13 +565,22 @@ pub fn execute_revert(src_path: &Path, mut on_progress: impl FnMut(usize, usize,
 pub fn execute_consolidate(src_path: &Path, chosen_target_dir: &Path) -> Result<usize, String> {
     let mut manifest =
         load_manifest(src_path).ok_or("No active manifest found for consolidation.")?;
+
     let chosen_str = chosen_target_dir.to_string_lossy().to_string();
+    let chosen_guid_str = get_volume_guid_path(chosen_target_dir)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
 
     let mut remaining_entries = Vec::new();
     let mut consolidated_count = 0;
 
     for entry in manifest.files {
-        if entry.target_file_path.starts_with(&chosen_str) {
+        // Supports matching both drive-letter paths and Volume GUID paths
+        let matches_chosen = entry.target_file_path.starts_with(&chosen_str)
+            || (!chosen_guid_str.is_empty()
+                && entry.target_file_path.starts_with(&chosen_guid_str));
+
+        if matches_chosen {
             let link_path = src_path.join(&entry.rel_path);
             let target_path = PathBuf::from(&entry.target_file_path);
             let backup_path = PathBuf::from(format!("{}.backup", link_path.to_string_lossy()));

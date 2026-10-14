@@ -937,7 +937,7 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
         append_log(
             &weak,
             &format!(
-                "💽 Pool Auto-Detect ({}): Found ~{} GB total available space across {} active member(s). Mode set to Dynamic Auto (0).",
+                "💽 Pool Auto-Detect ({}): Found ~{} GB total available space across {} active member(s).",
                 policy_str, calculated_gb, valid_drives
             ),
         );
@@ -1351,7 +1351,7 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
                     total_drives, mode_str
                 ),
             );
-            update_status(&w, "Profiling RAM limits & NVMe Cold/Warm cache...");
+            update_status(&w, "Profiling RAM limits & Cold/Warm cache...");
 
             let _ = w.upgrade_in_event_loop(|ui| {
                 ui.set_is_processing(true);
@@ -1371,15 +1371,44 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
                     append_log(
                         &w,
                         &format!(
-                            "• NVMe Cold I/O (Bypass Cache):              {:.1} MB/s",
-                            res.disk_cold_mbs
+                            "• {} Cold I/O (Bypass Cache):              {:.1} MB/s",
+                            res.bus_label, res.disk_cold_mbs
                         ),
                     );
                     append_log(
                         &w,
                         &format!(
-                            "• NVMe Warm I/O (Windows Standby List):      {:.1} MB/s",
-                            res.disk_warm_mbs
+                            "• {} Warm I/O (Windows Standby List):      {:.1} MB/s",
+                            res.bus_label, res.disk_warm_mbs
+                        ),
+                    );
+                    append_log(&w, "--- OPEN-WORLD ASSET STREAMING SIMULATOR ---");
+                    append_log(
+                        &w,
+                        &format!(
+                            "• Simulated Engine IOPS (Random Mix):        {:.1} ops/sec",
+                            res.streaming_iops
+                        ),
+                    );
+                    append_log(
+                        &w,
+                        &format!(
+                            "• Streaming Effective Throughput:            {:.1} MB/s",
+                            res.streaming_throughput_mbs
+                        ),
+                    );
+                    append_log(
+                        &w,
+                        &format!(
+                            "• Average Request Latency:                   {:.2} ms",
+                            res.avg_latency_ms
+                        ),
+                    );
+                    append_log(
+                        &w,
+                        &format!(
+                            "• Micro-Stalls Detected (>250ms spikes):     {} 🛑",
+                            res.streaming_stalls
                         ),
                     );
                     append_log(&w, "--- MULTI-SPINDLE CONCURRENT READ RESULTS ---");
@@ -1390,6 +1419,16 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
                             res.single_speed_mbs
                         ),
                     );
+                    for (d_idx, spd) in res.per_drive_speeds_mbs.iter().enumerate() {
+                        append_log(
+                            &w,
+                            &format!(
+                                "  └─ Drive {}:                                {:.1} MB/s",
+                                d_idx + 1,
+                                spd
+                            ),
+                        );
+                    }
                     append_log(
                         &w,
                         &format!(
@@ -1410,11 +1449,10 @@ pub fn bind_ui_handlers(app: &AppWindow, state: Arc<Mutex<AppState>>) {
                         ui.set_is_processing(false);
                         ui.set_status_msg(
                             format!(
-                                "RAM: {:.0} GB/s | Single: {:.0} MB/s | {} Drives: {:.0} MB/s ({:+.0}%)",
-                                res.ram_bandwidth_gbs,
-                                res.single_speed_mbs,
-                                res.drives_tested,
-                                res.parallel_speed_mbs,
+                                "IOPS: {:.0} | Latency: {:.1}ms | Stalls: {} | Boost: {:+.0}%",
+                                res.streaming_iops,
+                                res.avg_latency_ms,
+                                res.streaming_stalls,
                                 res.boost_percentage
                             )
                             .into(),

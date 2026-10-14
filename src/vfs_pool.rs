@@ -1,13 +1,15 @@
+use crate::benchmark::AlignedBuffer;
 use crate::stripe_math::StripeConfig;
 use crate::win32::{check_winfsp_available, get_system_ram_mb};
 use crate::zstd_atg::ZstdAtgCompressor;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::os::windows::fs::{FileExt, MetadataExt};
+use std::io::{Read, Write};
+use std::os::windows::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -28,7 +30,6 @@ const STATUS_IO_DEVICE_ERROR: i32 = 0xC0000185_u32 as i32;
 const STATUS_BUFFER_TOO_SMALL: i32 = 0xC0000023_u32 as i32;
 
 pub const MIN_HDD_OPTIMAL_STRIPE_BYTES: u64 = 64 * 1024 * 1024;
-const PREFETCH_LOOKAHEAD_PARTS: u64 = 2;
 const DIRECT_READ_WINDOW_BYTES: u64 = 1024 * 1024;
 
 pub type VfsLogCallback = Arc<dyn Fn(String) + Send + Sync>;
@@ -66,15 +67,21 @@ pub struct PartKey {
 pub struct CachedPart {
     pub data: Vec<u8>,
     pub dirty: bool,
-    pub last_access: Instant,
+    pub referenced: AtomicBool, // CLOCK algorithm second-chance access bit
     pub codec: VfsCodec,
     pub rel_path: String,
     pub file_hash: u64,
     pub part_index: u64,
 }
 
+pub struct CacheInner {
+    pub entries: HashMap<PartKey, Arc<RwLock<CachedPart>>>,
+    pub clock_ring: Vec<PartKey>,
+    pub clock_hand: usize,
+}
+
 pub struct GlobalStripeCache {
-    pub entries: Mutex<HashMap<PartKey, Arc<RwLock<CachedPart>>>>,
+    pub inner: Mutex<CacheInner>,
     pub max_parts: usize,
 }
 
@@ -87,7 +94,7 @@ pub struct FileNode {
     pub rel_path: RwLock<String>,
     pub file_hash: AtomicU64,
     pub is_striped: bool,
-    pub present_on: Vec<usize>, // Supports JBOD (len=1) and RAID-1 Mirror (len=N)
+    pub present_on: Vec<usize>,
     pub file_codec: VfsCodec,
     pub file_size: Mutex<u64>,
     pub dirty_parts: Mutex<HashSet<u64>>,
@@ -116,10 +123,24 @@ impl PoolFileHandle {
     }
 }
 
+struct LoadingLeaderGuard {
+    table: Arc<Mutex<HashMap<PartKey, Arc<Condvar>>>>,
+    key: PartKey,
+}
+
+impl Drop for LoadingLeaderGuard {
+    fn drop(&mut self) {
+        let mut inflight = self.table.lock();
+        if let Some(cv) = inflight.remove(&self.key) {
+            cv.notify_all();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SymStripePoolFs {
     pub members: Arc<Vec<PathBuf>>,
-    pub policy: i32, // 0 = JBOD, 1 = RAID-0, 2 = RAID-1 Mirror
+    pub policy: i32,
     pub stripe_config: StripeConfig,
     pub custom_size_gb: u64,
     pub pool_codec: VfsCodec,
@@ -129,10 +150,11 @@ pub struct SymStripePoolFs {
     pub file_nodes: Arc<RwLock<HashMap<String, Arc<FileNode>>>>,
     pub global_cache: Arc<GlobalStripeCache>,
     pub prefetch_in_flight: Arc<Mutex<HashSet<PartKey>>>,
+    pub in_flight_loads: Arc<Mutex<HashMap<PartKey, Arc<Condvar>>>>,
     pub meta_sizes: Arc<RwLock<HashMap<String, u64>>>,
     pub pool_used_bytes: Arc<AtomicU64>,
     pub spindle_locks: Arc<Vec<Mutex<()>>>,
-    pub rr_counter: Arc<AtomicUsize>, // Round-Robin counter for RAID-1 read load balancing
+    pub rr_counter: Arc<AtomicUsize>,
 
     pub io_bytes: Arc<Vec<AtomicU64>>,
     pub io_max_latency_ms: Arc<Vec<AtomicU64>>,
@@ -152,6 +174,7 @@ impl SymStripePoolFs {
         codec_idx: i32,
         tiered_storage: bool,
         ram_cache_mb: u32,
+        drive_weights: Option<Vec<usize>>,
         logger: Option<VfsLogCallback>,
     ) -> Self {
         let num_drives = members.len().max(1);
@@ -168,7 +191,6 @@ impl SymStripePoolFs {
         );
 
         let spindle_locks = Arc::new((0..num_drives).map(|_| Mutex::new(())).collect::<Vec<_>>());
-
         let effective_stripe = stripe_size_bytes.max(MIN_HDD_OPTIMAL_STRIPE_BYTES);
 
         let ram_mb = get_system_ram_mb();
@@ -182,7 +204,15 @@ impl SymStripePoolFs {
             1024 * 1024 * 1024
         };
 
-        let max_parts = ((cache_budget_bytes / effective_stripe).clamp(8, 2048)) as usize;
+        let calculated_parts = (cache_budget_bytes / effective_stripe).max(1);
+        let max_parts = (calculated_parts.min(2048)) as usize;
+
+        // Initialize weighted or symmetric StripeConfig
+        let stripe_config = if let Some(weights) = drive_weights {
+            StripeConfig::new_weighted(effective_stripe, weights)
+        } else {
+            StripeConfig::new(effective_stripe, num_drives)
+        };
 
         let mut valid_meta_keys = HashSet::new();
         let mut preloaded_meta = HashMap::new();
@@ -254,7 +284,7 @@ impl SymStripePoolFs {
         let fs = Self {
             members: Arc::new(members),
             policy,
-            stripe_config: StripeConfig::new(effective_stripe, num_drives),
+            stripe_config,
             custom_size_gb,
             pool_codec: VfsCodec::from_i32(codec_idx),
             tiered_storage,
@@ -262,10 +292,15 @@ impl SymStripePoolFs {
             jbod_map: Arc::new(RwLock::new(HashMap::new())),
             file_nodes: Arc::new(RwLock::new(HashMap::new())),
             global_cache: Arc::new(GlobalStripeCache {
-                entries: Mutex::new(HashMap::new()),
+                inner: Mutex::new(CacheInner {
+                    entries: HashMap::with_capacity(max_parts),
+                    clock_ring: Vec::with_capacity(max_parts),
+                    clock_hand: 0,
+                }),
                 max_parts,
             }),
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            in_flight_loads: Arc::new(Mutex::new(HashMap::new())),
             meta_sizes: Arc::new(RwLock::new(preloaded_meta)),
             pool_used_bytes: Arc::new(AtomicU64::new(initial_used)),
             spindle_locks,
@@ -466,9 +501,10 @@ impl SymStripePoolFs {
             return;
         }
 
-        let num_drives = self.members.len() as u64;
-        let drive_shift = part.file_hash % num_drives;
-        let target_drive_idx = ((part.part_index + drive_shift) % num_drives) as usize;
+        // Unified weighted part-to-drive mapping
+        let target_drive_idx = self
+            .stripe_config
+            .map_part_to_drive(part.file_hash, part.part_index);
 
         let ext = match part.codec {
             VfsCodec::Lz4 => "lz4",
@@ -528,9 +564,7 @@ impl SymStripePoolFs {
         }
 
         let f_hash = node.file_hash.load(Ordering::Relaxed);
-        let num_drives = self.members.len() as u64;
-
-        let cache = self.global_cache.entries.lock();
+        let inner = self.global_cache.inner.lock();
         let mut drive_buckets: HashMap<usize, Vec<CachedPartTuple>> = HashMap::new();
 
         for part_idx in dirty_indices {
@@ -538,16 +572,15 @@ impl SymStripePoolFs {
                 file_hash: f_hash,
                 part_index: part_idx,
             };
-            if let Some(part_arc) = cache.get(&key) {
-                let drive_shift = f_hash % num_drives;
-                let target_drive = ((part_idx + drive_shift) % num_drives) as usize;
+            if let Some(part_arc) = inner.entries.get(&key) {
+                let target_drive = self.stripe_config.map_part_to_drive(f_hash, part_idx);
                 drive_buckets
                     .entry(target_drive)
                     .or_default()
                     .push((part_idx, part_arc.clone()));
             }
         }
-        drop(cache);
+        drop(inner);
 
         drive_buckets
             .into_par_iter()
@@ -585,19 +618,35 @@ impl SymStripePoolFs {
             part_index,
         };
 
-        // 1. Fast path: Check cache with minimal lock duration
-        {
-            let cache = self.global_cache.entries.lock();
-            if let Some(part) = cache.get(&key) {
-                self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                part.write().last_access = Instant::now();
-                return Ok(part.clone());
+        // 1. Fast path: O(1) cache check with atomic second-chance bit
+        let _loading_guard = loop {
+            {
+                let inner = self.global_cache.inner.lock();
+                if let Some(part) = inner.entries.get(&key) {
+                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    // Lock-free reference update for CLOCK algorithm
+                    let guard = part.read();
+                    guard.referenced.store(true, Ordering::Relaxed);
+                    return Ok(part.clone());
+                }
             }
-        }
+
+            let mut inflight = self.in_flight_loads.lock();
+            if let Some(cv) = inflight.get(&key).cloned() {
+                cv.wait(&mut inflight);
+                continue;
+            } else {
+                let cv = Arc::new(Condvar::new());
+                inflight.insert(key, cv);
+                break LoadingLeaderGuard {
+                    table: self.in_flight_loads.clone(),
+                    key,
+                };
+            }
+        };
 
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
 
-        // 2. Read from disk OUTSIDE of the global cache lock
         let rel = node.rel_path();
         let (store_lz4, legacy_lz4) =
             self.resolve_part_paths(target_drive_idx, &rel, part_index, "lz4");
@@ -650,70 +699,100 @@ impl SymStripePoolFs {
         let new_part = Arc::new(RwLock::new(CachedPart {
             data,
             dirty: false,
-            last_access: Instant::now(),
+            referenced: AtomicBool::new(true), // Initial second chance granted
             codec: loaded_codec,
             rel_path: rel,
             file_hash: current_hash,
             part_index,
         }));
 
-        // 3. Store in cache and potentially evict oldest (fast lock)
+        // 2. O(1) CLOCK (Second Chance) Eviction Algorithm without O(N) linear scanning
         let evicted_part = {
-            let mut cache = self.global_cache.entries.lock();
+            let mut inner = self.global_cache.inner.lock();
 
-            // Anti-stampede check: if another thread loaded this chunk while we were reading
-            if let Some(existing) = cache.get(&key) {
+            if let Some(existing) = inner.entries.get(&key) {
                 return Ok(existing.clone());
             }
 
             let mut evicted = None;
-            if cache.len() >= self.global_cache.max_parts {
-                let mut oldest_key = None;
-                let mut oldest_time = Instant::now();
 
-                for (&k, v) in cache.iter() {
-                    let guard = v.read();
-                    if Self::is_pinned_metadata(&guard.rel_path) {
-                        continue;
-                    }
-                    if guard.last_access < oldest_time {
-                        oldest_time = guard.last_access;
-                        oldest_key = Some(k);
-                    }
-                }
+            if inner.entries.len() >= self.global_cache.max_parts && !inner.clock_ring.is_empty() {
+                let ring_len = inner.clock_ring.len();
+                let mut loops = 0;
 
-                if let Some(k) = oldest_key {
-                    evicted = cache.remove(&k);
+                while loops < ring_len * 2 {
+                    let hand = inner.clock_hand;
+                    let candidate_key = inner.clock_ring[hand];
+                    let candidate_part = inner.entries.get(&candidate_key).cloned();
+
+                    if let Some(part_arc) = candidate_part {
+                        let is_pinned = {
+                            let guard = part_arc.read();
+                            Self::is_pinned_metadata(&guard.rel_path)
+                        };
+
+                        if is_pinned {
+                            inner.clock_hand = (hand + 1) % ring_len;
+                            loops += 1;
+                            continue;
+                        }
+
+                        // Check second-chance bit
+                        let was_referenced = {
+                            let guard = part_arc.read();
+                            guard.referenced.swap(false, Ordering::Relaxed)
+                        };
+
+                        if was_referenced {
+                            inner.clock_hand = (hand + 1) % ring_len;
+                            loops += 1;
+                            continue;
+                        }
+
+                        // Victim found: evict in O(1)
+                        evicted = inner.entries.remove(&candidate_key);
+                        inner.clock_ring[hand] = key;
+                        inner.clock_hand = (hand + 1) % ring_len;
+                        break;
+                    } else {
+                        // Stale entry in ring (e.g., deleted or renamed) -> reuse slot immediately
+                        inner.clock_ring[hand] = key;
+                        inner.clock_hand = (hand + 1) % ring_len;
+                        break;
+                    }
                 }
             }
 
-            cache.insert(key, new_part.clone());
+            if evicted.is_none() && !inner.clock_ring.contains(&key) {
+                inner.clock_ring.push(key);
+            }
+            inner.entries.insert(key, new_part.clone());
             evicted
         };
 
-        // 4. Write evicted chunk to disk OUTSIDE of the global cache lock
         if let Some(evicted) = evicted_part {
             self.evict_part_to_disk(&evicted);
         }
 
-        // Prefetch logic
+        // 3. Asymmetric Adaptive Lookahead Prefetching
         if allow_prefetch {
             let file_size = *node.file_size.lock();
             let stripe_size = self.stripe_config.stripe_size_bytes;
             let mut candidates = Vec::new();
+            let lookahead_depth = if self.members.len() > 1 { 4 } else { 2 };
 
             {
-                let cache = self.global_cache.entries.lock();
+                let inner = self.global_cache.inner.lock();
                 let mut in_flight = self.prefetch_in_flight.lock();
 
-                for step in 1..=PREFETCH_LOOKAHEAD_PARTS {
+                for step in 1..=lookahead_depth {
                     let next_p = part_index + step;
                     let next_key = PartKey {
                         file_hash: current_hash,
                         part_index: next_p,
                     };
                     if next_p.saturating_mul(stripe_size) < file_size
-                        && !cache.contains_key(&next_key)
+                        && !inner.entries.contains_key(&next_key)
                         && !in_flight.contains(&next_key)
                     {
                         in_flight.insert(next_key);
@@ -726,11 +805,21 @@ impl SymStripePoolFs {
                 let fs_clone = self.clone();
                 let node_clone = Arc::clone(node);
                 rayon::spawn(move || {
-                    let num_drives = fs_clone.members.len() as u64;
                     let c_hash = node_clone.file_hash.load(Ordering::Relaxed);
-                    let drive_shift = c_hash % num_drives;
+
+                    // Priority scheduling: fetch from drives with higher recorded latency first
+                    candidates.sort_by_key(|&p_idx| {
+                        let d = fs_clone.stripe_config.map_part_to_drive(c_hash, p_idx);
+                        let lat = fs_clone
+                            .io_max_latency_ms
+                            .get(d)
+                            .map(|a| a.load(Ordering::Relaxed))
+                            .unwrap_or(0);
+                        std::cmp::Reverse(lat)
+                    });
+
                     for p_idx in candidates {
-                        let target_d = ((p_idx + drive_shift) % num_drives) as usize;
+                        let target_d = fs_clone.stripe_config.map_part_to_drive(c_hash, p_idx);
                         let _ = fs_clone.fetch_cached_part(&node_clone, p_idx, target_d, false);
 
                         let key = PartKey {
@@ -755,23 +844,25 @@ impl FileSystemContext for SymStripePoolFs {
         let mut total_size = 0u64;
 
         if self.policy == 1 {
-            // RAID-0: Volume is bound by the minimum free space per drive * number of drives
-            let mut min_free = u64::MAX;
-            let mut min_total = u64::MAX;
-            let mut valid = 0;
-            for m in self.members.iter() {
+            // Weighted RAID-0 capacity calculation: Sum(w_i) * Min(Free_i / w_i)
+            let weights = &self.stripe_config.drive_weights;
+            let mut min_unit_free = u64::MAX;
+            let mut min_unit_total = u64::MAX;
+            let mut sum_weights: u64 = 0;
+
+            for (idx, m) in self.members.iter().enumerate() {
+                let w = weights.get(idx).copied().unwrap_or(1).max(1) as u64;
+                sum_weights += w;
                 if let Some((free, tot)) = crate::win32::get_disk_space(m) {
-                    min_free = min_free.min(free);
-                    min_total = min_total.min(tot);
-                    valid += 1;
+                    min_unit_free = min_unit_free.min(free / w);
+                    min_unit_total = min_unit_total.min(tot / w);
                 }
             }
-            if valid > 0 {
-                total_free = min_free * valid;
-                total_size = min_total * valid;
+            if min_unit_total != u64::MAX && sum_weights > 0 {
+                total_free = min_unit_free.saturating_mul(sum_weights);
+                total_size = min_unit_total.saturating_mul(sum_weights);
             }
         } else if self.policy == 2 {
-            // RAID-1 Mirror: Volume is bound by the smallest drive
             let mut min_free = u64::MAX;
             let mut min_total = u64::MAX;
             for m in self.members.iter() {
@@ -785,7 +876,6 @@ impl FileSystemContext for SymStripePoolFs {
                 total_size = min_total;
             }
         } else {
-            // JBOD: Capacity is the sum of all drives
             for m in self.members.iter() {
                 if let Some((free, tot)) = crate::win32::get_disk_space(m) {
                     total_free += free;
@@ -794,7 +884,6 @@ impl FileSystemContext for SymStripePoolFs {
             }
         }
 
-        // Apply custom quota if defined
         if self.custom_size_gb > 0 {
             total_size = self.custom_size_gb * 1024 * 1024 * 1024;
             let used = self.pool_used_bytes.load(Ordering::Relaxed);
@@ -824,7 +913,6 @@ impl FileSystemContext for SymStripePoolFs {
             {
                 false
             } else {
-                // If file is not in cache, query disk directly (avoids "no dot means folder" bug)
                 let mut found_as_file = false;
                 let mut found_as_dir = false;
                 for m in self.members.iter() {
@@ -1008,7 +1096,6 @@ impl FileSystemContext for SymStripePoolFs {
         let (is_striped, present_on, file_codec) = if is_dir {
             for m in self.members.iter() {
                 let _ = fs::create_dir_all(m.join(&rel_path));
-                // Create folder hierarchy for future .part storage
                 let _ = fs::create_dir_all(m.join(".symstripe_store").join(&rel_path));
             }
             (false, vec![], self.pool_codec)
@@ -1191,6 +1278,7 @@ impl FileSystemContext for SymStripePoolFs {
                 part.data[start_idx..end_pos].copy_from_slice(src_slice);
                 part.dirty = true;
                 part.codec = codec;
+                part.referenced.store(true, Ordering::Relaxed);
 
                 if let Some(counter) = io_bytes.get(slice.target_drive_idx) {
                     counter.fetch_add(src_slice.len() as u64, Ordering::Relaxed);
@@ -1310,7 +1398,9 @@ impl FileSystemContext for SymStripePoolFs {
 
         let stripe_size = self.stripe_config.stripe_size_bytes;
         let offset_in_stripe = offset % stripe_size;
-        let trigger_lookahead = offset_in_stripe > (stripe_size * 3 / 4);
+
+        // POINT 2: Earlier prefetch trigger at 50% through the chunk to give slower drives head start
+        let trigger_lookahead = offset_in_stripe > (stripe_size / 2);
 
         for (i, slice) in slices.into_iter().enumerate() {
             let is_last = (i + 1 == num_slices) && trigger_lookahead;
@@ -1328,6 +1418,7 @@ impl FileSystemContext for SymStripePoolFs {
                            dest: &mut [u8]|
          -> usize {
             let part = part_arc.read();
+            part.referenced.store(true, Ordering::Relaxed);
             let src_len = part.data.len();
             let offset_idx = slice.offset_in_part as usize;
 
@@ -1491,8 +1582,8 @@ impl FileSystemContext for SymStripePoolFs {
 
                 let current_hash = node.file_hash.load(Ordering::Relaxed);
                 {
-                    let mut cache = self.global_cache.entries.lock();
-                    cache.retain(|k, _| k.file_hash != current_hash);
+                    let mut inner = self.global_cache.inner.lock();
+                    inner.entries.retain(|k, _| k.file_hash != current_hash);
                 }
 
                 if node.is_striped {
@@ -1510,15 +1601,14 @@ impl FileSystemContext for SymStripePoolFs {
                     }
                     let _ = fs::remove_file(&meta_p);
 
-                    // Direct targeted O(1) chunk deletion to eliminate O(N^2) directory scanning
                     let stripe_size = self.stripe_config.stripe_size_bytes;
                     let num_parts =
                         (file_size + stripe_size.saturating_sub(1)) / stripe_size.max(1);
-                    let num_drives = self.members.len() as u64;
-                    let drive_shift = current_hash % num_drives;
 
                     for part_index in 0..=(num_parts + 2) {
-                        let target_drive_idx = ((part_index + drive_shift) % num_drives) as usize;
+                        let target_drive_idx = self
+                            .stripe_config
+                            .map_part_to_drive(current_hash, part_index);
                         for ext in ["lz4", "zst", "raw"] {
                             let (store_p, legacy_p) =
                                 self.resolve_part_paths(target_drive_idx, &rel, part_index, ext);
@@ -1783,6 +1873,24 @@ impl FileSystemContext for SymStripePoolFs {
 
         if let Some(node) = &ctx.node {
             node.direct_cache.lock().take();
+
+            if *node.is_modified.lock() {
+                self.flush_node_dirty_parts(node);
+                let size = *node.file_size.lock();
+                if node.is_striped && size > 0 {
+                    self.save_meta_size(&old_rel, size);
+                }
+                *node.is_modified.lock() = false;
+            }
+
+            let old_hash = node.file_hash.load(Ordering::Relaxed);
+            let new_hash = hash_path_id(&new_rel);
+
+            {
+                let mut inner = self.global_cache.inner.lock();
+                inner.entries.retain(|k, _| k.file_hash != old_hash);
+            }
+
             if node.is_striped {
                 let old_m = self.meta_path(&old_rel);
                 let new_m = self.meta_path(&new_rel);
@@ -1801,19 +1909,12 @@ impl FileSystemContext for SymStripePoolFs {
                     let _ = fs::rename(&old_m, &new_m);
                 }
 
-                // Direct targeted O(1) chunk rename (prevents orphan chunks and hash drift)
                 let stripe_size = self.stripe_config.stripe_size_bytes;
                 let num_parts = (file_size + stripe_size.saturating_sub(1)) / stripe_size.max(1);
-                let num_drives = self.members.len() as u64;
-
-                let old_hash = node.file_hash.load(Ordering::Relaxed);
-                let new_hash = hash_path_id(&new_rel);
-                let old_shift = old_hash % num_drives;
-                let new_shift = new_hash % num_drives;
 
                 for part_index in 0..=(num_parts + 2) {
-                    let old_drive_idx = ((part_index + old_shift) % num_drives) as usize;
-                    let new_drive_idx = ((part_index + new_shift) % num_drives) as usize;
+                    let old_drive_idx = self.stripe_config.map_part_to_drive(old_hash, part_index);
+                    let new_drive_idx = self.stripe_config.map_part_to_drive(new_hash, part_index);
 
                     for ext in ["lz4", "zst", "raw"] {
                         let (old_store, old_legacy) =
@@ -1826,7 +1927,6 @@ impl FileSystemContext for SymStripePoolFs {
                                 if let Some(parent) = new_store.parent() {
                                     let _ = fs::create_dir_all(parent);
                                 }
-                                // If the chunk must cross physical drives due to hash drift
                                 if fs::rename(&p, &new_store).is_err()
                                     && fs::copy(&p, &new_store).is_ok()
                                 {
@@ -1841,9 +1941,6 @@ impl FileSystemContext for SymStripePoolFs {
                 if let Some(sz) = meta.remove(&old_rel.to_lowercase()) {
                     meta.insert(new_rel.to_lowercase(), sz);
                 }
-
-                // Update file hash so subsequent read operations resolve to new chunk locations
-                node.file_hash.store(new_hash, Ordering::Relaxed);
             } else {
                 for &member_idx in &node.present_on {
                     let _spindle_guard = self.spindle_locks[member_idx].lock();
@@ -1855,6 +1952,16 @@ impl FileSystemContext for SymStripePoolFs {
                     if old_f.exists() {
                         let _ = fs::rename(old_f, new_f);
                     }
+                }
+            }
+
+            *node.rel_path.write() = new_rel.clone();
+            node.file_hash.store(new_hash, Ordering::Relaxed);
+
+            {
+                let mut map = self.file_nodes.write();
+                if let Some(existing_node) = map.remove(&old_rel.to_lowercase()) {
+                    map.insert(new_rel.to_lowercase(), existing_node);
                 }
             }
         }
@@ -1971,6 +2078,87 @@ impl Drop for VfsPoolSession {
     }
 }
 
+/// Quick 0.1-second unbuffered read probe on each member to auto-calibrate drive weights.
+fn auto_calibrate_drive_weights(
+    members: &[PathBuf],
+    logger: &Option<VfsLogCallback>,
+) -> Vec<usize> {
+    if members.len() <= 1 {
+        return vec![1; members.len()];
+    }
+
+    let mut measured_speeds = Vec::new();
+    let probe_bytes = 8 * 1024 * 1024; // 8 MB quick test payload
+    let mut write_buf = AlignedBuffer::new(probe_bytes, 4096);
+    write_buf.as_slice_mut().fill(0x33);
+    let mut read_buf = AlignedBuffer::new(probe_bytes, 4096);
+
+    for (idx, member) in members.iter().enumerate() {
+        let probe_file = member.join(format!(".symstripe_calib_{}.tmp", idx));
+
+        let speed_mbs = (|| -> Option<f64> {
+            let mut wf = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(0x80000000) // FILE_FLAG_WRITE_THROUGH
+                .open(&probe_file)
+                .ok()?;
+            wf.write_all(write_buf.as_slice_mut()).ok()?;
+            wf.sync_all().ok()?;
+            drop(wf);
+
+            let t0 = Instant::now();
+            let mut f = OpenOptions::new()
+                .read(true)
+                .custom_flags(0x20000000) // FILE_FLAG_NO_BUFFERING
+                .open(&probe_file)
+                .or_else(|_| File::open(&probe_file))
+                .ok()?;
+
+            f.read_exact(read_buf.as_slice_mut()).ok()?;
+            let elapsed = t0.elapsed().as_secs_f64();
+            let _ = fs::remove_file(&probe_file);
+            Some((probe_bytes as f64 / 1_048_576.0) / elapsed.max(0.0001))
+        })()
+        .unwrap_or(100.0);
+
+        measured_speeds.push(speed_mbs);
+    }
+
+    let min_speed = measured_speeds
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min)
+        .max(1.0);
+
+    let weights: Vec<usize> = measured_speeds
+        .iter()
+        .map(|&spd| ((spd / min_speed).round() as usize).clamp(1, 4))
+        .collect();
+
+    if let Some(cb) = logger {
+        let details: Vec<String> = members
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                format!(
+                    "Drive {}: {}x ({:.0} MB/s)",
+                    i + 1,
+                    weights[i],
+                    measured_speeds[i]
+                )
+            })
+            .collect();
+        cb(format!(
+            "⚖️ [AUTO-CALIBRATION] RAID-0 Asymmetric Weights: {} -> Schedule pattern calibrated.",
+            details.join(", ")
+        ));
+    }
+
+    weights
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn mount_storage_pool(
     mount_target: &str,
@@ -1990,6 +2178,13 @@ pub fn mount_storage_pool(
     check_winfsp_available()?;
     let _init = winfsp::winfsp_init().map_err(|e| format!("WinFsp init failed: {:?}", e))?;
 
+    // Auto-detect speed ratio and assign weights if in RAID-0 (Policy 1)
+    let drive_weights = if policy == 1 && members.len() > 1 {
+        Some(auto_calibrate_drive_weights(members, &logger))
+    } else {
+        None
+    };
+
     let pool_fs = SymStripePoolFs::new(
         members.to_vec(),
         policy,
@@ -1998,6 +2193,7 @@ pub fn mount_storage_pool(
         codec_idx,
         tiered_storage,
         ram_cache_mb,
+        drive_weights,
         logger,
     );
 
@@ -2016,7 +2212,6 @@ pub fn mount_storage_pool(
     vp.unicode_on_disk(true);
     vp.flush_and_purge_on_cleanup(true);
 
-    // Deep kernel metadata caching to slash user-mode context switching CPU overhead
     vp.file_info_timeout(1000);
     vp.dir_info_timeout(1000);
     vp.volume_info_timeout(1000);
