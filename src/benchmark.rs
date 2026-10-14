@@ -105,7 +105,7 @@ pub fn measure_disk_cold_vs_warm_io(dir: &Path) -> (f64, f64) {
         return (0.0, 0.0);
     }
 
-    // 1. Warm Read (served directly from Windows Standby List / File System Cache)
+    // Warm Read (served directly from Windows Standby List / File System Cache)
     let start_warm = Instant::now();
     let mut warm_buf = vec![0u8; test_size];
     let warm_read_ok = File::open(&probe_file)
@@ -118,7 +118,7 @@ pub fn measure_disk_cold_vs_warm_io(dir: &Path) -> (f64, f64) {
         0.0
     };
 
-    // 2. Cold Read (bypassing Windows file system cache via FILE_FLAG_NO_BUFFERING)
+    // Cold Read (bypassing Windows file system cache via FILE_FLAG_NO_BUFFERING)
     let mut aligned_buf = AlignedBuffer::new(test_size, 4096);
     let start_cold = Instant::now();
     let cold_read_ok = open_unbuffered_file(&probe_file)
@@ -246,6 +246,7 @@ pub fn run_asset_streaming_simulation(dir: &Path) -> Result<(f64, f64, f64, usiz
 /// for the specified duration, wrapping around the test file to avoid any disk idle time.
 fn run_timed_read_loop(
     path: &Path,
+    drive_idx: usize,
     file_size: u64,
     chunk_size: usize,
     duration: Duration,
@@ -258,10 +259,15 @@ fn run_timed_read_loop(
     let start = Instant::now();
     while start.elapsed() < duration {
         if offset + (chunk_size as u64) > file_size {
-            offset = 0; // Seamless wraparound for sustained high-throughput streaming
+            offset = 0; // Seamless wraparound
         }
+        let t_read = Instant::now();
         file.seek_read(buf.as_slice_mut(), offset)
             .map_err(|e| format!("Read error at offset {offset}: {e}"))?;
+        let lat = t_read.elapsed().as_millis() as u64;
+
+        crate::telemetry::report_benchmark_io(drive_idx, chunk_size, lat);
+
         total_bytes += chunk_size;
         offset += chunk_size as u64;
     }
@@ -318,9 +324,10 @@ pub fn run_benchmark_test(src_dir: &Path, targets: &[PathBuf]) -> Result<Benchma
 
     drop(write_buffer);
 
-    // 1. Single-Drive Baseline (Continuous timed streaming on Drive 1)
+    // Single-Drive Baseline (Drive 1)
     let (_, single_speed_mbs) = run_timed_read_loop(
         &all_paths[0],
+        0,
         payload_bytes as u64,
         BENCH_CHUNK_BYTES,
         BENCH_DURATION,
@@ -330,15 +337,21 @@ pub fn run_benchmark_test(src_dir: &Path, targets: &[PathBuf]) -> Result<Benchma
         format!("Primary Drive benchmark failed: {e}")
     })?;
 
-    // 2. Parallel Multi-Drive Concurrent Read (All drives streaming simultaneously for the full duration)
+    // 2. Parallel Multi-Drive Concurrent Read (indices 0, 1, ...)
     let start_parallel = Instant::now();
     let mut handles = Vec::new();
 
     for (idx, path) in all_paths.iter().enumerate() {
         let p = path.clone();
         let handle = thread::spawn(move || -> Result<(usize, f64), String> {
-            run_timed_read_loop(&p, payload_bytes as u64, BENCH_CHUNK_BYTES, BENCH_DURATION)
-                .map_err(|e| format!("Drive {} error: {e}", idx + 1))
+            run_timed_read_loop(
+                &p,
+                idx,
+                payload_bytes as u64,
+                BENCH_CHUNK_BYTES,
+                BENCH_DURATION,
+            )
+            .map_err(|e| format!("Drive {} error: {e}", idx + 1))
         });
         handles.push(handle);
     }

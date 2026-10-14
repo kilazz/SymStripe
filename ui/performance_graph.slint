@@ -66,42 +66,39 @@ export component PerformanceGraph inherits Rectangle {
                 padding: 12px;
                 alignment: space-between;
 
-                // 100% Line
                 Rectangle {
                     height: 1px;
                     background: #202028;
                     HorizontalLayout {
                         padding-left: 4px;
                         Text {
-                            text: "Peak Dynamic Max";
+                            text: "Dynamic Peak Throughput";
                             font-size: 9px;
                             color: #52525B;
                         }
                     }
                 }
 
-                // 50% Line
                 Rectangle {
                     height: 1px;
                     background: #1A1A22;
                     HorizontalLayout {
                         padding-left: 4px;
                         Text {
-                            text: "50%";
+                            text: "50% Scale";
                             font-size: 9px;
                             color: #3F3F46;
                         }
                     }
                 }
 
-                // Baseline (0 MB/s)
                 Rectangle {
                     height: 1px;
                     background: #2E2E3A;
                     HorizontalLayout {
                         padding-left: 4px;
                         Text {
-                            text: "0 MB/s";
+                            text: "0 MB/s Baseline";
                             font-size: 9px;
                             color: #71717A;
                         }
@@ -119,7 +116,7 @@ export component PerformanceGraph inherits Rectangle {
                 for pt in root.data: Rectangle {
                     horizontal-stretch: 1;
 
-                    // Drive 1 Bar (Blue - Seagate)
+                    // Drive 1 Bar (Blue)
                     Rectangle {
                         y: parent.height * (1.0 - pt.d1_val);
                         height: max(0px, parent.height * pt.d1_val);
@@ -127,7 +124,7 @@ export component PerformanceGraph inherits Rectangle {
                         opacity: 0.85;
                     }
 
-                    // Drive 2 Bar (Purple - WD Black)
+                    // Drive 2 Bar (Purple)
                     Rectangle {
                         y: parent.height * (1.0 - pt.d2_val);
                         height: max(0px, parent.height * pt.d2_val);
@@ -135,7 +132,7 @@ export component PerformanceGraph inherits Rectangle {
                         opacity: 0.7;
                     }
 
-                    // Red Stall Dot (>250ms latency spike)
+                    // Red Stall Dot (>250ms spike)
                     if pt.is_stall: Rectangle {
                         y: 2px;
                         width: min(4px, parent.width);
@@ -146,7 +143,6 @@ export component PerformanceGraph inherits Rectangle {
                 }
             }
 
-            // Idle Overlay when no I/O is active
             if root.data.length == 0: VerticalLayout {
                 alignment: center;
                 spacing: 6px;
@@ -159,7 +155,7 @@ export component PerformanceGraph inherits Rectangle {
                 }
 
                 Text {
-                    text: "Awaiting file read/write operations on Virtual Pool (Z:)...";
+                    text: "Monitoring active. Run Benchmark or perform I/O to view real-time curves...";
                     font-size: 10px;
                     color: #374151;
                     horizontal-alignment: center;

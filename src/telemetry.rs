@@ -2,7 +2,7 @@ use crate::{AppState, AppWindow, MetricPoint};
 use parking_lot::Mutex;
 use slint::ComponentHandle;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tray_icon::{
@@ -10,7 +10,23 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
-/// Initializes the system tray menu and background telemetry polling thread.
+pub static BENCH_BYTES_D1: AtomicU64 = AtomicU64::new(0);
+pub static BENCH_BYTES_D2: AtomicU64 = AtomicU64::new(0);
+pub static BENCH_LAT_D1: AtomicU64 = AtomicU64::new(0);
+pub static BENCH_LAT_D2: AtomicU64 = AtomicU64::new(0);
+
+/// Feeds real-time benchmark streaming metrics directly into the telemetry pipeline.
+#[inline]
+pub fn report_benchmark_io(drive_idx: usize, bytes: usize, latency_ms: u64) {
+    if drive_idx == 0 {
+        BENCH_BYTES_D1.fetch_add(bytes as u64, Ordering::Relaxed);
+        BENCH_LAT_D1.fetch_max(latency_ms, Ordering::Relaxed);
+    } else {
+        BENCH_BYTES_D2.fetch_add(bytes as u64, Ordering::Relaxed);
+        BENCH_LAT_D2.fetch_max(latency_ms, Ordering::Relaxed);
+    }
+}
+
 pub fn init_tray_and_telemetry(
     state: Arc<Mutex<AppState>>,
     ui_weak: slint::Weak<AppWindow>,
@@ -50,13 +66,13 @@ pub fn init_tray_and_telemetry(
         let mut last_tick = Instant::now();
         let mut last_sec_tick = Instant::now();
 
-        let mut accum_d1_bytes = 0;
-        let mut accum_d2_bytes = 0;
-        let mut max_lat1 = 0;
-        let mut max_lat2 = 0;
+        let mut accum_d1_bytes = 0u64;
+        let mut accum_d2_bytes = 0u64;
+        let mut max_lat1 = 0u64;
+        let mut max_lat2 = 0u64;
 
         loop {
-            thread::sleep(Duration::from_millis(300));
+            thread::sleep(Duration::from_millis(250));
             let elapsed = last_tick.elapsed().as_secs_f64();
             last_tick = Instant::now();
 
@@ -94,99 +110,124 @@ pub fn init_tray_and_telemetry(
                 });
             }
 
-            // Real-Time I/O, Latency Tracking, and RAM Cache Metrics Sampling
+            // Real-Time I/O: Merge VFS Pool activity AND Hardware Benchmark streaming
             let (stats_io, stats_graph) = {
                 let mut st = state_telemetry.lock();
-                if let Some(session) = &st.pool_session {
-                    let (deltas, lats) = session.sample_and_reset_io();
 
-                    let d1_b = deltas.first().copied().unwrap_or(0);
-                    let d2_b = deltas.get(1).copied().unwrap_or(0);
-                    accum_d1_bytes += d1_b;
-                    accum_d2_bytes += d2_b;
+                // 1. Drain benchmark metrics
+                let bench_b1 = BENCH_BYTES_D1.swap(0, Ordering::Relaxed);
+                let bench_b2 = BENCH_BYTES_D2.swap(0, Ordering::Relaxed);
+                let bench_l1 = BENCH_LAT_D1.swap(0, Ordering::Relaxed);
+                let bench_l2 = BENCH_LAT_D2.swap(0, Ordering::Relaxed);
 
-                    max_lat1 = max_lat1.max(lats.first().copied().unwrap_or(0));
-                    max_lat2 = max_lat2.max(lats.get(1).copied().unwrap_or(0));
+                // 2. Drain VFS session metrics if active
+                let (vfs_b1, vfs_b2, vfs_l1, vfs_l2, names, hit_rate, saved_gb) =
+                    if let Some(session) = &st.pool_session {
+                        let (deltas, lats) = session.sample_and_reset_io();
+                        let d1 = deltas.first().copied().unwrap_or(0);
+                        let d2 = deltas.get(1).copied().unwrap_or(0);
+                        let l1 = lats.first().copied().unwrap_or(0);
+                        let l2 = lats.get(1).copied().unwrap_or(0);
+                        let n: Vec<String> = session
+                            .member_paths
+                            .iter()
+                            .enumerate()
+                            .map(|(i, p)| format!("Drive {} ({})", i + 1, p.to_string_lossy()))
+                            .collect();
 
-                    let names: Vec<String> = session
-                        .member_paths
-                        .iter()
-                        .enumerate()
-                        .map(|(i, p)| format!("Drive {} ({})", i + 1, p.to_string_lossy()))
-                        .collect();
+                        let hits = session.cache_hits.load(Ordering::Relaxed);
+                        let misses = session.cache_misses.load(Ordering::Relaxed);
+                        let total_cache = hits + misses;
+                        let hr = if total_cache > 0 {
+                            (hits as f64 / total_cache as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        let raw = session.raw_bytes.load(Ordering::Relaxed);
+                        let comp = session.compressed_bytes.load(Ordering::Relaxed);
+                        let sgb = raw.saturating_sub(comp) as f64 / 1_073_741_824.0;
 
-                    let hits = session.cache_hits.load(Ordering::Relaxed);
-                    let misses = session.cache_misses.load(Ordering::Relaxed);
-                    let total_cache = hits + misses;
-                    let hit_rate = if total_cache > 0 {
-                        (hits as f64 / total_cache as f64) * 100.0
+                        (d1, d2, l1, l2, n, hr, sgb)
                     } else {
-                        0.0
+                        (
+                            0,
+                            0,
+                            0,
+                            0,
+                            vec![
+                                "Drive 1 (Primary)".to_string(),
+                                "Drive 2 (Secondary)".to_string(),
+                            ],
+                            0.0,
+                            0.0,
+                        )
                     };
 
-                    let raw = session.raw_bytes.load(Ordering::Relaxed);
-                    let comp = session.compressed_bytes.load(Ordering::Relaxed);
-                    let saved_gb = raw.saturating_sub(comp) as f64 / 1_073_741_824.0;
+                let cur_d1 = vfs_b1 + bench_b1;
+                let cur_d2 = vfs_b2 + bench_b2;
+                let cur_lat1 = vfs_l1.max(bench_l1);
+                let cur_lat2 = vfs_l2.max(bench_l2);
 
-                    let mut g_update = None;
-                    let sec_elapsed = last_sec_tick.elapsed().as_secs_f64();
+                accum_d1_bytes += cur_d1;
+                accum_d2_bytes += cur_d2;
+                max_lat1 = max_lat1.max(cur_lat1);
+                max_lat2 = max_lat2.max(cur_lat2);
 
-                    // Generate Graph Metric Point Every 1.0 Second
-                    if sec_elapsed >= 1.0 {
-                        let d1_mbs = (accum_d1_bytes as f32 / 1_048_576.0) / sec_elapsed as f32;
-                        let d2_mbs = (accum_d2_bytes as f32 / 1_048_576.0) / sec_elapsed as f32;
+                let mut g_update = None;
+                let sec_elapsed = last_sec_tick.elapsed().as_secs_f64();
 
-                        st.metrics.push_back(MetricPoint {
-                            d1_mbs,
-                            d2_mbs,
-                            d1_lat: max_lat1,
-                            d2_lat: max_lat2,
-                        });
+                // Generate graph point every 1.0 second
+                if sec_elapsed >= 1.0 {
+                    let d1_mbs = (accum_d1_bytes as f32 / 1_048_576.0) / sec_elapsed as f32;
+                    let d2_mbs = (accum_d2_bytes as f32 / 1_048_576.0) / sec_elapsed as f32;
 
-                        if st.metrics.len() > 300 {
-                            st.metrics.pop_front(); // Retain up to 5 minutes of telemetry
-                        }
+                    st.metrics.push_back(MetricPoint {
+                        d1_mbs,
+                        d2_mbs,
+                        d1_lat: max_lat1,
+                        d2_lat: max_lat2,
+                    });
 
-                        let win = st.graph_window_secs;
-                        let skip = st.metrics.len().saturating_sub(win);
-                        let mut dynamic_max = 50.0_f32;
-                        for pt in st.metrics.iter().skip(skip) {
-                            dynamic_max = dynamic_max.max(pt.d1_mbs).max(pt.d2_mbs);
-                        }
-
-                        let mut graph_data = Vec::new();
-                        for pt in st.metrics.iter().skip(skip) {
-                            graph_data.push(crate::GraphPoint {
-                                d1_val: (pt.d1_mbs / dynamic_max).clamp(0.0, 1.0),
-                                d2_val: (pt.d2_mbs / dynamic_max).clamp(0.0, 1.0),
-                                is_stall: pt.d1_lat > 250 || pt.d2_lat > 250, // Micro-stall marker
-                            });
-                        }
-
-                        let insights = if max_lat1 > 250 || max_lat2 > 250 {
-                            "🔴 Spindle Bottleneck: High latency (>250ms) detected. Micro-stalls likely."
-                        } else if d1_mbs > 15.0 && d2_mbs > 15.0 {
-                            "🟢 Optimal Spindle Parallelism: Both drives streaming concurrently."
-                        } else if (d1_mbs > 15.0 && d2_mbs < 2.0) || (d2_mbs > 15.0 && d1_mbs < 2.0)
-                        {
-                            "🟡 Ping-Pong Pattern Detected: Alternating sequential load."
-                        } else {
-                            "⚪ System Idle or Low Activity."
-                        };
-
-                        g_update = Some((graph_data, insights.to_string()));
-
-                        accum_d1_bytes = 0;
-                        accum_d2_bytes = 0;
-                        max_lat1 = 0;
-                        max_lat2 = 0;
-                        last_sec_tick = Instant::now();
+                    if st.metrics.len() > 300 {
+                        st.metrics.pop_front();
                     }
 
-                    (Some((d1_b, d2_b, names, hit_rate, saved_gb)), g_update)
-                } else {
-                    (None, None)
+                    let win = st.graph_window_secs;
+                    let skip = st.metrics.len().saturating_sub(win);
+                    let mut dynamic_max = 50.0_f32;
+                    for pt in st.metrics.iter().skip(skip) {
+                        dynamic_max = dynamic_max.max(pt.d1_mbs).max(pt.d2_mbs);
+                    }
+
+                    let mut graph_data = Vec::new();
+                    for pt in st.metrics.iter().skip(skip) {
+                        graph_data.push(crate::GraphPoint {
+                            d1_val: (pt.d1_mbs / dynamic_max).clamp(0.0, 1.0),
+                            d2_val: (pt.d2_mbs / dynamic_max).clamp(0.0, 1.0),
+                            is_stall: pt.d1_lat > 250 || pt.d2_lat > 250,
+                        });
+                    }
+
+                    let insights = if max_lat1 > 250 || max_lat2 > 250 {
+                        "🔴 Spindle Bottleneck: High latency (>250ms) detected. Micro-stalls likely."
+                    } else if d1_mbs > 15.0 && d2_mbs > 15.0 {
+                        "🟢 Optimal Spindle Parallelism: Both drives streaming concurrently."
+                    } else if (d1_mbs > 15.0 && d2_mbs < 2.0) || (d2_mbs > 15.0 && d1_mbs < 2.0) {
+                        "🟡 Single-Drive / Asymmetric Load Detected."
+                    } else {
+                        "⚪ System Idle or Low Activity."
+                    };
+
+                    g_update = Some((graph_data, insights.to_string()));
+
+                    accum_d1_bytes = 0;
+                    accum_d2_bytes = 0;
+                    max_lat1 = 0;
+                    max_lat2 = 0;
+                    last_sec_tick = Instant::now();
                 }
+
+                (Some((cur_d1, cur_d2, names, hit_rate, saved_gb)), g_update)
             };
 
             let _ = ui_weak_telemetry.upgrade_in_event_loop(move |ui| {
@@ -216,13 +257,6 @@ pub fn init_tray_and_telemetry(
                     }
 
                     ui.set_is_io_active(total_mbs > 0.5);
-                } else {
-                    ui.set_drive1_speed_text("0.0 MB/s".into());
-                    ui.set_drive2_speed_text("0.0 MB/s".into());
-                    ui.set_drive1_load_pct(0.0);
-                    ui.set_drive2_load_pct(0.0);
-                    ui.set_total_io_text("0.0 MB/s".into());
-                    ui.set_is_io_active(false);
                 }
 
                 if let Some((g_data, insights)) = stats_graph {
