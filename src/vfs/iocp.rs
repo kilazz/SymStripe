@@ -225,6 +225,7 @@ impl IocpDispatcher {
         let _ = Box::into_raw(ctx);
     }
 
+    #[allow(dead_code)]
     pub fn submit_prefetch_direct(
         &self,
         fs_ref: SymStripePoolFs,

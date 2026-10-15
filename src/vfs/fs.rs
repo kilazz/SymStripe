@@ -2,16 +2,15 @@ use super::cache::{CacheInner, CachedPart, GlobalStripeCache};
 use super::calibration::VfsLogCallback;
 use super::iocp::IocpDispatcher;
 use super::node::{FileNode, PartKey, PoolFileHandle, VfsCodec, hash_path_id};
-use crate::aligned_buf::AlignedBuffer;
 use crate::stripe_math::StripeConfig;
-use crate::win32::{FILE_FLAG_NO_BUFFERING, get_default_security_descriptor, get_system_ram_mb};
+use crate::win32::{get_default_security_descriptor, get_system_ram_mb};
 use crate::zstd_atg::ZstdAtgCompressor;
 use parking_lot::{Condvar, Mutex, RwLock};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
-use std::os::windows::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::os::windows::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -25,6 +24,7 @@ use winfsp::filesystem::{
 use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
 pub const MIN_HDD_OPTIMAL_STRIPE_BYTES: u64 = 64 * 1024 * 1024;
+#[allow(dead_code)]
 pub const DIRECT_PAGE_SIZE: u64 = 2 * 1024 * 1024; // 2 MB Virtual Page Extent for Mirror/Direct files
 const STATUS_INVALID_DEVICE_REQUEST: i32 = 0xC0000010_u32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC0000034_u32 as i32;
@@ -33,10 +33,10 @@ const STATUS_BUFFER_TOO_SMALL: i32 = 0xC0000023_u32 as i32;
 
 type CachedPartTuple = (u64, Arc<RwLock<CachedPart>>);
 
-/// Hardware NCQ Throttler: allows up to 4 concurrent in-flight requests per spindle
-/// allowing the drive firmware elevator algorithm to optimize seek head sweeps without thrashing.
+/// Hardware NCQ Throttler: bounds in-flight requests per spindle to 4,
+/// allowing the drive firmware elevator algorithm to optimize seek sweeps without thrashing.
 pub struct SpindleThrottle {
-    active: AtomicUsize,
+    pub active: AtomicUsize, // MADE PUBLIC FOR LQD ROUTING
     cv: Condvar,
     lock: Mutex<()>,
     max_concurrent: usize,
@@ -105,7 +105,6 @@ pub struct SymStripePoolFs {
     pub meta_sizes: Arc<RwLock<HashMap<String, u64>>>,
     pub pool_used_bytes: Arc<AtomicU64>,
     pub spindle_throttles: Arc<Vec<SpindleThrottle>>,
-    pub rr_counter: Arc<AtomicUsize>,
     pub iocp: Arc<IocpDispatcher>,
 
     pub io_bytes: Arc<Vec<AtomicU64>>,
@@ -261,7 +260,6 @@ impl SymStripePoolFs {
             meta_sizes: Arc::new(RwLock::new(preloaded_meta)),
             pool_used_bytes: Arc::new(AtomicU64::new(initial_used)),
             spindle_throttles,
-            rr_counter: Arc::new(AtomicUsize::new(0)),
             iocp,
             io_bytes,
             io_max_latency_ms,
@@ -435,24 +433,16 @@ impl SymStripePoolFs {
         node.clone()
     }
 
-    /// Fast-path: retrieves a cached unbuffered Direct I/O handle via DuplicateHandle
-    fn get_or_open_direct_file(&self, node: &FileNode, drive_idx: usize) -> Option<File> {
+    /// Fast-path: retrieves a persistent cached Arc file handle (Zero Syscalls bypassing CreateFileW)
+    fn get_or_open_direct_file(&self, node: &FileNode, drive_idx: usize) -> Option<Arc<File>> {
         let mut map = node.open_files.lock();
         if let Some(f) = map.get(&drive_idx) {
-            return f.try_clone().ok();
+            return Some(Arc::clone(f));
         }
         let p = self.members[drive_idx].join(node.rel_path());
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_NO_BUFFERING)
-            .open(&p)
-            .or_else(|_| File::open(&p))
-            .ok()?;
-
-        if let Ok(cloned) = file.try_clone() {
-            map.insert(drive_idx, cloned);
-        }
-        map.get(&drive_idx).and_then(|f| f.try_clone().ok())
+        let file = Arc::new(File::open(&p).ok()?);
+        map.insert(drive_idx, Arc::clone(&file));
+        Some(file)
     }
 
     pub fn resolve_part_paths(
@@ -659,6 +649,7 @@ impl SymStripePoolFs {
         }
     }
 
+    #[allow(dead_code)]
     fn fetch_cached_direct_page(
         &self,
         node: &Arc<FileNode>,
@@ -716,30 +707,34 @@ impl SymStripePoolFs {
         }
 
         let to_read = (current_file_size - page_offset).min(DIRECT_PAGE_SIZE) as usize;
-        // Sector-align read length to 4096 for hardware Direct I/O (Bypass OS Cache)
-        let aligned_len = (to_read + 4095) & !4095;
-        let mut aligned_buf = AlignedBuffer::new(aligned_len, 4096);
+        let mut data = vec![0u8; to_read];
         let mut actual_read = 0;
 
         let t0 = Instant::now();
         {
             let _spindle_guard = self.spindle_throttles[target_drive_idx].acquire();
             if let Some(file) = self.get_or_open_direct_file(node, target_drive_idx) {
-                if let Ok(n) = file.seek_read(aligned_buf.as_slice_mut(), page_offset) {
-                    actual_read = n.min(to_read);
+                if let Ok(n) = file.seek_read(&mut data, page_offset) {
+                    actual_read = n;
                 }
             } else {
                 let p = self.members[target_drive_idx].join(node.rel_path());
-                if let Ok(file) = File::open(&p) {
-                    let _ = file.seek_read(&mut aligned_buf.as_slice_mut()[..to_read], page_offset);
-                    actual_read = to_read;
+                if let Ok(file) = File::open(&p)
+                    && let Ok(n) = file.seek_read(&mut data, page_offset)
+                {
+                    actual_read = n;
                 }
             }
         }
         let lat = t0.elapsed().as_millis() as u64;
         self.io_max_latency_ms[target_drive_idx].fetch_max(lat, Ordering::Relaxed);
 
-        let data = aligned_buf.as_slice_mut()[..actual_read].to_vec();
+        // Strict validation: if read fails on non-empty segment, return IO error instead of corrupting with zeroes
+        if actual_read == 0 && to_read > 0 {
+            return Err(FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR));
+        }
+
+        data.truncate(actual_read);
 
         let new_part = Arc::new(RwLock::new(CachedPart {
             data,
@@ -1282,24 +1277,25 @@ impl FileSystemContext for SymStripePoolFs {
         let write_offset = if write_to_eof { *current_size } else { offset };
 
         if !node.is_striped {
-            // Invalidate any overlapping cached direct pages in GlobalStripeCache using div_ceil
             let current_hash = node.file_hash.load(Ordering::Relaxed);
             let start_page = write_offset / DIRECT_PAGE_SIZE;
             let end_page = (write_offset + buffer.len() as u64).div_ceil(DIRECT_PAGE_SIZE);
 
             {
                 let mut inner = self.global_cache.inner.lock();
-                for p in start_page..end_page {
-                    let k = PartKey {
-                        file_hash: current_hash,
-                        part_index: p,
-                    };
-                    if let Some(removed) = inner.entries.remove(&k) {
-                        inner.current_bytes = inner
-                            .current_bytes
-                            .saturating_sub(removed.read().data.len());
+                let mut freed_bytes = 0usize;
+                inner.entries.retain(|k, v| {
+                    if k.file_hash == current_hash
+                        && k.part_index >= start_page
+                        && k.part_index < end_page
+                    {
+                        freed_bytes += v.read().data.len();
+                        false
+                    } else {
+                        true
                     }
-                }
+                });
+                inner.current_bytes = inner.current_bytes.saturating_sub(freed_bytes);
             }
 
             let first_idx = node.present_on[0];
@@ -1420,85 +1416,32 @@ impl FileSystemContext for SymStripePoolFs {
         let target_slice = &mut buffer[..bytes_to_read];
 
         // -------------------------------------------------------------
-        // UNIFIED CLOCK CACHE FOR NON-STRIPED / RAID-1 MIRROR FILES
+        // PURE DIRECT PASSTHROUGH WITH LQD (Least Queue Depth) & ZERO SYSCALLS
         // -------------------------------------------------------------
         if !node.is_striped {
-            let num_present = node.present_on.len().max(1);
-            let mut curr_offset = offset;
-            let mut remaining = bytes_to_read;
-            let mut dest_buf = target_slice;
-            let mut total_copied = 0;
+            // Intelligent Load Balancing (Least Queue Depth):
+            // We route the read request to the spindle that currently has the fewest active in-flight requests.
+            let target_drive = *node
+                .present_on
+                .iter()
+                .min_by_key(|&&d_idx| self.spindle_throttles[d_idx].active.load(Ordering::Relaxed))
+                .unwrap_or(&0);
 
-            while remaining > 0 {
-                let page_index = curr_offset / DIRECT_PAGE_SIZE;
-                let offset_in_page = (curr_offset % DIRECT_PAGE_SIZE) as usize;
-                let bytes_in_page = ((DIRECT_PAGE_SIZE as usize) - offset_in_page).min(remaining);
+            let _spindle_guard = self.spindle_throttles[target_drive].acquire();
 
-                // Alternates page scheduling across active mirror spindles for concurrent reading
-                let drive_slot = (page_index as usize
-                    + self.rr_counter.fetch_add(1, Ordering::Relaxed))
-                    % num_present;
-                let target_drive = node.present_on[drive_slot];
+            let file = self
+                .get_or_open_direct_file(node, target_drive)
+                .ok_or(FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
 
-                let part_arc = self.fetch_cached_direct_page(node, page_index, target_drive)?;
-                let part = part_arc.read();
-                part.referenced.store(true, Ordering::Relaxed);
+            let bytes_read = file
+                .seek_read(target_slice, offset)
+                .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
 
-                let src_data = &part.data;
-                if offset_in_page < src_data.len() {
-                    let copy_len = (src_data.len() - offset_in_page).min(bytes_in_page);
-                    dest_buf[..copy_len]
-                        .copy_from_slice(&src_data[offset_in_page..offset_in_page + copy_len]);
-                    if copy_len < bytes_in_page {
-                        dest_buf[copy_len..bytes_in_page].fill(0);
-                    }
-                    total_copied += copy_len;
-                } else {
-                    dest_buf[..bytes_in_page].fill(0);
-                }
-
-                if let Some(counter) = self.io_bytes.get(target_drive) {
-                    counter.fetch_add(bytes_in_page as u64, Ordering::Relaxed);
-                }
-
-                // Lookahead Prefetch: queue next page on alternate spindle via IOCP
-                let next_page = page_index + 1;
-                if next_page * DIRECT_PAGE_SIZE < current_file_size {
-                    let next_drive_slot = (drive_slot + 1) % num_present;
-                    let next_target_drive = node.present_on[next_drive_slot];
-                    let next_key = PartKey {
-                        file_hash: node.file_hash.load(Ordering::Relaxed),
-                        part_index: next_page,
-                    };
-
-                    let should_prefetch = {
-                        let inner = self.global_cache.inner.lock();
-                        let mut in_flight = self.prefetch_in_flight.lock();
-                        if !inner.entries.contains_key(&next_key) && !in_flight.contains(&next_key)
-                        {
-                            in_flight.insert(next_key);
-                            true
-                        } else {
-                            false
-                        }
-                    };
-
-                    if should_prefetch {
-                        self.iocp.submit_prefetch_direct(
-                            self.clone(),
-                            Arc::clone(node),
-                            next_page,
-                            next_target_drive,
-                        );
-                    }
-                }
-
-                dest_buf = &mut dest_buf[bytes_in_page..];
-                curr_offset += bytes_in_page as u64;
-                remaining -= bytes_in_page;
+            if let Some(counter) = self.io_bytes.get(target_drive) {
+                counter.fetch_add(bytes_read as u64, Ordering::Relaxed);
             }
 
-            return Ok(total_copied as u32);
+            return Ok(bytes_read as u32);
         }
 
         // -------------------------------------------------------------

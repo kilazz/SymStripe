@@ -1,6 +1,7 @@
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use winfsp::filesystem::DirBuffer;
 use xxhash_rust::xxh3::xxh3_64;
@@ -45,8 +46,8 @@ pub struct FileNode {
     pub is_modified: Mutex<bool>,
     pub open_handles: AtomicUsize,
 
-    // Persistent Handle Cache: eliminates CreateFileW/CloseHandle on every page miss
-    pub open_files: Mutex<HashMap<usize, File>>,
+    // Persistent Handle Cache (Zero-Syscalls): shares Arc references to avoid kernel transitions
+    pub open_files: Mutex<HashMap<usize, Arc<File>>>,
 
     // Markov Chain Prefetch Predictor Fields
     pub last_accessed_part: AtomicU64,

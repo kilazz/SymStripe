@@ -14,15 +14,11 @@ mod win32;
 mod zstd_atg;
 
 use config::{AppConfig, load_config};
-use mimalloc::MiMalloc;
 use parking_lot::Mutex;
 use slint::CloseRequestResponse;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use vfs::VfsPoolSession;
-
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
 
 slint::include_modules!();
 
