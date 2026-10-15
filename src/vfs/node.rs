@@ -1,8 +1,9 @@
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::fs::File;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use winfsp::filesystem::DirBuffer;
+use xxhash_rust::xxh3::xxh3_64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VfsCodec {
@@ -21,21 +22,16 @@ impl VfsCodec {
     }
 }
 
+#[inline]
 pub fn hash_path_id(rel_path: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    rel_path.to_lowercase().hash(&mut hasher);
-    hasher.finish()
+    let lower = rel_path.to_lowercase();
+    xxh3_64(lower.as_bytes())
 }
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 pub struct PartKey {
     pub file_hash: u64,
     pub part_index: u64,
-}
-
-pub struct DirectBuffer {
-    pub offset: u64,
-    pub data: Vec<u8>,
 }
 
 pub struct FileNode {
@@ -46,9 +42,11 @@ pub struct FileNode {
     pub file_codec: VfsCodec,
     pub file_size: Mutex<u64>,
     pub dirty_parts: Mutex<HashSet<u64>>,
-    pub direct_cache: Mutex<Option<DirectBuffer>>,
     pub is_modified: Mutex<bool>,
     pub open_handles: AtomicUsize,
+
+    // Persistent Handle Cache: eliminates CreateFileW/CloseHandle on every page miss
+    pub open_files: Mutex<HashMap<usize, File>>,
 
     // Markov Chain Prefetch Predictor Fields
     pub last_accessed_part: AtomicU64,

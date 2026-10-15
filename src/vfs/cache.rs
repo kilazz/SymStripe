@@ -19,9 +19,10 @@ pub struct CacheInner {
     pub entries: HashMap<PartKey, Arc<RwLock<CachedPart>>>,
     pub clock_ring: Vec<PartKey>,
     pub clock_hand: usize,
+    pub current_bytes: usize,
 }
 
 pub struct GlobalStripeCache {
     pub inner: Mutex<CacheInner>,
-    pub max_parts: usize,
+    pub max_bytes: usize,
 }

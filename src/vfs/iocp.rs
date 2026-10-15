@@ -1,5 +1,5 @@
 use super::cache::CachedPart;
-use super::fs::SymStripePoolFs;
+use super::fs::{DIRECT_PAGE_SIZE, SymStripePoolFs};
 use super::node::{FileNode, PartKey, VfsCodec};
 use crate::win32::{
     CloseHandle, CreateFileW, CreateIoCompletionPort, ERROR_IO_PENDING, FILE_FLAG_OVERLAPPED,
@@ -28,6 +28,8 @@ struct IocpContext {
     buffer: Vec<u8>,
     fs_ref: SymStripePoolFs,
     node: Arc<FileNode>,
+    is_direct_page: bool,
+    direct_expected_len: usize,
 }
 
 impl IocpDispatcher {
@@ -74,6 +76,24 @@ impl IocpDispatcher {
                 if let Some(cv) = inflight.remove(&ctx.part_key) {
                     cv.notify_all();
                 }
+                continue;
+            }
+
+            if ctx.is_direct_page {
+                let actual_len = ctx.direct_expected_len.min(bytes_transferred as usize);
+                ctx.buffer.truncate(actual_len);
+
+                let new_part = Arc::new(RwLock::new(CachedPart {
+                    data: ctx.buffer,
+                    dirty: false,
+                    referenced: AtomicBool::new(true),
+                    codec: VfsCodec::Store,
+                    rel_path: ctx.node.rel_path(),
+                    file_hash: ctx.part_key.file_hash,
+                    part_index: ctx.part_key.part_index,
+                }));
+
+                ctx.fs_ref.insert_into_cache(ctx.part_key, new_part);
                 continue;
             }
 
@@ -176,6 +196,8 @@ impl IocpDispatcher {
             buffer: buf,
             fs_ref,
             node,
+            is_direct_page: false,
+            direct_expected_len: 0,
         });
 
         unsafe { CreateIoCompletionPort(file_handle, self.port, 0, 0) };
@@ -200,7 +222,93 @@ impl IocpDispatcher {
             }
         }
 
-        // Successfully queued! Leak the box so Windows kernel owns it until completion.
+        let _ = Box::into_raw(ctx);
+    }
+
+    pub fn submit_prefetch_direct(
+        &self,
+        fs_ref: SymStripePoolFs,
+        node: Arc<FileNode>,
+        page_index: u64,
+        target_drive_idx: usize,
+    ) {
+        let part_key = PartKey {
+            file_hash: node.file_hash.load(std::sync::atomic::Ordering::Relaxed),
+            part_index: page_index,
+        };
+
+        let current_file_size = *node.file_size.lock();
+        let page_offset = page_index * DIRECT_PAGE_SIZE;
+        if page_offset >= current_file_size {
+            fs_ref.prefetch_in_flight.lock().remove(&part_key);
+            return;
+        }
+
+        let expected_len = (current_file_size - page_offset).min(DIRECT_PAGE_SIZE) as usize;
+        let p = fs_ref.members[target_drive_idx].join(node.rel_path());
+
+        let wide_path = crate::win32::to_wide_null(p.to_str().unwrap());
+        let file_handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ,
+                1 | 2,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                ptr::null_mut(),
+            )
+        };
+
+        if file_handle == INVALID_HANDLE_VALUE {
+            fs_ref.prefetch_in_flight.lock().remove(&part_key);
+            return;
+        }
+
+        let buf = vec![0u8; expected_len];
+        let offset_low = (page_offset & 0xFFFFFFFF) as u32;
+        let offset_high = ((page_offset >> 32) & 0xFFFFFFFF) as u32;
+
+        let mut ctx = Box::new(IocpContext {
+            overlapped: OVERLAPPED {
+                internal: 0,
+                internal_high: 0,
+                offset: offset_low,
+                offset_high,
+                h_event: ptr::null_mut(),
+            },
+            file_handle,
+            part_key,
+            codec: VfsCodec::Store,
+            buffer: buf,
+            fs_ref,
+            node,
+            is_direct_page: true,
+            direct_expected_len: expected_len,
+        });
+
+        unsafe { CreateIoCompletionPort(file_handle, self.port, 0, 0) };
+
+        let mut read_bytes = 0;
+        let ok = unsafe {
+            ReadFile(
+                file_handle,
+                ctx.buffer.as_mut_ptr() as *mut c_void,
+                expected_len as u32,
+                &mut read_bytes,
+                &mut ctx.overlapped,
+            )
+        };
+
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_IO_PENDING {
+                unsafe { CloseHandle(file_handle) };
+                ctx.fs_ref.prefetch_in_flight.lock().remove(&ctx.part_key);
+                return;
+            }
+        }
+
         let _ = Box::into_raw(ctx);
     }
 }
