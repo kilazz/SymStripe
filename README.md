@@ -1,43 +1,38 @@
 # SymStripe
 
-High-throughput storage accelerator and user-mode virtual filesystem (WinFsp) for Windows. Combines the throughput of mixed physical drives without repartitioning or hardware RAID.
+High-throughput storage accelerator and user-mode VFS (WinFsp) for Windows. Aggregates mixed physical drives without repartitioning or hardware RAID.
 
 ---
 
 ## Operating Modes
 
-### In-Place Game Optimizer (Symlinks)
-Offloads large game archives (`.ucas`, `.pak`, media) to secondary drives while maintaining transparent links in the original game directory.
-- **Volume GUID Anchoring:** Links target `\\?\Volume{GUID}\...` — immune to drive letter changes.
-- **UE5 IoStore Guard:** Retains critical bootstrap packages (`pakchunk0`, `global.*`) on the primary drive; keeps companions (`.utoc`, `.sig`) co-located with `.ucas`.
-- **LPT Balancing:** Balances file distribution across drives based on container size and available space.
-- **Safety & Rollback:** Atomic `.striping_manifest.json`, local `.backup` safety net, and target consolidation.
+### 1. In-Place Game Optimizer (Symlinks)
+Offloads heavy game archives (`.ucas`, `.pak`, media) to secondary drives via transparent symlinks.
+- **Volume GUID Anchoring:** Links target `\\?\Volume{GUID}\...` (immune to drive letter changes).
+- **UE5 Safe Mode:** Retains bootstrap packages (`pakchunk0`) on primary; strictly co-locates `.utoc`/`.sig` with `.ucas`.
+- **LPT Balancing & Recovery:** Capacity-aware distribution, atomic manifests, and `.backup` safety nets.
 
-### Virtual Storage Pool (VFS Z:)
-Aggregates folders across multiple physical disks into a unified virtual drive `Z:` via WinFsp.
-- **Policies:** RAID-0 (Striped), JBOD (Capacity Merge), RAID-1 (Mirror).
-- **Asymmetric Weighted Striping (RAID-0):** Auto-calibrates drive speed ratios (e.g., 2:1 schedule `[D1, D1, D2]`) so faster drives never stall on slower spindles.
-- **$O(1)$ CLOCK RAM Cache:** Low-overhead second-chance eviction via an atomic `referenced` bit, eliminating $O(N)$ traversal latency.
-- **Asymmetric Prefetch:** Triggers at 50% chunk read, looks ahead up to 4 blocks, and prioritizes higher-latency drives.
-- **Single-Flight:** Deduplicates concurrent chunk reads during asset streaming spikes (anti-stampede).
-- **Zstd ATG & LZ4:** DirectStorage-grade compression with a 256 KB window log (`WindowLog = 18`) to prevent CPU L3 cache thrashing.
+### 2. Virtual Storage Pool (VFS Z:)
+Mounts multi-drive folders as a unified `Z:` drive.
+- **Topologies:** RAID-0 (Striped), RAID-1 (Mirror), JBOD (Merged Capacity).
+- **RAID-0 Asymmetric Striping:** Auto-calibrates speed weights (e.g., 2:1 schedule) so fast drives never wait for slow ones.
+- **RAID-1 Smart Passthrough:** Uses **Least Queue Depth (LQD)** balancing and `FILE_FLAG_SEQUENTIAL_SCAN` for native OS readahead with zero-memory duplication.
+- **I/O Engine:** `mimalloc` allocator, `xxh3_64` SIMD hashing, and **Persistent Handle Cache** (zero `CreateFileW` syscalls).
+- **Hardware NCQ Throttling:** Limits queue depth (QD=4) per spindle to optimize magnetic head sweeps without thrashing.
+- **RAM Cache:** $O(1)$ CLOCK byte-bounded eviction, IOCP asynchronous prefetching, and Single-Flight deduplication (anti-stampede).
+- **Compression:** Zstd ATG (`WindowLog = 18`) & LZ4 for on-the-fly DirectStorage-grade asset unpacking.
 
 ---
 
 ## Diagnostics & System Features
 
-- **Time-Based Benchmark:** Measures sustained throughput over a fixed time window using unbuffered 4KB-aligned I/O (`FILE_FLAG_NO_BUFFERING`) with per-drive speed breakdowns.
-- **Bus Detection:** Queries real hardware bus interfaces (NVMe, SATA, USB) via Win32 `IOCTL_STORAGE_QUERY_PROPERTY`.
-- **S.M.A.R.T. Monitor:** Polls physical drive health via `IOCTL_STORAGE_PREDICT_FAILURE`.
-- **Zero-Alloc SEH:** Native emergency crash logger using pre-allocated paths and direct kernel handles to survive stack overflows and heap corruption.
-- **Windows Service Mode:** CLI flags (`--install-service`, `--service`) to auto-mount drive `Z:` at boot prior to user logon.
-- **Process Priority:** Disables Windows 11 EcoQoS (Power Throttling) and elevates process priority to Above Normal.
+- **Hardware Profiler:** Unbuffered 4KB-aligned I/O benchmark, Bus detection, and S.M.A.R.T. polling.
+- **Zero-Alloc SEH Logger:** Native crash handler using pre-allocated paths to survive stack/heap corruption.
+- **System Integration:** Silent boot Windows Service (`--install-service`), EcoQoS disabling, and Above Normal process priority.
 
 ---
 
-## Requirements & Build
-
+## Requirements
 - Windows 10/11 (x64)
-- [WinFsp Runtime](https://winfsp.dev/) installed
-- Rust 1.80+ (Edition 2024)
-- Slint UI 1.18
+- [WinFsp Runtime](https://winfsp.dev/)
+- Rust 1.80+ / Slint 1.18
